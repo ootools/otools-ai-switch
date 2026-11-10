@@ -1,0 +1,818 @@
+import { getTransport } from "../transport";
+import type {
+  AccountStatus,
+  AppSettings,
+  AppSettingsView,
+  Batch,
+  BatchGroup,
+  ConfigSnapshotSummary,
+  CodexOAuthMethod,
+  CodexOAuthStatus,
+  CodexLoginState,
+  ConfigWriteClientStatus,
+  ConfigWriteOutcome,
+  ClaudeSlotPlan,
+  DirectModeStatus,
+  CopyRouteCredentialInput,
+  CreateRoutePoolGroupInput,
+  DeleteRoutePoolGroupInput,
+  DiskSpaceStatus,
+  ExternalClientImportOutcome,
+  ExternalClientImportPreview,
+  FetchedRouteModel,
+  ImportExternalClientAccountsInput,
+  ImportJob,
+  CreateApiRouteCredentialInput,
+  NewOfficialAccount,
+  OfficialAccount,
+  PlatformCapability,
+  ExportRouteCredentialsInput,
+  RouteCredentialExportResult,
+  ImportRouteCredentialsInput,
+  PreviewExternalClientImportInput,
+  PreviewRouteCredentialImportInput,
+  RouteCredentialImportOutcome,
+  RouteCredentialImportPreview,
+  RouteCredential,
+  RouteCredentialModelStatus,
+  RouteCredentialPage,
+  RouteCredentialPageRequest,
+  ReorderRouteCredentialInput,
+  RouteCredentialImportResult,
+  QuotaRefreshOutcome,
+  RecoveryRule,
+  RelayBalanceRefreshOutcome,
+  RouteModelsFetchRequest,
+  RoutePoolModelTestOutcome,
+  RoutePoolModelTestRequest,
+  RoutePoolModelMode,
+  RoutePoolRouteOutcome,
+  RoutePoolRouteRequest,
+  RoutePoolState,
+  SetRoutePoolBaselineModelsInput,
+  SetRoutePoolGroupMembersInput,
+  UpdateRoutePoolGroupInput,
+  RouteProxyLiveLogEntry,
+  RouteProxyHttpsOperationOutcome,
+  RouteProxyHttpsStatus,
+  RouteProxyStatus,
+  SaveRouteCredentialExportResult,
+  SaveRouteProxyDiagnosticsResult,
+  SessionMessage,
+  SessionMeta,
+  SessionUsageStats,
+  TargetApp,
+  TargetConfigStatus,
+  UsageOverview,
+  UsageHistoryStorage,
+  ResponseBodyCleanup,
+  UpdateOfficialAccount,
+  UpdateRouteCredentialInput,
+  LocalMcpServer,
+  ModelPriceConfig,
+  McpAppType,
+  McpMarketplaceItem,
+  McpMarketplaceProvider,
+  McpMarketplaceServerDetail,
+  McpSpec,
+  SkillAgentInfo,
+  SkillAgentType,
+  SkillContent,
+  SkillItem,
+  SkillLayout,
+  SkillPackageDetail,
+  SkillPackageInstallResult,
+  SkillPackageUninstallResult,
+  SkillScope,
+  SkillsListResult,
+  SkillsPackageListResult,
+} from "./types";
+
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  return getTransport().call<T>(command, args);
+}
+
+export function listBatchGroups(search?: string): Promise<BatchGroup[]> {
+  return invoke("list_batch_groups", { search: search || null });
+}
+
+export function createBatch(input: {
+  name: string;
+  source: string;
+  notes?: string | null;
+}): Promise<Batch> {
+  return invoke("create_batch", { input });
+}
+
+export function createOfficialAccount(request: {
+  account: NewOfficialAccount;
+  batch_id?: string | null;
+}): Promise<OfficialAccount> {
+  return invoke("create_official_account", { request });
+}
+
+export function getOfficialAccount(id: string): Promise<OfficialAccount> {
+  return invoke("get_official_account", { id });
+}
+
+export function updateOfficialAccount(input: {
+  id: string;
+  account: UpdateOfficialAccount;
+}): Promise<OfficialAccount> {
+  return invoke("update_official_account", { input });
+}
+
+export function importExampleJson(request: {
+  batch_name: string;
+  source_label: string;
+  strategy: string;
+  json: string;
+}): Promise<ImportJob> {
+  return invoke("import_example_json", { request });
+}
+
+export function listTargetApps(): Promise<TargetApp[]> {
+  return invoke("list_target_apps");
+}
+
+export function listTargetConfigStatuses(): Promise<TargetConfigStatus[]> {
+  return invoke("list_target_config_statuses");
+}
+
+export function listConfigSnapshots(
+  targetAppId?: string | null,
+  limit?: number | null,
+): Promise<ConfigSnapshotSummary[]> {
+  return invoke("list_config_snapshots", {
+    targetAppId: targetAppId ?? null,
+    limit: limit ?? null,
+  });
+}
+
+export function rollbackConfigSnapshot(id: string): Promise<ConfigWriteOutcome> {
+  return invoke("rollback_config_snapshot", { id });
+}
+
+export function listPlatformCapabilities(): Promise<PlatformCapability[]> {
+  return invoke("list_platform_capabilities");
+}
+
+export function getDiskSpaceStatus(): Promise<DiskSpaceStatus> {
+  return invoke("get_disk_space_status");
+}
+
+export function getRoutePool(
+  platform: string,
+  groupId?: string | null,
+  since?: string | null,
+  requestPage?: number | null,
+  requestPageSize?: number | null,
+): Promise<RoutePoolState> {
+  return invoke("get_route_pool", {
+    platform,
+    group_id: groupId ?? null,
+    since: since ?? null,
+    request_page: requestPage ?? null,
+    request_page_size: requestPageSize ?? null,
+  });
+}
+
+export function createRoutePoolGroup(
+  input: CreateRoutePoolGroupInput,
+): Promise<RoutePoolState> {
+  return invoke("create_route_pool_group", { input });
+}
+
+export function updateRoutePoolGroup(
+  input: UpdateRoutePoolGroupInput,
+): Promise<RoutePoolState> {
+  return invoke("update_route_pool_group", { input });
+}
+
+export function deleteRoutePoolGroup(
+  input: DeleteRoutePoolGroupInput,
+): Promise<RoutePoolState> {
+  return invoke("delete_route_pool_group", { input });
+}
+
+export function setRoutePoolGroupMembers(
+  input: SetRoutePoolGroupMembersInput,
+): Promise<RoutePoolState> {
+  return invoke("set_route_pool_group_members", { input });
+}
+
+export function moveRoutePoolGroupMembers(input: SetRoutePoolGroupMembersInput): Promise<RoutePoolState> {
+  return invoke("move_route_pool_group_members", { input });
+}
+
+export function setRoutePoolMembers(input: {
+  platform: string;
+  account_ids: string[];
+}): Promise<RoutePoolState> {
+  return invoke("set_route_pool_members", { input });
+}
+
+/**
+ * Switch the platform's model catalog mode. Takes effect immediately for the
+ * pool's own `/v1/models`; client config files carry the new ids only after the
+ * next config write.
+ */
+export function setRoutePoolBaselineModels(
+  input: SetRoutePoolBaselineModelsInput,
+): Promise<RoutePoolState> {
+  return invoke("set_route_pool_baseline_models", { input });
+}
+export function setRoutePoolModelMode(input: {
+  platform: string;
+  mode: RoutePoolModelMode;
+}): Promise<RoutePoolState> {
+  return invoke("set_route_pool_model_mode", { input });
+}
+
+/**
+ * Aggregate usage from local Claude Code / Codex CLI session transcripts.
+ *
+ * `since` is an RFC 3339 timestamp; pass null for the full history.
+ */
+export function getSessionUsageStats(since?: string | null): Promise<SessionUsageStats> {
+  return invoke("get_session_usage_stats", { since: since ?? null });
+}
+
+/** Reload `~/.otools/local/otools-ai-switch/model-prices.json`, returning the entry count. */
+export function getModelPriceConfigs(): Promise<Record<string, ModelPriceConfig>> {
+  return invoke("get_model_price_configs");
+}
+
+export function saveModelPriceConfigs(configs: Record<string, ModelPriceConfig>): Promise<number> {
+  return invoke("save_model_price_configs", { configs });
+}
+
+export function reloadModelPriceOverrides(): Promise<number> {
+  return invoke("reload_model_price_overrides");
+}
+
+/** Unused space in the database file that a compaction could return. */
+export function getUsageHistoryStorage(): Promise<UsageHistoryStorage> {
+  return invoke("get_usage_history_storage");
+}
+
+/**
+ * Rebuild the database file compactly.
+ *
+ * Slow on purpose and never automatic: `VACUUM` copies the whole database under
+ * an exclusive lock, so this belongs behind a button the user pressed.
+ */
+export function compactUsageHistory(): Promise<UsageHistoryStorage> {
+  return invoke("compact_usage_history");
+}
+
+/**
+ * Delete stored response previews older than `olderThanDays`, keeping every row
+ * and statistic.
+ *
+ * The preview is the largest thing a usage row holds and is never pruned, so
+ * this is what actually bounds the database file. Pass `0` to clear every
+ * preview regardless of age. The freed space becomes reclaimable and is handed
+ * back to the filesystem by a follow-up `compactUsageHistory`.
+ */
+export function clearUsageResponseBodies(olderThanDays: number): Promise<ResponseBodyCleanup> {
+  return invoke("clear_usage_response_bodies", { older_than_days: olderThanDays });
+}
+
+/**
+ * Local CLI transcript usage merged with proxied requests, deduplicated on the
+ * upstream response id.
+ *
+ * Spans every platform: the figures answer "my total spend", so a per-platform
+ * view comes from the returned groups rather than from a filter. `since` is an
+ * RFC 3339 timestamp; pass null for the full history.
+ */
+export function getUsageOverview(
+  since: string | null,
+  page: number,
+  pageSize: number,
+): Promise<UsageOverview> {
+  return invoke("get_usage_overview", {
+    since: since ?? null,
+    page,
+    page_size: pageSize,
+    // The chart's buckets are cut at *this* client's midnight. `since` is already
+    // computed from this calendar, so letting the server use its own offset
+    // instead sliced the first and last bucket at a different instant and shifted
+    // every hour label — invisible on the desktop, wrong on a paired phone in
+    // another timezone. getTimezoneOffset is minutes *behind* UTC, hence the sign.
+    utc_offset_minutes: -new Date().getTimezoneOffset(),
+  });
+}
+
+export function routePoolRouteOnce(request: RoutePoolRouteRequest): Promise<RoutePoolRouteOutcome> {
+  return invoke("route_pool_route_once", { request });
+}
+
+export function routePoolTestModel(request: RoutePoolModelTestRequest): Promise<RoutePoolModelTestOutcome> {
+  return invoke("route_pool_test_model", { request });
+}
+
+export function fetchRouteModels(request: RouteModelsFetchRequest): Promise<FetchedRouteModel[]> {
+  return invoke("fetch_route_models", { request });
+}
+
+export function subscribeRouteProxyLiveLog(platform: string): Promise<RouteProxyLiveLogEntry[]> {
+  return invoke("subscribe_route_proxy_live_log", { platform });
+}
+
+export function unsubscribeRouteProxyLiveLog(): Promise<void> {
+  return invoke("unsubscribe_route_proxy_live_log");
+}
+
+/**
+ * 把实时日志连同环境、设置摘要和账号概况导出成一个文件，交给用户反馈。
+ *
+ * 保存路径由 OTools 宿主对话框选择。文件由后端组装并压缩，所以这里不传任何
+ * 数据——146MB 的原始日志不该为了落盘先过一次 IPC。
+ */
+export function saveRouteProxyDiagnosticsExport(path: string): Promise<SaveRouteProxyDiagnosticsResult> {
+  return invoke("save_route_proxy_diagnostics_export", { path });
+}
+
+export function getSettings(): Promise<AppSettingsView> {
+  return invoke("get_settings");
+}
+
+export function saveSettings(settings: AppSettings): Promise<AppSettingsView> {
+  return invoke("save_settings", { settings });
+}
+
+/**
+ * Whether this machine has a ChatGPT login Codex can fall back on.
+ *
+ * Only meaningful for the "keep Codex login state" switch: enabling it without a
+ * login would leave the client unable to authenticate.
+ */
+export function getCodexLoginState(): Promise<CodexLoginState> {
+  return invoke("get_codex_login_state");
+}
+
+export function startRouteProxy(): Promise<RouteProxyStatus> {
+  return invoke("start_route_proxy");
+}
+
+export function stopRouteProxy(): Promise<RouteProxyStatus> {
+  return invoke("stop_route_proxy");
+}
+
+export function getRouteProxyStatus(): Promise<RouteProxyStatus> {
+  return invoke("get_route_proxy_status");
+}
+
+export function getRouteProxyKey(platform: string): Promise<string> {
+  return invoke("get_route_proxy_key", { platform });
+}
+
+export function getRouteProxyHttpsStatus(): Promise<RouteProxyHttpsStatus> {
+  return invoke("get_route_proxy_https_status");
+}
+
+export function enableRouteProxyHttps(): Promise<RouteProxyHttpsOperationOutcome> {
+  return invoke("enable_route_proxy_https");
+}
+
+export function disableRouteProxyHttps(): Promise<RouteProxyHttpsOperationOutcome> {
+  return invoke("disable_route_proxy_https");
+}
+
+export function reimportRouteProxyRootCa(): Promise<RouteProxyHttpsOperationOutcome> {
+  return invoke("reimport_route_proxy_root_ca");
+}
+
+export function regenerateRouteProxyHttpsCertificates(): Promise<RouteProxyHttpsOperationOutcome> {
+  return invoke("regenerate_route_proxy_https_certificates");
+}
+
+export function uninstallRouteProxyRootCa(): Promise<RouteProxyHttpsOperationOutcome> {
+  return invoke("uninstall_route_proxy_root_ca");
+}
+
+export function deleteRouteProxyHttpsCertificates(): Promise<RouteProxyHttpsStatus> {
+  return invoke("delete_route_proxy_https_certificates");
+}
+
+export function openRouteProxyHttpsCertificateDirectory(): Promise<void> {
+  return invoke("open_route_proxy_https_certificate_dir");
+}
+
+export function writeRouteProxyConfigs(
+  baseUrl: string | null | undefined,
+  platform: string,
+  clientKeys?: string[] | null,
+): Promise<ConfigWriteOutcome[]> {
+  return invoke("write_route_proxy_configs", {
+    baseUrl: baseUrl ?? null,
+    platform,
+    clientKeys: clientKeys ?? null,
+  });
+}
+
+/// Whether writing config now would change the file on disk. Config is written
+/// on demand, so model-slot and global-client-config edits sit unapplied until
+/// the user asks for a write.
+export function routeConfigWriteIsStale(
+  baseUrl: string | null | undefined,
+  platform: string,
+  clientKeys?: string[] | null,
+): Promise<boolean> {
+  return invoke("route_config_write_is_stale", {
+    baseUrl: baseUrl ?? null,
+    platform,
+    clientKeys: clientKeys ?? null,
+  });
+}
+
+/// Read-only preview of what the next Claude config write would put into the
+/// `/model` slots; resolved by the same code as the write itself.
+export function getClaudeSlotPlan(): Promise<ClaudeSlotPlan> {
+  return invoke("get_claude_slot_plan");
+}
+
+/// Clients this platform can write config for, with each one's current file
+/// state. Drives the write dialog's checkbox list.
+export function listConfigWriteClients(platform: string): Promise<ConfigWriteClientStatus[]> {
+  return invoke("list_config_write_clients", { platform });
+}
+
+export function listRouteCredentials(platform: string): Promise<RouteCredential[]> {
+  return invoke("list_route_credentials", { platform });
+}
+
+export function exportRouteCredentials(
+  input: ExportRouteCredentialsInput,
+): Promise<RouteCredentialExportResult> {
+  return invoke("export_route_credentials", { input });
+}
+
+export function saveRouteCredentialExport(input: {
+  suggested_file_name: string;
+  json_text: string;
+  path: string;
+}): Promise<SaveRouteCredentialExportResult> {
+  return invoke("save_route_credential_export", {
+    suggested_file_name: input.suggested_file_name,
+    json_text: input.json_text,
+    path: input.path,
+  });
+}
+
+export function previewRouteCredentialImport(
+  input: PreviewRouteCredentialImportInput,
+): Promise<RouteCredentialImportPreview> {
+  return invoke("preview_route_credential_import", { input });
+}
+
+export function importRouteCredentials(
+  input: ImportRouteCredentialsInput,
+): Promise<RouteCredentialImportOutcome> {
+  return invoke("import_route_credentials", { input });
+}
+
+export function previewExternalClientImport(
+  input: PreviewExternalClientImportInput,
+): Promise<ExternalClientImportPreview> {
+  return invoke("preview_external_client_import", { input });
+}
+
+export function importExternalClientAccounts(
+  input: ImportExternalClientAccountsInput,
+): Promise<ExternalClientImportOutcome> {
+  return invoke("import_external_client_accounts", { input });
+}
+
+export function listRouteCredentialPage(input: RouteCredentialPageRequest): Promise<RouteCredentialPage> {
+  return invoke("list_route_credentials_page", { input });
+}
+
+export function reorderRouteCredentials(input: ReorderRouteCredentialInput): Promise<RouteCredentialPage> {
+  return invoke("reorder_route_credentials", { input });
+}
+
+export function createApiRouteCredential(input: CreateApiRouteCredentialInput): Promise<RouteCredential> {
+  return invoke("create_api_route_credential", { input });
+}
+
+export function startCodexOAuth(input: {
+  method: CodexOAuthMethod;
+  batch_name: string;
+}): Promise<CodexOAuthStatus> {
+  return invoke("start_codex_oauth", { input });
+}
+
+export function getCodexOAuthStatus(sessionId: string): Promise<CodexOAuthStatus> {
+  return invoke("get_codex_oauth_status", { session_id: sessionId });
+}
+
+export function cancelCodexOAuth(sessionId: string): Promise<CodexOAuthStatus> {
+  return invoke("cancel_codex_oauth", { session_id: sessionId });
+}
+
+export function importOfficialRouteCredentialsFromText(input: {
+  platform: string;
+  text: string;
+  batch_name?: string | null;
+}): Promise<RouteCredentialImportResult> {
+  return invoke("import_official_route_credentials_from_text", { input });
+}
+
+export function importOfficialRouteCredentialsFromFiles(input: {
+  platform: string;
+  file_paths: string[];
+  batch_name?: string | null;
+}): Promise<RouteCredentialImportResult> {
+  return invoke("import_official_route_credentials_from_files", { input });
+}
+
+export function updateRouteCredential(
+  id: string,
+  input: UpdateRouteCredentialInput,
+): Promise<RouteCredential> {
+  return invoke("update_route_credential", { id, input });
+}
+
+export function copyRouteCredential(
+  id: string,
+  input?: CopyRouteCredentialInput,
+): Promise<RouteCredential> {
+  return invoke("copy_route_credential", input ? { id, input } : { id });
+}
+
+export function setRouteCredentialRecovery(
+  id: string,
+  rule: RecoveryRule,
+): Promise<RouteCredential> {
+  return invoke("set_route_credential_recovery", { id, rule });
+}
+
+export function setRouteCredentialModelStatus(
+  id: string,
+  modelKey: string,
+  status: RouteCredentialModelStatus,
+): Promise<RouteCredential> {
+  return invoke("set_route_credential_model_status", {
+    id,
+    model_key: modelKey,
+    status,
+  });
+}
+
+export function clearRouteCredentialModelState(
+  id: string,
+  modelKey: string,
+): Promise<RouteCredential> {
+  return invoke("clear_route_credential_model_state", { id, model_key: modelKey });
+}
+
+/** `seconds = 0` lifts the account's backoff without clearing its failure count. */
+export function setRouteCredentialCooldown(
+  id: string,
+  seconds: number,
+): Promise<RouteCredential> {
+  return invoke("set_route_credential_cooldown", { id, seconds });
+}
+
+export function clearRouteCredentialFailureState(id: string): Promise<RouteCredential> {
+  return invoke("clear_route_credential_failure_state", { id });
+}
+
+export function deleteRouteCredential(id: string): Promise<void> {
+  return invoke("delete_route_credential", { id });
+}
+
+export function archiveRouteCredentials(ids: string[]): Promise<void> {
+  return invoke("archive_route_credentials", { ids });
+}
+
+export function restoreRouteCredentials(ids: string[]): Promise<void> {
+  return invoke("restore_route_credentials", { ids });
+}
+
+export function setRouteCredentialStatuses(
+  ids: string[],
+  status: AccountStatus,
+): Promise<void> {
+  return invoke("set_route_credential_statuses", { ids, status });
+}
+
+export function refreshRouteCredentialQuota(id: string): Promise<QuotaRefreshOutcome> {
+  return invoke("refresh_route_credential_quota", { id });
+}
+
+export function refreshRouteCredentialsQuota(platform: string): Promise<QuotaRefreshOutcome[]> {
+  return invoke("refresh_route_credentials_quota", { platform });
+}
+
+export function refreshRouteCredentialRelayBalance(
+  id: string,
+): Promise<RelayBalanceRefreshOutcome> {
+  return invoke("refresh_route_credential_relay_balance", { id });
+}
+
+export function refreshRouteCredentialsRelayBalance(
+  platform: string,
+): Promise<RelayBalanceRefreshOutcome[]> {
+  return invoke("refresh_route_credentials_relay_balance", { platform });
+}
+
+export function listSessions(platform?: string | null): Promise<SessionMeta[]> {
+  return invoke("list_sessions", { platform: platform ?? null });
+}
+
+export function getSessionMessages(input: {
+  providerId: string;
+  sourcePath: string;
+}): Promise<SessionMessage[]> {
+  return invoke("get_session_messages", {
+    providerId: input.providerId,
+    sourcePath: input.sourcePath,
+  });
+}
+
+export function setRouteAccess(enabled: boolean): Promise<RouteProxyStatus> {
+  return invoke("set_route_access", { enabled });
+}
+
+export function mcpScanLocal(): Promise<LocalMcpServer[]> {
+  return invoke("mcp_scan_local");
+}
+
+export function mcpListMarketplaces(): Promise<McpMarketplaceProvider[]> {
+  return invoke("mcp_list_marketplaces");
+}
+
+export function mcpSearchMarketplace(input: {
+  providerId: string;
+  query?: string | null;
+  limit?: number | null;
+}): Promise<McpMarketplaceItem[]> {
+  return invoke("mcp_search_marketplace", {
+    providerId: input.providerId,
+    query: input.query ?? null,
+    limit: input.limit ?? null,
+  });
+}
+
+export function mcpGetMarketplaceServerDetail(
+  providerId: string,
+  serverId: string,
+): Promise<McpMarketplaceServerDetail> {
+  return invoke("mcp_get_marketplace_server_detail", { providerId, serverId });
+}
+
+export function mcpInstallFromMarketplace(input: {
+  providerId: string;
+  serverId: string;
+  apps: McpAppType[];
+  optionId?: string | null;
+  protocol?: string | null;
+  parameterValues?: Record<string, unknown> | null;
+}): Promise<LocalMcpServer> {
+  return invoke("mcp_install_from_marketplace", {
+    providerId: input.providerId,
+    serverId: input.serverId,
+    apps: input.apps,
+    optionId: input.optionId ?? null,
+    protocol: input.protocol ?? null,
+    parameterValues: input.parameterValues ?? null,
+  });
+}
+
+export function mcpUpsertLocalServer(input: {
+  serverId: string;
+  spec: McpSpec;
+  apps: McpAppType[];
+}): Promise<LocalMcpServer> {
+  return invoke("mcp_upsert_local_server", input);
+}
+
+export function mcpSetServerApps(serverId: string, apps: McpAppType[]): Promise<LocalMcpServer | null> {
+  return invoke("mcp_set_server_apps", { serverId, apps });
+}
+
+export function mcpRemoveServer(serverId: string, apps?: McpAppType[] | null): Promise<boolean> {
+  return invoke("mcp_remove_server", { serverId, apps: apps ?? null });
+}
+
+export function skillsListAgents(): Promise<SkillAgentInfo[]> {
+  return invoke("skills_list_agents");
+}
+
+export function skillsList(input: {
+  agentType: SkillAgentType;
+  scope: SkillScope;
+  workspacePath?: string | null;
+}): Promise<SkillsListResult> {
+  return invoke("skills_list", { ...input, workspacePath: input.workspacePath ?? null });
+}
+
+export function skillsRead(input: {
+  agentType: SkillAgentType;
+  scope: SkillScope;
+  skillId: string;
+  workspacePath?: string | null;
+}): Promise<SkillContent> {
+  return invoke("skills_read", { ...input, workspacePath: input.workspacePath ?? null });
+}
+
+export function skillsSave(input: {
+  agentType: SkillAgentType;
+  scope: SkillScope;
+  skillId: string;
+  content: string;
+  layout?: SkillLayout | null;
+  workspacePath?: string | null;
+}): Promise<SkillItem> {
+  return invoke("skills_save", { ...input, workspacePath: input.workspacePath ?? null });
+}
+
+export function skillsDelete(input: {
+  agentType: SkillAgentType;
+  scope: SkillScope;
+  skillId: string;
+  workspacePath?: string | null;
+}): Promise<boolean> {
+  return invoke("skills_delete", { ...input, workspacePath: input.workspacePath ?? null });
+}
+
+export function skillsListPackages(input?: {
+  agentType?: SkillAgentType;
+  scope?: SkillScope;
+  workspacePath?: string | null;
+}): Promise<SkillsPackageListResult> {
+  return invoke("skills_list_packages", {
+    agentType: input?.agentType ?? null,
+    scope: input?.scope ?? null,
+    workspacePath: input?.workspacePath ?? null,
+  });
+}
+
+export function skillsReadPackage(input: {
+  packageId: string;
+  agentType?: SkillAgentType;
+  scope?: SkillScope;
+  workspacePath?: string | null;
+}): Promise<SkillPackageDetail> {
+  return invoke("skills_read_package", {
+    packageId: input.packageId,
+    agentType: input.agentType ?? null,
+    scope: input.scope ?? null,
+    workspacePath: input.workspacePath ?? null,
+  });
+}
+
+/// `skillIds` null installs every missing member; pass ids to install just those.
+export function skillsInstallPackage(input: {
+  packageId: string;
+  agentType?: SkillAgentType;
+  scope?: SkillScope;
+  workspacePath?: string | null;
+  skillIds?: string[] | null;
+}): Promise<SkillPackageInstallResult> {
+  return invoke("skills_install_package", {
+    packageId: input.packageId,
+    agentType: input.agentType ?? null,
+    scope: input.scope ?? null,
+    workspacePath: input.workspacePath ?? null,
+    skillIds: input.skillIds ?? null,
+  });
+}
+
+export function skillsUninstallPackage(input: {
+  packageId: string;
+  agentType?: SkillAgentType;
+  scope?: SkillScope;
+  workspacePath?: string | null;
+  skillIds?: string[] | null;
+}): Promise<SkillPackageUninstallResult> {
+  return invoke("skills_uninstall_package", {
+    packageId: input.packageId,
+    agentType: input.agentType ?? null,
+    scope: input.scope ?? null,
+    workspacePath: input.workspacePath ?? null,
+    skillIds: input.skillIds ?? null,
+  });
+}
+
+export type NotificationChannelKind =
+  | { type: "feishu"; webhook_url: string }
+  | { type: "bark"; server_url: string; device_key: string }
+  | { type: "webhook"; url: string };
+
+export function testNotification(kind: NotificationChannelKind): Promise<void> {
+  return invoke("test_notification", { kind });
+}
+
+// 仅注册为桌面命令，不向远端 Web/租户开放宿主认证写入。
+export function getClientDirectModes(): Promise<DirectModeStatus[]> {
+  return invoke("get_client_direct_modes");
+}
+
+export function enableClientDirectMode(credentialId: string): Promise<DirectModeStatus> {
+  return invoke("enable_client_direct_mode", { credentialId });
+}
