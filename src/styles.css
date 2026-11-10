@@ -1,0 +1,963 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+:where(h1, h2, h3, h4, h5, h6, p, figure, blockquote, dl, dd) {
+  margin: 0;
+}
+
+:where(ul, ol) {
+  margin: 0;
+  padding: 0;
+}
+
+:where(button, input:not([type="checkbox"]):not([type="radio"]), optgroup, select, textarea) {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  border: 1px solid #d6d3d1;
+}
+
+input:not([type="checkbox"]):not([type="radio"])[class*="border-stone-200"],
+select[class*="border-stone-200"],
+textarea[class*="border-stone-200"] {
+  border-color: #d6d3d1;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+:root {
+  color: #1d1d1f;
+  background: #e8e6e1;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI",
+    sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  height: 100%;
+  max-height: 100dvh;
+  background:
+    radial-gradient(circle at 18% 0%, rgba(255, 255, 255, 0.9), transparent 34rem),
+    linear-gradient(135deg, #f5f3ee 0%, #e7e4dd 48%, #dcd9d1 100%);
+}
+
+button,
+select,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button,
+input:not([type="checkbox"]):not([type="radio"]),
+textarea {
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+input:not([type="checkbox"]):not([type="radio"]),
+textarea {
+  cursor: text;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* `data-plain-text` opts a button out of the chrome below. Some buttons are a run
+   of text that happens to be clickable — the account row's stats line — and on
+   those the radius plus the shadow draw a ghost border around the sentence. The
+   opt-out also leaves `box-shadow` unset, so the focus-visible ring further down
+   this file finally reaches them. */
+.accounts-screen button[class*="border"]:not([data-plain-text]),
+.accounts-screen button:not([class*="border"]):not([data-plain-text]) {
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.accounts-screen button:not([class*="border"]):not([data-plain-text]) {
+  border: 1px solid transparent;
+}
+
+.accounts-screen input:not([type="checkbox"]):not([type="radio"]),
+.accounts-screen select,
+.accounts-screen textarea {
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+
+.accounts-screen input:not([type="checkbox"]):not([type="radio"]):not([class*="border"]),
+.accounts-screen select:not([class*="border"]),
+.accounts-screen textarea:not([class*="border"]) {
+  border: 1px solid #d6d3d1;
+  background: #fff;
+}
+
+.accounts-screen input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+.accounts-screen select:focus-visible,
+.accounts-screen textarea:focus-visible {
+  outline: none;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18), 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.app-sidebar-drawer {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 50;
+  width: min(var(--app-sidebar-width), calc(100vw - 3rem));
+  max-width: 100vw;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.35);
+}
+
+.app-sidebar-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Motion system                                                               */
+/* -------------------------------------------------------------------------- */
+:root {
+  --motion-ease-standard: cubic-bezier(0.22, 1, 0.36, 1);
+  --motion-ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --motion-duration-instant: 120ms;
+  --motion-duration-control: 180ms;
+  --motion-duration-surface: 240ms;
+  --motion-duration-page: 320ms;
+  --motion-focus-ring: 0 0 0 3px rgba(96, 165, 250, 0.18);
+}
+
+.motion-control {
+  transition:
+    transform var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard),
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-control) var(--motion-ease-standard),
+    opacity var(--motion-duration-control) var(--motion-ease-standard),
+    filter var(--motion-duration-control) var(--motion-ease-standard);
+  transform-origin: center;
+}
+
+.motion-page {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  transform-origin: center top;
+  will-change: transform, opacity;
+}
+
+.app-shell {
+  transition: grid-template-columns var(--motion-duration-page) var(--motion-ease-standard);
+}
+
+.motion-layout {
+  transition: grid-template-rows var(--motion-duration-page) var(--motion-ease-standard);
+}
+
+.app-sidebar {
+  transition:
+    padding var(--motion-duration-page) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-surface) var(--motion-ease-standard),
+    background-color var(--motion-duration-surface) var(--motion-ease-standard);
+}
+
+/* Every interactive control gets a small, physically legible press/release. */
+:where(button, [role="button"], summary) {
+  transition:
+    transform var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard),
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-control) var(--motion-ease-standard),
+    opacity var(--motion-duration-control) var(--motion-ease-standard),
+    filter var(--motion-duration-control) var(--motion-ease-standard);
+  transform-origin: center;
+  will-change: transform;
+}
+
+@media (hover: hover) {
+  :where(button, [role="button"]):not(:disabled):not([aria-disabled="true"]):hover {
+    transform: translateY(-1px);
+  }
+}
+
+:where(button, [role="button"]):not(:disabled):active {
+  transform: translateY(0) scale(0.985);
+  transition-duration: var(--motion-duration-instant);
+}
+
+:where(button, [role="button"]):focus-visible,
+summary:focus-visible {
+  outline: none;
+  box-shadow: var(--motion-focus-ring);
+}
+
+:where(input, select, textarea) {
+  transition:
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-control) var(--motion-ease-standard),
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard);
+}
+
+:where(input, select, textarea):focus-visible {
+  outline: none;
+  box-shadow: var(--motion-focus-ring);
+}
+
+:where(input[type="checkbox"], input[type="radio"]) {
+  accent-color: #d97706;
+  transition: transform var(--motion-duration-instant) var(--motion-ease-standard), filter var(--motion-duration-control) var(--motion-ease-standard);
+}
+
+:where(input[type="checkbox"], input[type="radio"]):active {
+  transform: scale(0.92);
+}
+
+:where(.motion-dialog, .motion-menu, [role="dialog"], [role="menu"]) {
+  transform-origin: center top;
+}
+
+:where([role="alert"], [role="status"]) {
+  animation: motion-surface-enter var(--motion-duration-surface) var(--motion-ease-standard) both;
+}
+
+.motion-menu {
+  will-change: transform, opacity;
+}
+
+.motion-surface,
+.motion-page article,
+.motion-page [data-testid^="account-card-"],
+.motion-page [data-testid^="credential-"] {
+  animation: motion-surface-enter var(--motion-duration-surface) var(--motion-ease-standard) both;
+  will-change: transform, opacity;
+}
+
+.motion-collapse {
+  min-height: 0;
+  will-change: height, opacity;
+}
+
+.motion-overlay:not(.motion-runtime-overlay),
+.app-sidebar-drawer-backdrop {
+  animation: motion-backdrop-enter var(--motion-duration-surface) var(--motion-ease-standard) both;
+}
+
+.app-sidebar-drawer {
+  animation: motion-drawer-enter var(--motion-duration-surface) var(--motion-ease-standard) both;
+  transform-origin: left center;
+}
+
+/* Native conditional surfaces still receive a graceful entry even when a local
+   component does not need the full MotionOverlay wrapper. */
+[role="menu"] {
+  animation: motion-menu-enter var(--motion-duration-control) var(--motion-ease-standard) both;
+}
+
+[role="dialog"]:not(.motion-dialog) {
+  animation: motion-dialog-enter var(--motion-duration-surface) var(--motion-ease-standard) both;
+}
+
+@keyframes motion-surface-enter {
+  from { opacity: 0; transform: translateY(6px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes motion-menu-enter {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes motion-dialog-enter {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes motion-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes motion-drawer-enter {
+  from { opacity: 0; transform: translateX(-18px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+
+  :where(button, [role="button"], summary, input, select, textarea) {
+    transition-duration: 0.01ms !important;
+  }
+
+  :where(button, [role="button"]):not(:disabled):hover,
+  :where(button, [role="button"]):not(:disabled):active {
+    transform: none;
+  }
+
+  .motion-page,
+  .motion-layout,
+  .app-shell,
+  .app-sidebar,
+  .motion-dialog,
+  .motion-menu,
+  .motion-collapse {
+    transition-duration: 0.01ms !important;
+  }
+
+  :where([role="alert"], [role="status"], [role="menu"], [role="dialog"], .app-sidebar-drawer, .app-sidebar-drawer-backdrop),
+  .motion-surface,
+  .motion-page article,
+  .motion-page [data-testid^="account-card-"],
+  .motion-page [data-testid^="credential-"] {
+    animation: none !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    animation-play-state: paused !important;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Dark theme                                                                  */
+/* -------------------------------------------------------------------------- */
+/* Match whole utilities (including opacity and interaction variants), never
+   substrings such as class*="bg-white" which also match hover-only utilities.
+   Cover global dialogs mounted outside AppLayout as well. */
+html.dark {
+  color-scheme: dark;
+  color: #e7e5e4;
+  background: #191614;
+}
+
+html.dark body {
+  background:
+    radial-gradient(circle at 18% 0%, rgba(255, 255, 255, 0.05), transparent 34rem),
+    linear-gradient(135deg, #1c1917 0%, #171412 48%, #131110 100%);
+}
+
+/* Neutral surfaces. Low-opacity white highlights on solid buttons stay white. */
+
+html.dark :is(.bg-white) {
+  background-color: #221f1c;
+}
+
+html.dark :is([class~="bg-white/50"]) {
+  background-color: rgba(34, 31, 28, 0.5);
+}
+
+html.dark :is([class~="bg-white/55"]) {
+  background-color: rgba(34, 31, 28, 0.55);
+}
+
+html.dark :is([class~="bg-white/56"]) {
+  background-color: rgba(34, 31, 28, 0.56);
+}
+
+html.dark :is([class~="bg-white/65"]) {
+  background-color: rgba(34, 31, 28, 0.65);
+}
+
+html.dark :is([class~="bg-white/70"]) {
+  background-color: rgba(34, 31, 28, 0.7);
+}
+
+html.dark :is([class~="bg-white/80"]) {
+  background-color: rgba(34, 31, 28, 0.8);
+}
+
+html.dark :is([class~="bg-white/82"]) {
+  background-color: rgba(34, 31, 28, 0.82);
+}
+
+html.dark :is([class~="bg-white/84"]) {
+  background-color: rgba(34, 31, 28, 0.84);
+}
+
+html.dark :is([class~="bg-white/86"]) {
+  background-color: rgba(34, 31, 28, 0.86);
+}
+
+html.dark :is([class~="bg-white/88"]) {
+  background-color: rgba(34, 31, 28, 0.88);
+}
+
+html.dark :is([class~="bg-white/90"]) {
+  background-color: rgba(34, 31, 28, 0.9);
+}
+
+html.dark :is([class~="bg-white/95"]) {
+  background-color: rgba(34, 31, 28, 0.95);
+}
+
+html.dark :is(.bg-stone-50) {
+  background-color: #292523;
+}
+
+html.dark :is(.bg-stone-100, .bg-slate-100) {
+  background-color: #191614;
+}
+
+html.dark :is(.bg-stone-200) {
+  background-color: #34302c;
+}
+
+html.dark :is(.bg-stone-300) {
+  background-color: #57534e;
+}
+
+html.dark :is(.bg-stone-800) {
+  background-color: #211d1a;
+}
+
+html.dark :is(.bg-stone-900, .bg-slate-900) {
+  background-color: #141110;
+}
+
+html.dark :is(.bg-stone-950) {
+  background-color: #0c0a09;
+}
+
+html.dark :is([class~="bg-stone-50/50"]) {
+  background-color: rgba(41, 37, 35, 0.5);
+}
+
+html.dark :is([class~="bg-stone-50/60"]) {
+  background-color: rgba(41, 37, 35, 0.6);
+}
+
+html.dark :is([class~="bg-stone-50/70"]) {
+  background-color: rgba(41, 37, 35, 0.7);
+}
+
+html.dark :is([class~="bg-stone-50/80"]) {
+  background-color: rgba(41, 37, 35, 0.8);
+}
+
+html.dark :is([class~="bg-stone-100/75"]) {
+  background-color: rgba(25, 22, 20, 0.75);
+}
+
+html.dark :is([class~="bg-stone-100/90"]) {
+  background-color: rgba(25, 22, 20, 0.9);
+}
+
+html.dark :is([class~="hover:bg-white"]:hover, [class~="hover:bg-white/60"]:hover, [class~="hover:bg-white/70"]:hover, [class~="hover:bg-stone-50"]:hover, [class~="hover:bg-stone-100"]:hover, [class~="hover:bg-slate-50"]:hover) {
+  background-color: #34302c;
+}
+
+html.dark :is([class~="hover:bg-stone-200"]:hover) {
+  background-color: #443d37;
+}
+
+html.dark :is([class~="hover:bg-stone-300/70"]:hover) {
+  background-color: rgba(87, 83, 78, 0.7);
+}
+
+html.dark :is([class~="hover:bg-stone-700"]:hover, [class~="hover:bg-stone-800"]:hover, [class~="hover:bg-slate-800"]:hover) {
+  background-color: #302b27;
+}
+
+html.dark :is([class~="disabled:bg-stone-100"]:disabled) {
+  background-color: #292523;
+}
+
+html.dark :is([class~="disabled:bg-stone-400"]:disabled) {
+  background-color: #57534e;
+}
+
+/* Text: muted 11–13px labels still need readable contrast. */
+
+html.dark :is(.text-stone-400) {
+  color: #a8a29e;
+}
+
+html.dark :is(.text-stone-500) {
+  color: #b1aaa4;
+}
+
+html.dark :is(.text-stone-600) {
+  color: #c4beb9;
+}
+
+html.dark :is([class~="hover:text-stone-600"]:hover) {
+  color: #c4beb9;
+}
+
+html.dark :is(.text-stone-700, .text-slate-700) {
+  color: #d6d1cc;
+}
+
+html.dark :is([class~="hover:text-stone-700"]:hover) {
+  color: #d6d1cc;
+}
+
+html.dark :is(.text-stone-800) {
+  color: #e7e5e4;
+}
+
+html.dark :is([class~="hover:text-stone-800"]:hover) {
+  color: #e7e5e4;
+}
+
+html.dark :is(.text-stone-900, .text-stone-950, .text-slate-900) {
+  color: #f2f0ee;
+}
+
+html.dark :is([class~="hover:text-stone-900"]:hover, [class~="hover:text-stone-950"]:hover) {
+  color: #f2f0ee;
+}
+
+html.dark :is([class~="disabled:text-stone-500"]:disabled, [class~="disabled:text-stone-600"]:disabled) {
+  color: #a8a29e;
+}
+
+html.dark [class~="placeholder:text-stone-400"]::placeholder {
+  color: #a8a29e;
+}
+
+/* Borders, dividers and rings use UnoCSS variables, not Tailwind --tw-*. */
+
+html.dark :is(.border-stone-100) {
+  border-color: #332e29;
+}
+
+html.dark :is(.border-stone-200, .border-slate-200) {
+  border-color: #49423c;
+}
+
+html.dark :is(.border-stone-300, .border-stone-400) {
+  border-color: #62594f;
+}
+
+html.dark :is([class~="border-stone-200/70"]) {
+  border-color: rgba(73, 66, 60, 0.7);
+}
+
+html.dark :is([class~="border-stone-200/80"]) {
+  border-color: rgba(73, 66, 60, 0.8);
+}
+
+html.dark :is([class~="border-stone-300/80"]) {
+  border-color: rgba(98, 89, 79, 0.8);
+}
+
+html.dark :is([class~="border-white/70"], [class~="border-white/80"]) {
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+html.dark :is([class~="hover:border-stone-300"]:hover, [class~="hover:border-stone-400"]:hover, [class~="hover:border-slate-300"]:hover) {
+  border-color: #8f8174;
+}
+
+html.dark :is(.divide-stone-100, .divide-stone-200) > :not([hidden]) ~ :not([hidden]) {
+  border-color: #49423c;
+}
+
+html.dark :is(.ring-stone-200, .ring-stone-300, [class~="ring-stone-300/70"]) {
+  --un-ring-color: #62594f;
+}
+
+html.dark :is([class~="hover:ring-stone-300"]:hover, [class~="focus:ring-stone-100"]:focus, [class~="focus:ring-stone-300"]:focus) {
+  --un-ring-color: #62594f;
+}
+
+/* Status palettes retain their meaning without bright light-mode fills. */
+
+html.dark :is(.bg-red-50) {
+  background-color: #3a1f20;
+}
+
+html.dark :is([class~="hover:bg-red-50"]:hover) {
+  background-color: #3a1f20;
+}
+
+html.dark :is(.bg-red-100) {
+  background-color: #4a2527;
+}
+
+html.dark :is([class~="hover:bg-red-100"]:hover) {
+  background-color: #4a2527;
+}
+
+html.dark :is(.border-red-200, .border-red-300) {
+  border-color: #713236;
+}
+
+html.dark :is([class~="hover:border-red-300"]:hover) {
+  border-color: #713236;
+}
+
+html.dark :is(.text-red-600, .text-red-700) {
+  color: #fca5a5;
+}
+
+html.dark :is([class~="hover:text-red-600"]:hover, [class~="hover:text-red-700"]:hover) {
+  color: #fca5a5;
+}
+
+html.dark :is(.text-red-800, .text-red-900, .text-red-950) {
+  color: #fecaca;
+}
+
+html.dark :is(.ring-red-200) {
+  --un-ring-color: #713236;
+}
+
+html.dark :is(.bg-amber-50) {
+  background-color: #3a2b16;
+}
+
+html.dark :is([class~="hover:bg-amber-50"]:hover) {
+  background-color: #3a2b16;
+}
+
+html.dark :is([class~="hover:bg-amber-100"]:hover) {
+  background-color: #4b3519;
+}
+
+html.dark :is(.border-amber-100, .border-amber-200, .border-amber-300) {
+  border-color: #765321;
+}
+
+html.dark :is([class~="hover:border-amber-300"]:hover) {
+  border-color: #765321;
+}
+
+html.dark :is(.text-amber-600, .text-amber-700) {
+  color: #fcd34d;
+}
+
+html.dark :is(.text-amber-800, .text-amber-900, .text-amber-950) {
+  color: #fde68a;
+}
+
+html.dark :is(.ring-amber-200, .ring-amber-300) {
+  --un-ring-color: #765321;
+}
+
+html.dark :is(.bg-blue-50) {
+  background-color: #172f46;
+}
+
+html.dark :is([class~="hover:bg-blue-100"]:hover, [class~="focus-visible:bg-blue-100"]:focus-visible) {
+  background-color: #1d3b58;
+}
+
+html.dark :is(.border-blue-100, .border-blue-200) {
+  border-color: #2d5b85;
+}
+
+html.dark :is(.text-blue-700) {
+  color: #93c5fd;
+}
+
+html.dark :is([class~="hover:text-blue-600"]:hover, [class~="hover:text-blue-700"]:hover) {
+  color: #93c5fd;
+}
+
+html.dark :is(.text-blue-800, .text-blue-900) {
+  color: #bfdbfe;
+}
+
+html.dark :is([class~="hover:text-blue-900"]:hover, [class~="focus-visible:text-blue-800"]:focus-visible) {
+  color: #bfdbfe;
+}
+
+html.dark :is(.ring-blue-200) {
+  --un-ring-color: #2d5b85;
+}
+
+html.dark :is([class~="focus:ring-blue-100"]:focus, [class~="focus:ring-blue-200"]:focus) {
+  --un-ring-color: #2d5b85;
+}
+
+html.dark :is(.bg-emerald-50) {
+  background-color: #17352c;
+}
+
+html.dark :is([class~="hover:bg-emerald-50"]:hover) {
+  background-color: #17352c;
+}
+
+html.dark :is(.bg-emerald-100) {
+  background-color: #1d4738;
+}
+
+html.dark :is([class~="hover:bg-emerald-100"]:hover) {
+  background-color: #1d4738;
+}
+
+html.dark :is(.border-emerald-100, .border-emerald-200, .border-emerald-300) {
+  border-color: #27634f;
+}
+
+html.dark :is([class~="hover:border-emerald-200"]:hover) {
+  border-color: #27634f;
+}
+
+html.dark :is(.text-emerald-600, .text-emerald-700) {
+  color: #6ee7b7;
+}
+
+html.dark :is(.text-emerald-800, .text-emerald-900, .text-emerald-950) {
+  color: #a7f3d0;
+}
+
+html.dark :is(.ring-emerald-200) {
+  --un-ring-color: #27634f;
+}
+
+html.dark :is(.bg-orange-50) {
+  background-color: #3b271a;
+}
+
+html.dark :is([class~="hover:bg-orange-50"]:hover) {
+  background-color: #3b271a;
+}
+
+html.dark :is(.bg-orange-100) {
+  background-color: #4b3220;
+}
+
+html.dark :is([class~="hover:bg-orange-100"]:hover, [class~="hover:bg-orange-200"]:hover) {
+  background-color: #4b3220;
+}
+
+html.dark :is(.border-orange-100, .border-orange-200) {
+  border-color: #785031;
+}
+
+html.dark :is(.text-orange-700) {
+  color: #fdba74;
+}
+
+html.dark :is(.text-orange-800) {
+  color: #fed7aa;
+}
+
+html.dark :is(.bg-sky-50) {
+  background-color: #152f40;
+}
+
+html.dark :is(.border-sky-100, .border-sky-200) {
+  border-color: #305c78;
+}
+
+html.dark :is(.text-sky-700) {
+  color: #7dd3fc;
+}
+
+html.dark :is(.text-sky-800, .text-sky-900, .text-sky-950) {
+  color: #bae6fd;
+}
+
+html.dark :is([class~="hover:text-sky-800"]:hover) {
+  color: #bae6fd;
+}
+
+html.dark :is(.ring-sky-200) {
+  --un-ring-color: #305c78;
+}
+
+html.dark :is(.bg-teal-50) {
+  background-color: #183430;
+}
+
+html.dark :is([class~="hover:bg-teal-50"]:hover) {
+  background-color: #183430;
+}
+
+html.dark :is(.text-teal-700) {
+  color: #5eead4;
+}
+
+html.dark :is(.text-teal-800) {
+  color: #99f6e4;
+}
+
+html.dark :is(.bg-violet-50) {
+  background-color: #2d2342;
+}
+
+html.dark :is([class~="hover:bg-violet-50"]:hover) {
+  background-color: #2d2342;
+}
+
+html.dark :is(.bg-violet-100) {
+  background-color: #3d2e57;
+}
+
+html.dark :is(.border-violet-200, .border-violet-300) {
+  border-color: #625081;
+}
+
+html.dark :is(.text-violet-700) {
+  color: #c4b5fd;
+}
+
+html.dark :is(.text-violet-800, .text-violet-900) {
+  color: #ddd6fe;
+}
+
+html.dark :is(.bg-indigo-50) {
+  background-color: #242a43;
+}
+
+html.dark :is(.text-indigo-600) {
+  color: #a5b4fc;
+}
+
+html.dark :is(.text-indigo-800) {
+  color: #c7d2fe;
+}
+
+html.dark :is(.bg-cyan-50) {
+  background-color: #15333b;
+}
+
+html.dark :is(.text-cyan-800) {
+  color: #a5f3fc;
+}
+
+html.dark :is(.bg-rose-50) {
+  background-color: #3c212b;
+}
+
+html.dark :is(.bg-rose-100) {
+  background-color: #4e2937;
+}
+
+html.dark :is(.text-rose-600, .text-rose-700) {
+  color: #fda4af;
+}
+
+html.dark :is(.text-rose-900) {
+  color: #fecdd3;
+}
+
+html.dark :is(.ring-rose-200) {
+  --un-ring-color: #7c4157;
+}
+
+html.dark :is([class~="bg-amber-50/80"]) {
+  background-color: rgba(58, 43, 22, 0.8);
+}
+
+html.dark :is([class~="bg-amber-100/80"]) {
+  background-color: rgba(75, 53, 25, 0.8);
+}
+
+html.dark :is([class~="bg-blue-50/60"]) {
+  background-color: rgba(23, 47, 70, 0.6);
+}
+
+html.dark :is([class~="bg-blue-50/70"]) {
+  background-color: rgba(23, 47, 70, 0.7);
+}
+
+html.dark :is([class~="hover:bg-emerald-50/70"]:hover) {
+  background-color: rgba(23, 53, 44, 0.7);
+}
+
+html.dark :is([class~="bg-orange-50/50"]) {
+  background-color: rgba(59, 39, 26, 0.5);
+}
+
+html.dark :is([class~="bg-sky-50/60"]) {
+  background-color: rgba(21, 47, 64, 0.6);
+}
+
+html.dark :is([class~="text-sky-800/80"]) {
+  color: rgba(186, 230, 253, 0.8);
+}
+
+/* Utility gradients need their stops themed as well as the solid fill. */
+
+html.dark :is(.from-amber-50) {
+  --un-gradient-from: #3a2b16 var(--un-gradient-from-position);
+}
+
+html.dark :is(.from-sky-50) {
+  --un-gradient-from: #152f40 var(--un-gradient-from-position);
+}
+
+html.dark :is(.to-emerald-50) {
+  --un-gradient-to: #17352c var(--un-gradient-to-position);
+}
+
+html.dark :is(.to-white) {
+  --un-gradient-to: #221f1c var(--un-gradient-to-position);
+}
+
+html.dark :is(.via-white) {
+  --un-gradient-stops: var(--un-gradient-from), #221f1c var(--un-gradient-via-position), var(--un-gradient-to);
+}
+
+/* Sidebar decorative gradients are intentionally separate from content cards. */
+html.dark .app-sidebar {
+  background: linear-gradient(135deg, rgba(28, 25, 23, 0.94), rgba(23, 21, 19, 0.9) 48%, rgba(25, 22, 19, 0.88));
+}
+html.dark .app-sidebar > .pointer-events-none.absolute.inset-0 {
+  background:
+    radial-gradient(circle at 20% 15%, rgba(16, 185, 129, 0.1), transparent 34%),
+    radial-gradient(circle at 88% 8%, rgba(245, 158, 11, 0.08), transparent 30%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+}
+
+/* Native field defaults must not override status/validation borders. */
+html.dark input:not([type="checkbox"]):not([type="radio"]):not([class*="border-"]):not(:focus),
+html.dark select:not([class*="border-"]):not(:focus),
+html.dark textarea:not([class*="border-"]):not(:focus) {
+  border-color: #49423c;
+}
+html.dark .accounts-screen input:not([type="checkbox"]):not([type="radio"]):not([class*="border"]),
+html.dark .accounts-screen select:not([class*="border"]),
+html.dark .accounts-screen textarea:not([class*="border"]) {
+  border-color: #49423c;
+  background: #221f1c;
+}
+
+/* Usage charts use currentColor for axes/grid only; data-series hues stay stable. */
+html.dark svg .text-stone-200 { color: #49423c; }
+html.dark svg .text-stone-300 { color: #62594f; }
+
+/* Focus borders must win over the base border, not inherit its dark gray. */
+html.dark :is([class~="focus:border-blue-400"]:focus, [class~="focus:border-blue-500"]:focus) {
+  border-color: #60a5fa;
+}
+html.dark :is([class~="focus:border-stone-400"]:focus, [class~="focus:border-stone-500"]:focus) {
+  border-color: #a8a29e;
+}

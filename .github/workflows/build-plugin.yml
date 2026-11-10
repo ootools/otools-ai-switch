@@ -1,0 +1,56 @@
+name: Build plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x64
+            library: Windows.dll
+          - os: ubuntu-latest
+            artifact: linux-x64
+            library: Linux.so
+          - os: macos-14
+            artifact: macos-arm64
+            library: macOS.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test:run
+      - run: node --test scripts/package.test.mjs
+      - run: pnpm build
+      - run: cargo test --manifest-path native/Cargo.toml --test plugin_boundary -- --test-threads=1
+      - run: node scripts/build-native.mjs
+      - run: python -I scripts/smoke-native.py --library lib/${{ matrix.library }}
+      - run: node scripts/pack-plugin.mjs
+      - run: node scripts/verify-plugin.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: otools-ai-switch-${{ matrix.artifact }}
+          path: dist-pack/
+          if-no-files-found: error

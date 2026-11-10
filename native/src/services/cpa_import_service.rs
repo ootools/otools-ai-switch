@@ -1,0 +1,475 @@
+use crate::error::AppError;
+use crate::models::platform::PlatformId;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParsedOfficialCredential {
+    pub display_name: String,
+    pub email: Option<String>,
+    pub secret_payload_json: String,
+    pub config_json: String,
+}
+
+pub fn parse_cpa_text(
+    platform: &str,
+    text: &str,
+) -> Result<Vec<ParsedOfficialCredential>, AppError> {
+    let platform = PlatformId::parse(platform)?;
+    let platform = platform.as_str();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(validation_error(
+            "validation.cpa_empty",
+            "CPA import text is empty",
+            None,
+        ));
+    }
+
+    let value: Value = serde_json::from_str(trimmed)?;
+
+    match value {
+        Value::Object(object) if platform == "claude" && object.contains_key("claudeAiOauth") => {
+            let mut native = object
+                .get("claudeAiOauth")
+                .and_then(Value::as_object)
+                .cloned()
+                .ok_or_else(|| {
+                    validation_error(
+                        "validation.cpa_shape",
+                        "claudeAiOauth must be an object",
+                        None,
+                    )
+                })?;
+            if let Some(expiry) = native.get("expiresAt").cloned() {
+                native.insert("expired".to_string(), expiry);
+            }
+            parse_cpa_object(platform, &native).map(|credential| vec![credential])
+        }
+        Value::Object(object) => match object.get("accounts") {
+            Some(accounts) => parse_cpa_accounts_wrapper(&platform, accounts),
+            None => parse_cpa_object(&platform, &object).map(|credential| vec![credential]),
+        },
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let object = item.as_object().ok_or_else(|| {
+                    validation_error(
+                        "validation.cpa_entry_object",
+                        "CPA array entries must be objects",
+                        Some(format!("Entry {index} is not an object")),
+                    )
+                })?;
+                parse_cpa_object(&platform, object)
+            })
+            .collect(),
+        _ => Err(validation_error(
+            "validation.cpa_shape",
+            "CPA import JSON must be an object or array",
+            Some(trimmed.to_string()),
+        )),
+    }
+}
+
+pub fn parse_cpa_file<P: AsRef<Path>>(
+    platform: &str,
+    path: P,
+    content: &str,
+) -> Result<Vec<ParsedOfficialCredential>, AppError> {
+    parse_cpa_text(platform, content).map_err(|err| with_file_context(err, path.as_ref()))
+}
+
+fn parse_cpa_object(
+    platform: &str,
+    object: &Map<String, Value>,
+) -> Result<ParsedOfficialCredential, AppError> {
+    let raw_type = string_field(object, &["type"]);
+    if let Some(raw_type) = raw_type.as_deref() {
+        if !cpa_types_match(platform, raw_type) {
+            return Err(validation_error(
+                "validation.cpa_platform_mismatch",
+                "CPA credential type does not match the selected platform",
+                Some(format!("expected {platform}, got {raw_type}")),
+            ));
+        }
+    }
+
+    let email = string_field(object, &["email"]);
+    let display_name = string_field(object, &["display_name", "displayName", "name", "label"])
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| "Official account".to_string());
+
+    let id_token = token_field(object, "id_token", "idToken");
+    let access_token = token_field(object, "access_token", "accessToken");
+    let refresh_token = token_field(object, "refresh_token", "refreshToken");
+    let account_id = token_field(object, "account_id", "accountId");
+
+    if access_token.is_none() && refresh_token.is_none() {
+        return Err(validation_error(
+            "validation.cpa_secret_required",
+            "CPA credential requires access_token or refresh_token",
+            None,
+        ));
+    }
+
+    let last_refresh = value_field(object, &["last_refresh", "lastRefresh"]);
+    let expired = value_field(object, &["expired"]);
+    let base_url = string_field(object, &["base_url", "baseUrl"]);
+    let token_endpoint = string_field(object, &["token_endpoint", "tokenEndpoint"]);
+    let auth_kind = string_field(object, &["auth_kind", "authKind"]);
+    let sub = string_field(object, &["sub"]);
+    let token_type = string_field(object, &["token_type", "tokenType"]);
+    let redirect_uri = string_field(object, &["redirect_uri", "redirectUri"]);
+    let expires_in = value_field(object, &["expires_in", "expiresIn"]);
+    let disabled = value_field(object, &["disabled"]);
+    let headers = object
+        .get("headers")
+        .cloned()
+        .filter(|value| value.is_object())
+        .unwrap_or(Value::Null);
+    let headers = normalize_imported_headers(platform, &headers);
+
+    // Keep the original CPA object for lossless re-export / future fields.
+    let raw = Value::Object(object.clone());
+
+    let secret_payload_json = json!({
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": account_id,
+    })
+    .to_string();
+
+    let mut config = Map::new();
+    config.insert("type".to_string(), json!(platform));
+    config.insert("raw_type".to_string(), json!(raw_type));
+    config.insert("account_id".to_string(), json!(account_id));
+    config.insert("last_refresh".to_string(), last_refresh);
+    config.insert("expired".to_string(), expired);
+    config.insert("expires_in".to_string(), expires_in);
+    config.insert("disabled".to_string(), disabled);
+    config.insert("raw".to_string(), raw);
+
+    if let Some(base_url) = base_url {
+        config.insert("base_url".to_string(), json!(base_url));
+    }
+    if let Some(token_endpoint) = token_endpoint {
+        config.insert("token_endpoint".to_string(), json!(token_endpoint));
+    }
+    if let Some(auth_kind) = auth_kind {
+        config.insert("auth_kind".to_string(), json!(auth_kind));
+    }
+    if let Some(sub) = sub {
+        config.insert("sub".to_string(), json!(sub));
+    }
+    if let Some(token_type) = token_type {
+        config.insert("token_type".to_string(), json!(token_type));
+    }
+    if let Some(redirect_uri) = redirect_uri {
+        config.insert("redirect_uri".to_string(), json!(redirect_uri));
+    }
+    if platform == "grok" || !headers.is_null() {
+        config.insert("headers".to_string(), headers);
+    }
+
+    let config_json = Value::Object(config).to_string();
+
+    Ok(ParsedOfficialCredential {
+        display_name,
+        email,
+        secret_payload_json,
+        config_json,
+    })
+}
+
+fn parse_cpa_accounts_wrapper(
+    platform: &str,
+    accounts: &Value,
+) -> Result<Vec<ParsedOfficialCredential>, AppError> {
+    let accounts = accounts.as_array().ok_or_else(|| {
+        validation_error(
+            "validation.cpa_accounts_array",
+            "CPA accounts wrapper must contain an accounts array",
+            None,
+        )
+    })?;
+
+    accounts
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let object = item.as_object().ok_or_else(|| {
+                validation_error(
+                    "validation.cpa_entry_object",
+                    "CPA accounts wrapper entries must be objects",
+                    Some(format!("Entry {index} is not an object")),
+                )
+            })?;
+            let normalized = normalize_cpa_wrapper_account(object);
+            parse_cpa_object(platform, &normalized)
+        })
+        .collect()
+}
+
+fn normalize_cpa_wrapper_account(object: &Map<String, Value>) -> Map<String, Value> {
+    let mut normalized = object.clone();
+
+    if !normalized.contains_key("type") {
+        if let Some(provider) = value_field_option(object, &["provider", "platform", "app"]) {
+            normalized.insert("type".to_string(), provider);
+        }
+    }
+
+    if let Some(credentials) = object.get("credentials").and_then(Value::as_object) {
+        for (key, value) in credentials {
+            normalized
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    normalized
+}
+
+fn normalize_imported_headers(platform: &str, headers: &Value) -> Value {
+    // Preserve non-Grok headers as-is.
+    if platform != "grok" {
+        return headers.clone();
+    }
+
+    // CLIProxyAPI chat-proxy identity headers (force-set on request too).
+    // Older CPA exports only store User-Agent=grok-cli which upstream treats as version none.
+    let mut map = match headers {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    map.insert("User-Agent".to_string(), json!("xai-grok-workspace/0.2.93"));
+    map.insert("X-XAI-Token-Auth".to_string(), json!("xai-grok-cli"));
+    map.insert("x-grok-client-version".to_string(), json!("0.2.93"));
+    map.remove("X-Client-Name");
+    map.remove("x-client-name");
+    Value::Object(map)
+}
+
+fn token_field(object: &Map<String, Value>, snake_case: &str, camel_case: &str) -> Option<String> {
+    string_field(object, &[snake_case, camel_case]).or_else(|| {
+        object
+            .get("tokens")
+            .and_then(Value::as_object)
+            .and_then(|tokens| string_field(tokens, &[snake_case, camel_case]))
+    })
+}
+
+fn string_field(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn value_field(object: &Map<String, Value>, keys: &[&str]) -> Value {
+    value_field_option(object, keys).unwrap_or(Value::Null)
+}
+
+fn value_field_option(object: &Map<String, Value>, keys: &[&str]) -> Option<Value> {
+    keys.iter().find_map(|key| object.get(*key).cloned())
+}
+
+fn cpa_types_match(expected_platform: &str, raw_type: &str) -> bool {
+    matches!(
+        (
+            PlatformId::parse(expected_platform),
+            PlatformId::parse(raw_type)
+        ),
+        (Ok(expected), Ok(actual)) if expected == actual
+    )
+}
+
+fn validation_error(code: &'static str, message: &str, details: Option<String>) -> AppError {
+    AppError::Validation {
+        code,
+        message: message.to_string(),
+        details,
+        recoverable: true,
+    }
+}
+
+fn with_file_context(err: AppError, path: &Path) -> AppError {
+    let label = path.to_string_lossy();
+    match err {
+        AppError::Validation {
+            code,
+            message,
+            details,
+            recoverable,
+        } => AppError::Validation {
+            code,
+            message: format!("{label}: {message}"),
+            details,
+            recoverable,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cliproxyapi_codex_object() {
+        let text = r#"{
+          "type":"codex",
+          "email":"a@example.com",
+          "id_token":"id",
+          "access_token":"at",
+          "refresh_token":"rt_1",
+          "account_id":"ac_1"
+        }"#;
+        let parsed = parse_cpa_text("codex", text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].email.as_deref(), Some("a@example.com"));
+        assert!(parsed[0].secret_payload_json.contains("rt_1"));
+    }
+
+    #[test]
+    fn parses_nested_and_camel_case_array() {
+        let text = r#"[{
+          "type":"claude",
+          "email":"b@example.com",
+          "tokens":{"accessToken":"sk-ant-oat01-x","refreshToken":"sk-ant-ort01-y"}
+        }]"#;
+        let parsed = parse_cpa_text("claude", text).unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn parses_accounts_wrapper_export() {
+        let text = r#"{"accounts":[{"provider":"anthropic","email":"x@example.com","credentials":{"access_token":"a","refresh_token":"b"}}]}"#;
+        let parsed = parse_cpa_text("claude", text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].email.as_deref(), Some("x@example.com"));
+        assert!(parsed[0]
+            .secret_payload_json
+            .contains("\"access_token\":\"a\""));
+        assert!(parsed[0]
+            .secret_payload_json
+            .contains("\"refresh_token\":\"b\""));
+        assert!(parsed[0].config_json.contains("\"raw\""));
+    }
+
+    #[test]
+    fn rejects_platform_mismatch() {
+        let text = r#"{"type":"claude","access_token":"a","refresh_token":"b"}"#;
+        assert!(parse_cpa_text("codex", text).is_err());
+    }
+
+    #[test]
+    fn rejects_substring_platform_aliases() {
+        let text = r#"{"type":"my-grok-wrapper","access_token":"at","refresh_token":"rt"}"#;
+
+        let error = parse_cpa_text("grok", text).expect_err("substring aliases are unsafe");
+
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "validation.cpa_platform_mismatch",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accepts_xai_type_alias_for_grok_platform() {
+        let text = r#"{
+          "type":"xai",
+          "email":"g@example.com",
+          "access_token":"at-xai",
+          "refresh_token":"rt-xai",
+          "id_token":"id-xai",
+          "token_type":"Bearer",
+          "expires_in":null,
+          "expired":"2026-07-21T10:31:25Z",
+          "last_refresh":"2026-07-21T04:31:26Z",
+          "auth_kind":"oauth",
+          "sub":"2835da8c-3bdf-4096-9920-0af2a8dc325b",
+          "redirect_uri":"",
+          "token_endpoint":"https://auth.x.ai/oauth2/token",
+          "base_url":"https://cli-chat-proxy.grok.com/v1",
+          "disabled":false,
+          "headers":{
+            "User-Agent":"grok-cli",
+            "X-Client-Name":"grok-cli"
+          }
+        }"#;
+        let parsed = parse_cpa_text("grok", text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].email.as_deref(), Some("g@example.com"));
+        assert!(parsed[0].secret_payload_json.contains("at-xai"));
+        assert!(parsed[0].secret_payload_json.contains("rt-xai"));
+        assert!(parsed[0].secret_payload_json.contains("id-xai"));
+        assert!(parsed[0].config_json.contains("\"type\":\"grok\""));
+        assert!(parsed[0].config_json.contains("\"raw_type\":\"xai\""));
+        assert!(parsed[0]
+            .config_json
+            .contains("https://cli-chat-proxy.grok.com/v1"));
+        assert!(parsed[0]
+            .config_json
+            .contains("https://auth.x.ai/oauth2/token"));
+        assert!(parsed[0].config_json.contains("xai-grok-workspace/0.2.93"));
+        assert!(parsed[0].config_json.contains("x-grok-client-version"));
+        // Stored headers are upgraded; original CPA payload remains in raw for lossless re-export.
+        assert!(
+            parsed[0]
+                .config_json
+                .contains("\"headers\":{\"User-Agent\":\"xai-grok-workspace/0.2.93\"")
+                || parsed[0].config_json.contains("xai-grok-workspace/0.2.93")
+        );
+        assert!(parsed[0].config_json.contains("\"auth_kind\":\"oauth\""));
+        assert!(parsed[0]
+            .config_json
+            .contains("2835da8c-3bdf-4096-9920-0af2a8dc325b"));
+        assert!(parsed[0].config_json.contains("\"raw\""));
+    }
+
+    #[test]
+    fn accepts_grok_platform_when_import_target_is_xai_alias() {
+        let text = r#"{"type":"grok","access_token":"at","refresh_token":"rt"}"#;
+        let parsed = parse_cpa_text("xai", text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].config_json.contains("\"type\":\"grok\""));
+    }
+
+    #[test]
+    fn fills_default_grok_cli_headers_when_missing() {
+        let text = r#"{"type":"xai","access_token":"at","refresh_token":"rt","base_url":"https://cli-chat-proxy.grok.com/v1"}"#;
+        let parsed = parse_cpa_text("grok", text).unwrap();
+        assert!(parsed[0].config_json.contains("xai-grok-workspace/0.2.93"));
+        assert!(parsed[0].config_json.contains("x-grok-client-version"));
+        assert!(parsed[0].config_json.contains("X-XAI-Token-Auth"));
+    }
+}
+
+#[cfg(test)]
+mod native_claude_auth_tests {
+    use super::*;
+    #[test]
+    fn imports_native_claude_oauth_with_expiry_and_scopes_for_direct_mode() {
+        let input = r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":4070908800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}"#;
+        let rows = parse_cpa_text("claude", input).unwrap();
+        let config: Value = serde_json::from_str(&rows[0].config_json).unwrap();
+        assert_eq!(config["expired"], 4070908800000i64);
+        let secret: Value = serde_json::from_str(&rows[0].secret_payload_json).unwrap();
+        assert_eq!(secret["access_token"], "at");
+        assert_eq!(
+            config["raw"]["scopes"],
+            json!(["user:inference", "user:profile"])
+        );
+    }
+}

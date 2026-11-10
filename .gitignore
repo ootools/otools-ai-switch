@@ -1,0 +1,14 @@
+node_modules/
+dist/
+lib/
+dist-pack/
+native/target/
+native/*.log
+native/*.err
+artifacts/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.DS_Store

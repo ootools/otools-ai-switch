@@ -1,0 +1,21957 @@
+use crate::database::repositories::route_credential_model_repository::RouteCredentialModelRepository;
+use crate::database::repositories::route_credential_repository::RouteCredentialRepository;
+use crate::services::route_credential_service::RouteCredentialService;
+use crate::database::repositories::route_pool_repository::RoutePoolRepository;
+use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+use crate::error::{ApiError, AppError};
+use crate::models::platform::{ApiDialect, CapabilityRule, PlatformId, PlatformOperation};
+use crate::models::route_credential::{
+    normalize_anthropic_api_key_field, ModelMapping, RouteCredentialFailurePolicy,
+    ANTHROPIC_API_KEY_FIELD, ANTHROPIC_AUTH_TOKEN_FIELD, CLAUDE_ONE_M_SUFFIX,
+};
+use crate::models::route_credential_model::{
+    FailureScope, RouteCredentialModelState, MODEL_STATUS_OK,
+};
+use crate::models::route_pool::RouteUsageBreakdown;
+use crate::models::settings::DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB;
+use crate::services::account_proxy::account_proxy_url;
+use crate::services::anthropic_thinking::strip_replayed_thinking_from_bytes;
+use crate::services::client_identity;
+use crate::services::codex_reasoning_cache::CodexReasoningCache;
+use crate::services::http_client::{
+    build_outbound_http_client, build_outbound_http_client_with_timeouts,
+    build_outbound_http_client_with_timeouts_and_proxy, outbound_proxy_description,
+    OutboundTimeouts,
+};
+use crate::services::official_agent_identity_service::{
+    resolve_agent_identity_headers, CODEX_CHATGPT_BACKEND_BASE_URL,
+};
+use crate::services::platform_capability_service::PlatformCapabilityService;
+use crate::services::request_compression;
+use crate::services::request_content_rejection;
+use crate::services::request_image_limit;
+use crate::services::response_failure_service::{
+    detect_response_failed, is_content_rejection, is_context_length_failure,
+    is_cross_resource_item_failure, is_definitive_quota_exhaustion_failure,
+    is_encrypted_content_failure, is_insufficient_permissions_failure,
+    is_missing_reasoning_failure, is_quota_exhaustion_failure, is_text_only_chat_content_failure,
+    is_thinking_signature_failure, is_too_many_images_failure,
+    stream_disconnected_before_completion, STREAM_DISCONNECTED_FAILURE_MESSAGE,
+};
+use crate::services::responses_encrypted_content::{
+    sanitize_reasoning_from_bytes, sanitize_replayed_reasoning_from_bytes, ReasoningCleanupMode,
+};
+use crate::services::route_config_service::generate_route_proxy_key;
+use crate::services::route_credential_activity::{
+    RouteCredentialActivityLease, RouteCredentialActivityRegistry,
+};
+use crate::services::route_failure_scope::is_account_scoped_failure;
+use crate::services::route_model_capability::{
+    advertised_model_catalog_entries_with_baseline_and_capability, catalog_members,
+    codex_effective_context_window, codex_reasoning_metadata,
+    effective_context_window_for_upstream, known_upstream_models_with_baseline,
+    mapping_declares_one_m_context, model_matches_with_baseline, model_state_key_with_mode,
+    parse_model_capability, parse_model_capability_value, requested_model_from_body,
+    resolve_mapping_target, supports_requested_capability_with_mode,
+    supports_requested_model_with_mode_with_baseline, CatalogMemberInput, ModelCapability,
+    ModelMatchMode, CODEX_ONE_M_CONTEXT_WINDOW,
+};
+use crate::services::route_pool_model_mode::{
+    accepted_prefixes, is_official_model_prefix, split_prefixed_model, strip_vendor_model_tag,
+    PoolModelMode,
+};
+use crate::services::route_protocol_bridge::{
+    force_reasoning_content_on_chat_body, is_anthropic_count_tokens_path,
+    prepare_request as prepare_protocol_bridge_request,
+    transform_response_with_tool_namespaces as transform_protocol_bridge_response, turn_reminder,
+    IncrementalResponseBridge, PreparedBridgeRequest, ProtocolBridgeKind, TransformedBridgeResponse,
+};
+use crate::services::route_proxy_live_log::{
+    stage_preview, truncated_stage_names, RouteProxyLiveLog, RouteProxyLiveLogEntry,
+    LIVE_LOG_ELISION_MARKER, LIVE_LOG_RAW_PREVIEW_LIMIT, LIVE_LOG_STAGE_LIMIT,
+};
+use crate::services::route_proxy_stream::{
+    sse_is_chat_role_prelude, sse_payload_started, StreamObserver,
+};
+use crate::services::route_stream_continuation::plan_continuation;
+use axum::body::Body;
+use axum::extract::State as AxumState;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use axum::Router;
+use chrono::{DateTime, Utc};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::{Row, SqlitePool};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
+
+const BIND_HOST: &str = "127.0.0.1";
+const DEFAULT_ROUTE_PROXY_PORT: u16 = 10888;
+const ROUTE_PROXY_KEY_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Upstream connect-phase ceiling. If the handshake does not complete there is
+/// nothing to wait for — fail the attempt so the retry queue moves on.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum gap between upstream reads, reset after each successful read.
+///
+/// Deliberately not a total deadline. A buffered response is only complete once
+/// the whole body has arrived, and a streamed one stays open for as long as the
+/// upstream keeps generating, so on either path a long answer legitimately takes
+/// minutes and a total budget would kill valid generations. What this catches is
+/// bytes stopping altogether — an upstream that accepted the connection and then
+/// went silent. Without it such a stall never returns an error, so the failover
+/// loop never runs and the CLI hangs forever.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long to wait before re-sending a streamed request whose upstream
+/// reported a failure frame instead of answering.
+///
+/// Deliberately short and fixed rather than read from the credential's failure
+/// policy: an upstream that fails this way has already answered, in
+/// milliseconds, so a policy-sized backoff — commonly seconds — would cost the
+/// caller far more than the retry is worth. The failure is transient on the
+/// upstream's side and re-asking usually lands on a healthy provider.
+const STREAM_DISCONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// The most keepalive padding to hold back while waiting for real content.
+///
+/// Past this the stream is forwarded as it stands. Without a cap, an upstream
+/// that only ever emits comment frames could hold the request open indefinitely
+/// in the hope that a payload frame is still coming.
+const STREAM_PRIME_HOLDBACK_LIMIT: usize = 64 * 1024;
+
+/// Public xAI Grok CLI OAuth client ID (CLIProxyAPI / Grok CLI).
+const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+// Keep in sync with CLIProxyAPI xai_executor (cli-chat-proxy identity headers).
+const GROK_CLI_CLIENT_VERSION: &str = "0.2.93";
+const GROK_CLI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+const GROK_CLI_CHAT_PROXY_MARKER: &str = "cli-chat-proxy.grok.com";
+/// Refresh a short time before wall-clock expiry to avoid edge 401s.
+const OAUTH_REFRESH_LEAD: Duration = Duration::from_secs(5 * 60);
+const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
+const CUSTOM_TOOL_INPUT_DESCRIPTION: &str =
+    "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
+const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const ROUTE_PROXY_PLATFORM_HEADER: &str = "x-ai-switch-platform";
+
+/// 视频端点要求账号声明的能力（`requested_video_capability` 的返回值）。
+///
+/// 提成常量是因为它有**两个**必须一致的消费方：请求期的候选过滤，以及
+/// `video_route_groups`（跨供应商选号）。两处写两遍字面量迟早漂移。
+const VIDEO_GENERATE_CAPABILITY: &str = "video.generate";
+/// 音频（TTS）端点要求账号声明的能力（`requested_audio_capability` 的返回值）。
+///
+/// 与 `VIDEO_GENERATE_CAPABILITY` 同构：音频也是一个**独立平台**（池身份是
+/// `audio`），所以 `/v1/models` 与候选过滤都按这一个能力收窄。
+const AUDIO_GENERATE_CAPABILITY: &str = "audio.generate";
+/// STT / 翻译端点（`/v1/audio/transcriptions`、`/v1/audio/translations`）要求的
+/// 能力。与 TTS 的 `audio.generate` **分开**：会说话的账号不一定会听，
+/// 一个账号声明哪个，哪个端点才轮得到它。
+const AUDIO_TRANSCRIBE_CAPABILITY: &str = "audio.transcribe";
+pub const ROUTE_PROXY_TRACE_HEADER: &str = "x-ai-switch-test-trace-id";
+const ROUTE_PROXY_CORS_ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+const ROUTE_PROXY_CORS_DEFAULT_ALLOW_HEADERS: &str =
+    "Authorization, Content-Type, X-API-Key, API-Key, X-Google-API-Key, X-AI-Switch-Platform, X-AI-Switch-Test-Trace-Id, Accept";
+const ROUTE_PROXY_RESPONSE_BODY_LIMIT: usize = 16 * 1024;
+/// Successful responses keep only a short preview so callers can confirm the
+/// upstream returned real AI content (vs. a fake/empty 200) without bloating
+/// `usage_events`, which is never pruned.
+const ROUTE_PROXY_SUCCESS_BODY_LIMIT: usize = 2 * 1024;
+/// Key holding the compressed preview. New rows write this and *not*
+/// `response_body`, so the size of what we retain no longer depends on how
+/// well the payload happens to compress.
+pub const ROUTE_PROXY_RESPONSE_BODY_ENCODED_KEY: &str = "response_body_br";
+/// Key holding an uncompressed preview. Only ever seen on rows written before
+/// the compressed form existed; readers must still accept it.
+pub const ROUTE_PROXY_RESPONSE_BODY_KEY: &str = "response_body";
+const TEXT_ONLY_CHAT_CONTENT_MESSAGE: &str = "当前会话包含多模态内容，但目标模型只支持纯文本；请换回多模态模型，或开启新会话后继续。 This conversation contains multimodal content, but the target model only accepts text; switch back to a multimodal model or start a new session.";
+
+async fn wait_for_credential_retry(policy: RouteCredentialFailurePolicy) {
+    if policy.retry_interval_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(policy.retry_interval_ms.into())).await;
+    }
+}
+
+/// 账号关掉故障转移后，它自己的失败就是这次请求的最终答案。
+///
+/// 默认行为是记账后继续试池里的下一个账号——聚合模式下这就是「切号」，也正是
+/// 池的价值所在。关掉之后清空重试队列：循环随即退出，客户端拿到的是这个账号
+/// 自己的错误，而不是一句聚合出来的「所有凭据都失败」。精确模式下候选本来就
+/// 只有一个，这里清空与否都没有区别。
+fn stop_failover_when_disabled(retry_queue: &mut VecDeque<(usize, usize)>, failover_enabled: bool) {
+    if !failover_enabled {
+        retry_queue.clear();
+    }
+}
+
+/// Everything the transport log line needs about one failed attempt.
+///
+/// Kept as a struct so [`format_upstream_transport_error`] stays pure: telling
+/// a connect timeout, a refused connection and a read stall apart is exactly
+/// what has been reported wrong before, and it is worth testing without a live
+/// socket per failure mode.
+#[derive(Default)]
+struct TransportErrorDetail<'a> {
+    /// reqwest's top-level Display, e.g. `error sending request for url (...)`.
+    text: &'a str,
+    /// Deepest cause behind that Display, e.g. `connection refused`.
+    cause: Option<&'a str>,
+    /// Outbound proxy this process is configured to use, if any.
+    proxy: Option<&'a str>,
+    is_connect: bool,
+    is_timeout: bool,
+}
+
+/// Describe an upstream transport failure, naming the phase and deadline that fired.
+///
+/// reqwest renders a timeout as a bare "operation timed out", which reads the
+/// same as any other transport error in the request log. Since a stalled
+/// upstream and a refused one call for different fixes, spell out which limit
+/// was hit and what it was set to.
+///
+/// The phase has to be decided before the timeout: a connect-phase timeout
+/// satisfies *both* `is_connect()` and `is_timeout()` (reqwest wraps the
+/// connect future in its own deadline and keeps the `TimedOut` in the source
+/// chain). Testing `is_timeout()` first therefore reported a connect timeout
+/// with the read-stall wording, and every non-timeout connect error — refused,
+/// aborted, TLS handshake failure — as if it had waited out the connect
+/// deadline, however fast it actually failed.
+fn describe_upstream_transport_error(
+    display_name: &str,
+    context: &str,
+    error: &reqwest::Error,
+    timeouts: OutboundTimeouts,
+) -> String {
+    let cause = transport_error_cause(error);
+    let proxy = outbound_proxy_description();
+    format_upstream_transport_error(
+        display_name,
+        context,
+        &TransportErrorDetail {
+            text: &error.to_string(),
+            cause: cause.as_deref(),
+            proxy: proxy.as_deref(),
+            is_connect: error.is_connect(),
+            is_timeout: error.is_timeout(),
+        },
+        timeouts,
+    )
+}
+
+/// Deepest message in reqwest's source chain.
+///
+/// `reqwest::Error`'s own Display stops at "error sending request for url
+/// (...)", which names neither the reason nor the layer that failed: a refused
+/// connection, a DNS failure and a TLS handshake error all read the same. The
+/// cause is what makes the log line actionable.
+fn transport_error_cause(error: &reqwest::Error) -> Option<String> {
+    use std::error::Error as _;
+
+    let mut cause = None;
+    let mut source = error.source();
+    while let Some(current) = source {
+        let text = current.to_string();
+        if !text.trim().is_empty() {
+            cause = Some(text);
+        }
+        source = current.source();
+    }
+    cause.map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Pure formatter behind [`describe_upstream_transport_error`].
+fn format_upstream_transport_error(
+    display_name: &str,
+    context: &str,
+    detail: &TransportErrorDetail<'_>,
+    timeouts: OutboundTimeouts,
+) -> String {
+    let mut message = format!("{display_name}: {context}: {}", detail.text);
+    if let Some(cause) = detail.cause.filter(|cause| {
+        let cause = cause.trim();
+        !cause.is_empty() && !detail.text.contains(cause)
+    }) {
+        message.push_str(": ");
+        message.push_str(cause.trim());
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    if detail.is_connect {
+        if let Some(connect) = timeouts.connect {
+            if detail.is_timeout {
+                notes.push(format!("connect timed out after {}s", connect.as_secs()));
+            } else {
+                notes.push(format!(
+                    "connection failed before the {}s connect deadline",
+                    connect.as_secs()
+                ));
+            }
+            notes.push("check network/proxy reachability".to_string());
+        }
+    } else if detail.is_timeout {
+        if let Some(read) = timeouts.read {
+            notes.push(format!(
+                "no data from upstream for {}s; treated as a stalled connection and retried/failed over",
+                read.as_secs()
+            ));
+        }
+    }
+    if let Some(proxy) = detail.proxy.filter(|proxy| !proxy.trim().is_empty()) {
+        notes.push(format!("outbound proxy {}", proxy.trim()));
+    }
+    if !notes.is_empty() {
+        message.push_str(&format!(" ({})", notes.join("; ")));
+    }
+    message
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteProxyStatus {
+    pub running: bool,
+    /// Whether pool model routes are accepted. Independent from `running`,
+    /// which reports whether a listener exists.
+    #[serde(default)]
+    pub route_access_enabled: bool,
+    #[serde(default)]
+    pub shared_listener: bool,
+    pub bind_host: String,
+    pub port: Option<u16>,
+    /// The address clients should use: the shared Web endpoint, or the HTTP
+    /// endpoint in legacy independent-listener mode. Writing client
+    /// configs, model connectivity tests and the stale-config nudge all read this
+    /// field, so it has to mean "which endpoint a client should point at" rather
+    /// than "which protocol is running" — a client that cannot read the local root
+    /// CA must keep working after HTTPS is switched on.
+    pub base_url: Option<String>,
+    pub https_port: Option<u16>,
+    /// The HTTPS endpoint, on its own port next to the HTTP one. `None` when HTTPS
+    /// is off or could not start.
+    pub https_base_url: Option<String>,
+    /// Why HTTPS could not start. HTTP keeps serving when this has a value.
+    pub https_error: Option<String>,
+}
+
+/// Which listeners the proxy should open.
+///
+/// HTTPS is always additive: it gets its own port and HTTP keeps serving on
+/// its own, so enabling it cannot break clients that ship their own CA bundle
+/// (curl on macOS/Linux, Node-based CLIs) and therefore never see the local root
+/// certificate.
+#[derive(Debug, Clone)]
+pub enum RouteProxyTransport {
+    HttpOnly,
+    HttpAndHttps {
+        certificate_pem_path: std::path::PathBuf,
+        private_key_pem_path: std::path::PathBuf,
+    },
+}
+
+#[derive(Clone)]
+pub struct RouteProxyRuntimeState {
+    inner: Arc<Mutex<RouteProxyInner>>,
+    activity: RouteCredentialActivityRegistry,
+    live_log: RouteProxyLiveLog,
+    request_body_limit_mib: Arc<AtomicU32>,
+}
+
+impl Default for RouteProxyRuntimeState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            request_body_limit_mib: Arc::new(AtomicU32::new(
+                DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB,
+            )),
+        }
+    }
+}
+
+/// A started listener together with the handle that stops it.
+struct ProxyListener {
+    port: u16,
+    base_url: String,
+    shutdown: oneshot::Sender<()>,
+    join_handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct RouteProxyInner {
+    http: Option<ProxyListener>,
+    https: Option<ProxyListener>,
+    route_access_enabled: bool,
+    /// Why the HTTPS listener is absent while HTTP serves on.
+    https_error: Option<String>,
+}
+
+impl RouteProxyInner {
+    /// Derived from owned listeners, so stopping the plugin also clears status.
+    fn running(&self) -> bool {
+        self.http.is_some() || self.https.is_some()
+    }
+
+    fn status(&self) -> RouteProxyStatus {
+        RouteProxyStatus {
+            running: self.http.is_some() || self.https.is_some(),
+            route_access_enabled: self.route_access_enabled,
+            shared_listener: false,
+            bind_host: BIND_HOST.to_string(),
+            port: self.http.as_ref().map(|listener| listener.port),
+            base_url: self.http.as_ref().map(|listener| listener.base_url.clone()),
+            https_port: self.https.as_ref().map(|listener| listener.port),
+            https_base_url: self
+                .https
+                .as_ref()
+                .map(|listener| listener.base_url.clone()),
+            https_error: self.https_error.clone(),
+        }
+    }
+
+    async fn shutdown_all(&mut self) {
+        for listener in [self.http.take(), self.https.take()].into_iter().flatten() {
+            shutdown_proxy_listener(listener).await;
+        }
+        self.https_error = None;
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProxyAppState {
+    pool: SqlitePool,
+    access_scope: Option<Arc<ProxyAccessScope>>,
+    model_match_mode: ModelMatchMode,
+    key_cache: Arc<Mutex<RouteProxyKeyCache>>,
+    activity: RouteCredentialActivityRegistry,
+    live_log: RouteProxyLiveLog,
+    codex_history: CodexReasoningCache,
+    /// Deadlines for upstream requests. A field rather than a constant read at
+    /// the call site so tests can drive a stalled upstream in milliseconds
+    /// instead of waiting out the production ceiling.
+    upstream_timeouts: OutboundTimeouts,
+    /// Clients keyed by account proxy URL. Kept across requests so an account
+    /// that owns an IP keeps its connection pool instead of reconnecting (and
+    /// re-negotiating TLS) on every request.
+    proxy_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
+    /// Shared with the runtime so saving settings affects existing listeners.
+    request_body_limit_mib: Arc<AtomicU32>,
+}
+
+#[derive(Clone)]
+struct ProxyAccessScope {
+    platform: PlatformId,
+    /// Trusted native callers can pin an account for video submission/polling.
+    /// `None` uses the active pool; `Some(empty)` deliberately permits no accounts.
+    credential_ids: Option<HashSet<String>>,
+}
+
+impl ProxyAppState {
+    /// Trust a native caller and pin its platform/account set. Never derive this
+    /// scope from public HTTP headers: public requests must use local API keys.
+    pub(crate) fn with_access_scope(
+        mut self,
+        platform: PlatformId,
+        credential_ids: HashSet<String>,
+    ) -> Self {
+        self.access_scope = Some(Arc::new(ProxyAccessScope {
+            platform,
+            credential_ids: Some(credential_ids),
+        }));
+        self
+    }
+
+    /// 只钉死平台，不限制账号子集（直连网关路径用）。
+    pub(crate) fn with_platform_scope(mut self, platform: PlatformId) -> Self {
+        self.access_scope = Some(Arc::new(ProxyAccessScope {
+            platform,
+            credential_ids: None,
+        }));
+        self
+    }
+
+    pub(crate) fn with_model_match_mode(mut self, mode: ModelMatchMode) -> Self {
+        self.model_match_mode = mode;
+        self
+    }
+
+    fn default_upstream_timeouts() -> OutboundTimeouts {
+        OutboundTimeouts {
+            connect: Some(UPSTREAM_CONNECT_TIMEOUT),
+            read: Some(UPSTREAM_READ_TIMEOUT),
+            ..OutboundTimeouts::default()
+        }
+    }
+
+    /// The client this account's requests must use. Accounts without a proxy
+    /// share `default_client`, which already honours the app-wide settings.
+    fn outbound_client_for_config(
+        &self,
+        default_client: &Client,
+        config_json: &str,
+    ) -> Result<Client, String> {
+        let Some(proxy_url) = account_proxy_url(config_json) else {
+            return Ok(default_client.clone());
+        };
+        {
+            let cache = self
+                .proxy_clients
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(client) = cache.get(&proxy_url) {
+                return Ok(client.clone());
+            }
+        }
+        let client =
+            build_outbound_http_client_with_timeouts_and_proxy(self.upstream_timeouts, &proxy_url)?;
+        self.proxy_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(proxy_url, client.clone());
+        Ok(client)
+    }
+}
+
+#[derive(Default)]
+struct RouteProxyKeyCache {
+    loaded_at: Option<Instant>,
+    // proxy_key -> platform
+    by_key: HashMap<String, String>,
+}
+
+impl RouteProxyRuntimeState {
+    pub fn set_request_body_limit_mib(&self, limit_mib: u32) {
+        self.request_body_limit_mib.store(limit_mib, Ordering::Relaxed);
+    }
+
+    pub fn activity(&self) -> RouteCredentialActivityRegistry {
+        self.activity.clone()
+    }
+
+    pub fn live_log(&self) -> RouteProxyLiveLog {
+        self.live_log.clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioResponseAdapter {
+    pub(crate) dialect: crate::audiogen::protocol::AudioDialect,
+    pub(crate) response_format: crate::audiogen::protocol::SpeechAudioFormat,
+}
+
+#[derive(Debug)]
+pub(crate) struct BuiltUpstreamRequest {
+    pub(crate) target_url: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
+    pub(crate) bridge_kind: Option<ProtocolBridgeKind>,
+    pub(crate) audio_response_adapter: Option<AudioResponseAdapter>,
+    pub(crate) audio_stream_dialect: Option<crate::audiogen::protocol::AudioDialect>,
+    pub(crate) tool_namespaces: BTreeMap<String, String>,
+    pub(crate) streaming_request: bool,
+    pub(crate) reasoning_sanitized: bool,
+}
+
+impl RouteProxyKeyCache {
+    fn get_if_fresh(&self, proxy_key: &str) -> Option<Option<String>> {
+        let loaded_at = self.loaded_at?;
+        if loaded_at.elapsed() > ROUTE_PROXY_KEY_CACHE_TTL {
+            return None;
+        }
+        Some(self.by_key.get(proxy_key).cloned())
+    }
+
+    fn replace(&mut self, rows: Vec<(String, String)>) {
+        self.by_key = rows.into_iter().collect();
+        self.loaded_at = Some(Instant::now());
+    }
+
+    fn upsert(&mut self, proxy_key: String, platform: String) {
+        // Keep cache coherent immediately after write_configs without waiting for TTL.
+        if self.loaded_at.is_none() {
+            self.loaded_at = Some(Instant::now());
+        }
+        self.by_key.insert(proxy_key, platform);
+    }
+}
+
+pub struct RouteProxyService;
+
+pub(crate) fn build_proxy_state(
+    pool: SqlitePool,
+    runtime: &RouteProxyRuntimeState,
+) -> ProxyAppState {
+    ProxyAppState {
+        pool,
+        access_scope: None,
+        model_match_mode: ModelMatchMode::ClientFacing,
+        key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+        activity: runtime.activity.clone(),
+        live_log: runtime.live_log.clone(),
+        codex_history: CodexReasoningCache::default(),
+        upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+        proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        request_body_limit_mib: runtime.request_body_limit_mib.clone(),
+    }
+}
+
+impl RouteProxyService {
+    pub async fn get_or_create_platform_key(
+        pool: &SqlitePool,
+        platform: &str,
+    ) -> Result<String, AppError> {
+        let platform = PlatformId::parse(platform)?.as_str();
+        if let Some(existing) = RouteProxyKeyRepository::get_by_platform(pool, platform).await? {
+            if !existing.starts_with("sk-ai-switch-test-") {
+                return Ok(existing);
+            }
+
+            let replacement = generate_route_proxy_key();
+            RouteProxyKeyRepository::replace_platform_key(pool, platform, &replacement).await?;
+            return RouteProxyKeyRepository::get_by_platform(pool, platform)
+                .await?
+                .ok_or_else(|| AppError::Database {
+                    code: "database.route_proxy_key_missing_after_rotate",
+                    message: "Could not load the new route proxy key".to_string(),
+                    details: None,
+                    recoverable: true,
+                });
+        }
+
+        RouteProxyKeyRepository::ensure_platform_key(pool, platform, &generate_route_proxy_key())
+            .await
+    }
+
+    pub async fn status(state: &RouteProxyRuntimeState) -> RouteProxyStatus {
+        state.inner.lock().await.status()
+    }
+
+    pub async fn set_route_access_enabled(state: &RouteProxyRuntimeState, enabled: bool) {
+        state.inner.lock().await.route_access_enabled = enabled;
+    }
+
+    pub async fn is_route_access_enabled(state: &RouteProxyRuntimeState) -> bool {
+        state.inner.lock().await.route_access_enabled
+    }
+
+    pub async fn start(
+        state: &RouteProxyRuntimeState,
+        pool: SqlitePool,
+        transport: RouteProxyTransport,
+    ) -> Result<RouteProxyStatus, AppError> {
+        Self::start_with_upstream_timeouts(
+            state,
+            pool,
+            transport,
+            ProxyAppState::default_upstream_timeouts(),
+        )
+        .await
+    }
+
+    /// Same as [`RouteProxyService::start`] but with explicit upstream deadlines,
+    /// so a test can exercise the stall path without a multi-minute wait.
+    #[cfg(test)]
+    pub(crate) async fn start_with_test_upstream_timeouts(
+        state: &RouteProxyRuntimeState,
+        pool: SqlitePool,
+        transport: RouteProxyTransport,
+        upstream_timeouts: OutboundTimeouts,
+    ) -> Result<RouteProxyStatus, AppError> {
+        Self::start_with_upstream_timeouts(state, pool, transport, upstream_timeouts).await
+    }
+
+    async fn start_with_upstream_timeouts(
+        state: &RouteProxyRuntimeState,
+        pool: SqlitePool,
+        transport: RouteProxyTransport,
+        upstream_timeouts: OutboundTimeouts,
+    ) -> Result<RouteProxyStatus, AppError> {
+        let app_state = ProxyAppState {
+            upstream_timeouts,
+            ..build_proxy_state(pool.clone(), state)
+        };
+        let app = Router::new()
+            .fallback(any(proxy_handler))
+            .with_state(app_state);
+        Self::start_with_router(state, pool, transport, app).await
+    }
+
+    /// Start the plugin-owned AI router with the same HTTP/HTTPS lifecycle.
+    /// The caller supplies protocol routes only; management RPC belongs to OTools.
+    pub async fn start_with_router(
+        state: &RouteProxyRuntimeState,
+        _pool: SqlitePool,
+        transport: RouteProxyTransport,
+        app: Router,
+    ) -> Result<RouteProxyStatus, AppError> {
+        let mut inner = state.inner.lock().await;
+        if inner.running() {
+            return Ok(inner.status());
+        }
+
+        let http_listener = bind_route_proxy_listener().await?;
+        let http = spawn_listener(http_listener, app.clone(), None).await?;
+        let http_port = http.port;
+        inner.http = Some(http);
+
+        if let RouteProxyTransport::HttpAndHttps {
+            certificate_pem_path,
+            private_key_pem_path,
+        } = &transport
+        {
+            // HTTPS uses the adjacent fixed port. A conflict never changes its
+            // endpoint silently. A certificate or port problem here only
+            // records a reason — HTTP has to keep serving, otherwise the switch
+            // would take down the one path every client can use.
+            let tls = Some((
+                certificate_pem_path.as_path(),
+                private_key_pem_path.as_path(),
+            ));
+            match bind_route_proxy_listener_from(http_port.saturating_add(1)).await {
+                Ok(https_listener) => match spawn_listener(https_listener, app, tls).await {
+                    Ok(https) => inner.https = Some(https),
+                    Err(error) => inner.https_error = Some(describe_https_failure(&error)),
+                },
+                Err(error) => inner.https_error = Some(describe_https_failure(&error)),
+            }
+        }
+
+        Ok(inner.status())
+    }
+
+    pub async fn stop(state: &RouteProxyRuntimeState) -> Result<RouteProxyStatus, AppError> {
+        let mut inner = state.inner.lock().await;
+        inner.shutdown_all().await;
+        Ok(inner.status())
+    }
+
+    /// Release listening sockets immediately during native plugin shutdown.
+    /// The owning Tokio runtime then cancels and joins outstanding connections.
+    pub async fn force_stop(state: &RouteProxyRuntimeState) -> Result<RouteProxyStatus, AppError> {
+        let mut inner = state.inner.lock().await;
+        let listeners = [inner.http.take(), inner.https.take()];
+        inner.https_error = None;
+        for listener in listeners.into_iter().flatten() {
+            let _ = listener.shutdown.send(());
+            listener.join_handle.abort();
+            let _ = listener.join_handle.await;
+        }
+        Ok(inner.status())
+    }
+}
+
+async fn shutdown_proxy_listener(listener: ProxyListener) {
+    let ProxyListener {
+        shutdown,
+        mut join_handle,
+        ..
+    } = listener;
+    let _ = shutdown.send(());
+    if tokio::time::timeout(Duration::from_secs(5), &mut join_handle)
+        .await
+        .is_err()
+    {
+        join_handle.abort();
+        let _ = join_handle.await;
+    }
+}
+
+/// Folds an HTTPS start failure into the single string the status carries.
+/// `Display` is only the message, and for these two errors the message is generic
+/// ("Could not load local route proxy HTTPS certificate") while the detail names
+/// the file and what the OS said. Dropping it leaves the settings panel saying
+/// HTTPS did not start with nothing to act on.
+fn describe_https_failure(error: &AppError) -> String {
+    match error.details() {
+        Some(details) => format!("{error} ({details})"),
+        None => error.to_string(),
+    }
+}
+
+/// Serve `app` on `listener`. `tls` carries the certificate/key pair when the
+/// listener should speak HTTPS.
+async fn spawn_listener(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<(&std::path::Path, &std::path::Path)>,
+) -> Result<ProxyListener, AppError> {
+    let addr = listener.local_addr().map_err(|err| AppError::Filesystem {
+        code: "filesystem.route_proxy_addr",
+        message: "Could not resolve route proxy address".to_string(),
+        details: Some(err.to_string()),
+        recoverable: true,
+    })?;
+    let port = addr.port();
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let base_url = format!("{scheme}://{BIND_HOST}:{port}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let join_handle = match tls {
+        None => tokio::spawn(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            });
+
+            if let Err(err) = server.await {
+                eprintln!("route proxy server error: {err}");
+            }
+        }),
+        Some((certificate_pem_path, private_key_pem_path)) => {
+            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                certificate_pem_path,
+                private_key_pem_path,
+            )
+            .await
+            .map_err(|error| AppError::Validation {
+                code: "validation.route_proxy_https_certificate",
+                message: "Could not load local route proxy HTTPS certificate".to_string(),
+                details: Some(error.to_string()),
+                recoverable: true,
+            })?;
+            let std_listener = listener.into_std().map_err(|error| AppError::Filesystem {
+                code: "filesystem.route_proxy_tls_listener",
+                message: "Could not prepare local HTTPS listener".to_string(),
+                details: Some(error.to_string()),
+                recoverable: true,
+            })?;
+            let handle = axum_server::Handle::new();
+
+            tokio::spawn(async move {
+                let server = axum_server::from_tcp_rustls(std_listener, rustls_config)
+                    .handle(handle.clone())
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+                tokio::pin!(server);
+
+                tokio::select! {
+                    result = &mut server => {
+                        if let Err(error) = result {
+                            eprintln!("route proxy HTTPS server error: {error}");
+                        }
+                    }
+                    _ = shutdown_rx => {
+                        handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                        if let Err(error) = server.await {
+                            eprintln!("route proxy HTTPS shutdown error: {error}");
+                        }
+                    }
+                }
+            })
+        }
+    };
+
+    Ok(ProxyListener {
+        port,
+        base_url,
+        shutdown: shutdown_tx,
+        join_handle,
+    })
+}
+
+pub(crate) async fn proxy_handler(
+    AxumState(state): AxumState<ProxyAppState>,
+    method: Method,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Response {
+    let origin = cors_request_origin(&headers);
+    if method == Method::OPTIONS {
+        return cors_preflight_response(&headers);
+    }
+
+    let mut response = match forward_request(&state, method, headers, uri, body).await {
+        Ok(response) => response,
+        Err(err) => json_error(route_proxy_error_status(&err), &err),
+    };
+    add_cors_headers(&mut response, origin.as_ref());
+    response
+}
+
+fn cors_request_origin(headers: &HeaderMap) -> Option<HeaderValue> {
+    let origin = headers.get("origin")?.to_str().ok()?.trim();
+    if origin.is_empty() {
+        return None;
+    }
+    HeaderValue::from_str(origin).ok()
+}
+
+fn add_cors_headers(response: &mut Response, origin: Option<&HeaderValue>) {
+    let Some(origin) = origin else {
+        return;
+    };
+
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        origin.clone(),
+    );
+    headers.append(
+        HeaderName::from_static("vary"),
+        HeaderValue::from_static("Origin"),
+    );
+}
+
+fn cors_preflight_response(headers: &HeaderMap) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let Some(origin) = cors_request_origin(headers) else {
+        return response;
+    };
+
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        origin,
+    );
+    response_headers.insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static(ROUTE_PROXY_CORS_ALLOW_METHODS),
+    );
+    response_headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        headers
+            .get("access-control-request-headers")
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static(ROUTE_PROXY_CORS_DEFAULT_ALLOW_HEADERS)),
+    );
+    response_headers.insert(
+        HeaderName::from_static("access-control-max-age"),
+        HeaderValue::from_static("600"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("vary"),
+        HeaderValue::from_static(
+            "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        ),
+    );
+    if headers.contains_key("access-control-request-private-network") {
+        response_headers.insert(
+            HeaderName::from_static("access-control-allow-private-network"),
+            HeaderValue::from_static("true"),
+        );
+    }
+    response
+}
+
+pub(crate) async fn forward_request(
+    state: &ProxyAppState,
+    method: Method,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Body,
+) -> Result<Response, String> {
+    let pool = &state.pool;
+    let path = uri.path().to_string();
+    let query = uri.query().map(|value| value.to_string());
+    let trace_id = route_proxy_trace_id(&headers);
+    let inbound_key = extract_inbound_api_key(&headers, query.as_deref());
+    let platform_id = resolve_platform(state, &headers, inbound_key.as_deref())
+        .await
+        .map_err(format_app_error)?;
+    let platform = platform_id.as_str().to_string();
+    let routing_rule =
+        PlatformCapabilityService::require(platform_id, PlatformOperation::GenericApiRouting)
+            .map_err(format_app_error)?;
+
+    // OpenAI-compatible model listing: aggregate/dedupe client-facing model ids
+    // from every enabled pool credential mapping instead of forwarding upstream.
+    if is_models_list_path(&path) {
+        if method != Method::GET {
+            return Ok((
+                StatusCode::METHOD_NOT_ALLOWED,
+                [("content-type", "application/json"), ("allow", "GET")],
+                json!({
+                    "error": {
+                        "code": "route_proxy.method_not_allowed",
+                        "message": "Method not allowed for models list",
+                        "type": "route_proxy_error",
+                    }
+                })
+                .to_string(),
+            )
+                .into_response());
+        }
+        let candidates = load_request_candidates(state, &platform)
+            .await
+            .map_err(|err| err.to_string())?;
+        let candidates = filter_candidates_for_rule(candidates, &routing_rule);
+        let candidates = restrict_candidates(state, candidates);
+        let credentials = partition_by_cooldown(candidates, &HashMap::new(), Utc::now());
+        let mode = RoutePoolRepository::model_mode(pool, &platform)
+            .await
+            .map_err(|err| err.to_string())?;
+        let baseline_models = if platform.eq_ignore_ascii_case("codex") {
+            Some(
+                RoutePoolRepository::baseline_models(pool, &platform)
+                    .await
+                    .map_err(|err| err.to_string())?,
+            )
+        } else {
+            None
+        };
+        return Ok(json_models_list_response_with_baseline(
+            &platform,
+            &credentials,
+            mode,
+            query.as_deref(),
+            baseline_models.as_deref(),
+        ));
+    }
+
+    let limit_mib = state.request_body_limit_mib.load(Ordering::Relaxed);
+    let limit_bytes = if limit_mib == 0 {
+        usize::MAX
+    } else {
+        (limit_mib as usize).saturating_mul(1024 * 1024)
+    };
+    let body_bytes = axum::body::to_bytes(body, limit_bytes)
+        .await
+        .map_err(|err| {
+            if std::error::Error::source(&err)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                format!("route_proxy.request_body_too_large: Request body exceeds the configured limit of {limit_mib} MiB. Increase the model proxy request body limit in Settings, or set it to 0 for unlimited.")
+            } else {
+                format!("Could not read proxy request body: {err}")
+            }
+        })?;
+
+    // Anthropic's token-counting endpoint, answered locally. No bridge can
+    // convert it, and most third-party relays do not implement it — forwarding
+    // it earns a 404 that the retry loop would charge against every credential
+    // in the pool, cooling down accounts that are perfectly healthy.
+    if is_anthropic_count_tokens_path(&path) {
+        if method != Method::POST {
+            return Ok((
+                StatusCode::METHOD_NOT_ALLOWED,
+                [("content-type", "application/json"), ("allow", "POST")],
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Method not allowed for count_tokens",
+                    }
+                })
+                .to_string(),
+            )
+                .into_response());
+        }
+        return Ok(json_count_tokens_response(&body_bytes));
+    }
+
+    // STT / 翻译是 multipart：`model` 住在表单字段里（遗留 1），JSON 读不出。
+    // multipart 不可能的形状（JSON 体）走原路；content-type 不是 multipart 时
+    // 第二个取值直接是 None。
+    let requested_model = requested_model_from_body(&body_bytes).or_else(|| {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        crate::audiogen::protocol::multipart_requested_model(content_type, &body_bytes)
+    });
+    let candidates = load_request_candidates(state, &platform)
+        .await
+        .map_err(|err| err.to_string())?;
+    let candidates = filter_candidates_for_rule(candidates, &routing_rule);
+    let candidates = restrict_candidates(state, candidates);
+    if candidates.is_empty() {
+        return Err("No enabled route credentials in pool".to_string());
+    }
+    // Precise-mode addressing, before anything reads the model name: a
+    // `<账号>/<别名>` request pins the pool to that one account and continues as if
+    // the client had asked for the bare alias.
+    let baseline_models = if platform.eq_ignore_ascii_case("codex") {
+        Some(
+            RoutePoolRepository::baseline_models(pool, &platform)
+                .await
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        None
+    };
+    let (candidates, requested_model, body_bytes) = resolve_account_scoped_model(
+        &platform,
+        candidates,
+        requested_model,
+        body_bytes,
+        baseline_models.as_deref(),
+    );
+    // Model filtering must run before cooldown partitioning: the model a request
+    // asks for decides which cooldown applies, so an account cannot be judged
+    // before its model key is known. It also means the all-cooling probe below
+    // is now scoped to accounts that can actually serve this model.
+    let candidates = filter_candidates_for_model_with_mode_with_baseline(
+        &platform,
+        candidates,
+        requested_model.as_deref(),
+        state.model_match_mode,
+        baseline_models.as_deref(),
+    );
+    // 图像 / 视频 / 音频都按能力收窄候选
+    // （视频 = G-P2c 的 `/v1/video/generations`，音频 = TTS 的 `/v1/audio/speech`）
+    let requested_capability = requested_image_capability(&path)
+        .or_else(|| requested_video_capability(&path))
+        .or_else(|| requested_audio_capability(&path));
+    let candidates = if let Some(capability) = requested_capability {
+        filter_candidates_for_capability_with_mode(
+            &platform,
+            candidates,
+            requested_model.as_deref(),
+            capability,
+            state.model_match_mode,
+        )
+    } else {
+        candidates
+    };
+    if candidates.is_empty() {
+        let model = requested_model.as_deref().unwrap_or("unknown");
+        return Err(format!(
+            "route_pool.model_unmatched: no enabled route credential supports model '{model}' on platform '{platform}'"
+        ));
+    }
+    // Keyed by account id: two accounts may map the same requested model to
+    // different upstream names, so the pair is the key, never the model alone.
+    let model_keys: HashMap<String, String> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            Some((
+                candidate.credential.id.clone(),
+                candidate.model_key.clone()?,
+            ))
+        })
+        .collect();
+    let model_states = load_candidate_model_states(pool, &candidates)
+        .await
+        .map_err(|err| err.to_string())?;
+    let credentials = partition_by_cooldown(candidates, &model_states, Utc::now());
+    if credentials.is_empty() {
+        let model = requested_model.as_deref().unwrap_or("unknown");
+        return Err(format!(
+            "route_pool.model_unavailable: every route credential for model '{model}' on platform '{platform}' is paused or marked unhealthy"
+        ));
+    }
+    let cursor = RoutePoolRepository::next_cursor_index(pool, &platform)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let mut outbound_headers = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if is_hop_by_hop_header(name) {
+            continue;
+        }
+        outbound_headers.append(name.clone(), value.clone());
+    }
+    // The inbound key is local proxy authentication only. Never forward it upstream.
+    strip_route_proxy_auth_headers(&mut outbound_headers);
+    // Our reqwest client is built without any decompression features, so we must
+    // never let the upstream compress the response — otherwise we relay/inspect
+    // raw gzip/br/zstd bytes and everything downstream sees garbage. Force
+    // identity encoding, matching what the real Claude Code / Codex CLIs send.
+    force_identity_accept_encoding(&mut outbound_headers);
+
+    let custom_tool_names = collect_custom_tool_names(&body_bytes);
+    let upstream_query = strip_route_proxy_auth_query(query.as_deref());
+    let default_client = build_outbound_http_client_with_timeouts(state.upstream_timeouts)?;
+    // Fallback for upstreams that fetch remote image URLs and reject non-image
+    // Content-Types (e.g. OSS objects served as text/plain): when a routed
+    // credential opts in, inline remote images as base64 data URLs up front.
+    // Mutable because a rejected reasoning signature is recovered by rewriting
+    // the body and re-asking the same account; see the retry loop below.
+    let mut body_bytes = if let Some(image_credential) = credentials
+        .iter()
+        .find(|credential| selected_credential_inlines_images(credential))
+    {
+        let image_client =
+            state.outbound_client_for_config(&default_client, &image_credential.config_json)?;
+        axum::body::Bytes::from(inline_remote_image_urls_in_body(&body_bytes, &image_client).await)
+    } else {
+        body_bytes
+    };
+    let request_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|err| format!("Unsupported method: {err}"))?;
+    let retry_indexes = credential_indexes_by_priority(&credentials, cursor);
+    let mut retry_queue = retry_indexes
+        .into_iter()
+        .map(|credential_index| (credential_index, 0usize))
+        .collect::<VecDeque<_>>();
+    let mut retry_errors = Vec::new();
+    let mut rejected_indexes = Vec::new();
+    let request_start = Instant::now();
+    let mut acquired_any = false;
+    let mut attempt = 0usize;
+    // One recovery rewrite per compatibility rule per client request. Reasoning
+    // cleanup is idempotent and must not spend the account's retry budget.
+    let mut thinking_stripped = false;
+    let mut reasoning_sanitized = false;
+    // Set once the missing-reasoning self-heal has rewritten this request, so a
+    // still-failing upstream falls through to normal failover instead of looping.
+    let mut reasoning_forced = false;
+    let mut trimmed_content_rejection_retry = false;
+    // One image rewrite per client request, whichever path triggers it: the
+    // account already opted in (proactive), or this request just hit the
+    // upstream's image limit (self-heal). Both set it, so a body that is still
+    // refused after the rewrite falls through to the upstream's own answer
+    // instead of being rewritten twice.
+    let mut images_trimmed = false;
+
+    loop {
+        let Some((credential_index, credential_retry_count)) = retry_queue.pop_front() else {
+            if trimmed_content_rejection_retry || rejected_indexes.is_empty() {
+                break;
+            }
+            let retry_indexes = content_rejection_retry_indexes(&credentials, &rejected_indexes);
+            if retry_indexes.is_empty() {
+                break;
+            }
+            let Some(next_body) = request_content_rejection::elide_old_tool_outputs(&body_bytes)
+            else {
+                break;
+            };
+            body_bytes = axum::body::Bytes::from(next_body);
+            trimmed_content_rejection_retry = true;
+            retry_queue = retry_indexes
+                .into_iter()
+                .map(|credential_index| (credential_index, 0usize))
+                .collect();
+            continue;
+        };
+        attempt += 1;
+        let selected = &credentials[credential_index];
+        // The upstream model this account was matched on. Every failure recorded
+        // below is charged against it unless the failure is account-scoped.
+        let selected_model_key = model_keys.get(&selected.id).cloned();
+        let Some(activity_lease) = state
+            .activity
+            .try_acquire(&platform, &selected.id, selected.max_concurrency)
+            .await
+        else {
+            continue;
+        };
+        acquired_any = true;
+        let credential =
+            match maybe_refresh_official_credential(pool, selected, Some(&state.activity)).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    if matches!(
+                        classify_proxy_failure(None, Some(&error)),
+                        ProxyFailureKind::Transient
+                    ) {
+                        record_route_credential_failure(
+                            &state.activity,
+                            &platform,
+                            pool,
+                            selected,
+                            selected_model_key.as_deref(),
+                            "refresh",
+                            &error,
+                            None,
+                        )
+                        .await;
+                    }
+                    let metadata = route_proxy_request_metadata(
+                        attempt,
+                        &platform,
+                        selected,
+                        &path,
+                        None,
+                        None,
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error),
+                        requested_model.as_deref(),
+                        None,
+                        None,
+                    );
+                    let _ = insert_route_credential_request_event(
+                        state,
+                        &selected.id,
+                        &metadata,
+                        &RouteUsageBreakdown::default(),
+                        None,
+                    )
+                    .await;
+                    emit_live_log(
+                        state,
+                        &platform,
+                        selected,
+                        attempt,
+                        &path,
+                        None,
+                        // Failed before an upstream request was built.
+                        None,
+                        None,
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error),
+                        requested_model.as_deref(),
+                        None,
+                        None,
+                        Some(&body_bytes),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    retry_errors.push(format!("{}: {error}", selected.display_name));
+                    continue;
+                }
+            };
+        let failure_policy =
+            RouteCredentialFailurePolicy::from_config_json(&credential.config_json);
+        let client =
+            match state.outbound_client_for_config(&default_client, &credential.config_json) {
+                Ok(client) => client,
+                Err(error) => {
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "proxy",
+                        &error,
+                        None,
+                    )
+                    .await;
+                    emit_live_log(
+                        state,
+                        &platform,
+                        &credential,
+                        attempt,
+                        &path,
+                        None,
+                        None,
+                        None,
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error),
+                        requested_model.as_deref(),
+                        None,
+                        None,
+                        Some(&body_bytes),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    retry_errors.push(format!("{}: {error}", credential.display_name));
+                    continue;
+                }
+            };
+        // An account that has already hit its upstream's per-request image limit
+        // sends only its newest images from now on. Decided per attempt because
+        // the switch is per account, and computed from `body_bytes` rather than
+        // replacing it, so the client's own request still appears untrimmed in the
+        // logs and in every other candidate's attempt.
+        let proactive_image_trim = if image_limit_trim_enabled(&credential.config_json) {
+            request_image_limit::trim_old_images(&body_bytes)
+        } else {
+            None
+        };
+        if proactive_image_trim.is_some() {
+            images_trimmed = true;
+        }
+        let upstream_body_bytes: &[u8] = proactive_image_trim
+            .as_deref()
+            .unwrap_or_else(|| body_bytes.as_ref());
+        let upstream_request = build_upstream_request_internal(
+            &credential,
+            &platform,
+            &path,
+            upstream_query.as_deref(),
+            outbound_headers.clone(),
+            upstream_body_bytes,
+            Some(&state.codex_history),
+            TurnReminderMode::Apply,
+            state.model_match_mode,
+        );
+        let BuiltUpstreamRequest {
+            target_url,
+            headers: mut request_headers,
+            body: outbound_body,
+            bridge_kind,
+            audio_response_adapter,
+            audio_stream_dialect,
+            tool_namespaces,
+            streaming_request,
+            reasoning_sanitized: outbound_reasoning_sanitized,
+        } = match upstream_request {
+            Ok(request) => request,
+            Err(error) => {
+                record_route_credential_failure(
+                    &state.activity,
+                    &platform,
+                    pool,
+                    &credential,
+                    selected_model_key.as_deref(),
+                    "request_build",
+                    &error,
+                    None,
+                )
+                .await;
+                let metadata = route_proxy_request_metadata(
+                    attempt,
+                    &platform,
+                    &credential,
+                    &path,
+                    None,
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error),
+                    requested_model.as_deref(),
+                    None,
+                    None,
+                );
+                let _ = insert_route_credential_request_event(
+                    state,
+                    &credential.id,
+                    &metadata,
+                    &RouteUsageBreakdown::default(),
+                    None,
+                )
+                .await;
+                emit_live_log(
+                    state,
+                    &platform,
+                    &credential,
+                    attempt,
+                    &path,
+                    None,
+                    // The upstream request could not be built, so there are no
+                    // outbound headers to report.
+                    None,
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error),
+                    requested_model.as_deref(),
+                    None,
+                    None,
+                    Some(&body_bytes),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                retry_errors.push(format!("{}: {error}", credential.display_name));
+                continue;
+            }
+        };
+        let bridge_name = bridge_kind.map(|kind| format!("{kind:?}"));
+        // Guarantee `reasoning_content` on every assistant turn when either the
+        // account opted in proactively, or the missing-reasoning self-heal below
+        // armed `reasoning_forced` after a prior 11155 rejection. Thinking upstreams
+        // (DeepSeek/MiMo behind new-api) reject a follow-up otherwise. Chat bridge
+        // only: `reasoning_content` is a Chat-only field.
+        let mut outbound_body = outbound_body;
+        // `reasoning_content` is a Chat-only field, so the forced-reasoning rebuild
+        // only applies to bodies that are (or were bridged into) Chat: a true
+        // Chat/Completions passthrough (`None`), a Responses→Chat bridge, or a
+        // Claude→Chat bridge. The rewrite itself no-ops on non-Chat bodies.
+        let chat_bridge = matches!(
+            bridge_kind,
+            None | Some(ProtocolBridgeKind::ResponsesToChat) | Some(ProtocolBridgeKind::ClaudeToChat)
+        );
+        if chat_bridge
+            && (reasoning_forced
+                || force_reasoning_content_enabled(
+                    &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+                ))
+        {
+            if let Some(forced) = force_reasoning_content_on_chat_body(&outbound_body) {
+                outbound_body = forced;
+            }
+        }
+        // Diagnostics and model accounting keep decoded JSON. Only the wire
+        // body and its transport headers receive provider-specific encoding.
+        let upstream_request_bytes = outbound_body.clone();
+        let upstream_model = requested_model_from_body(&outbound_body);
+        let outbound_body = request_compression::encode_request_body(
+            &target_url,
+            &mut request_headers,
+            &outbound_body,
+            &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+        )
+        .unwrap_or(outbound_body);
+        let upstream = client
+            .request(request_method.clone(), &target_url)
+            .headers(map_to_reqwest_headers(&request_headers))
+            .body(outbound_body)
+            .send()
+            .await;
+
+        let upstream = match upstream {
+            Ok(response) => response,
+            Err(error) => {
+                let error_message = describe_upstream_transport_error(
+                    &credential.display_name,
+                    "upstream request failed",
+                    &error,
+                    state.upstream_timeouts,
+                );
+                let should_retry_same_credential =
+                    credential_retry_count < failure_policy.retry_count as usize;
+                let metadata = route_proxy_request_metadata(
+                    attempt,
+                    &platform,
+                    &credential,
+                    &path,
+                    Some(&target_url),
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error_message),
+                    requested_model.as_deref(),
+                    upstream_model.as_deref(),
+                    None,
+                );
+                let _ = insert_route_credential_request_event(
+                    state,
+                    &credential.id,
+                    &metadata,
+                    &RouteUsageBreakdown::default(),
+                    None,
+                )
+                .await;
+                emit_live_log(
+                    state,
+                    &platform,
+                    &credential,
+                    attempt,
+                    &path,
+                    Some(&target_url),
+                    Some(&request_headers),
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error_message),
+                    requested_model.as_deref(),
+                    upstream_model.as_deref(),
+                    bridge_name.as_deref(),
+                    Some(&body_bytes),
+                    Some(&upstream_request_bytes),
+                    None,
+                    None,
+                    None,
+                );
+                if should_retry_same_credential {
+                    wait_for_credential_retry(failure_policy).await;
+                    retry_queue.push_front((credential_index, credential_retry_count + 1));
+                } else {
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "transport",
+                        &error_message,
+                        None,
+                    )
+                    .await;
+                    retry_errors.push(error_message);
+                    stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+                }
+                continue;
+            }
+        };
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut upstream_headers = upstream.headers().clone();
+
+        if let Some(dialect) = audio_stream_dialect.filter(|_| status.is_success()) {
+            let mut adapter = crate::audiogen::stream::SpeechStreamAdapter::new(dialect);
+            let mut stream: AudioUpstreamStream = Box::pin(upstream.bytes_stream());
+            let (raw, output) = match prime_audio_stream(&mut stream, &mut adapter).await {
+                Ok(primed) => primed,
+                Err((message, raw)) => {
+                    let error_message = format!("{}: {message}", credential.display_name);
+                    let terminal = handle_stream_prime_failure(
+                        state,
+                        pool,
+                        &platform,
+                        &credential,
+                        &error_message,
+                        StreamPrimeContext {
+                            attempt,
+                            path: &path,
+                            target_url: &target_url,
+                            status,
+                            trace_id: trace_id.as_deref(),
+                            request_start,
+                            requested_model: requested_model.as_deref(),
+                            upstream_model: upstream_model.as_deref(),
+                            model_key: selected_model_key.as_deref(),
+                            bridge_name: bridge_name.as_deref(),
+                            client_request: &body_bytes,
+                            upstream_request: &upstream_request_bytes,
+                            upstream_headers: &request_headers,
+                            response_body: Some(&raw),
+                        },
+                        credential_retry_count < failure_policy.retry_count as usize,
+                        failure_policy,
+                        None,
+                        &mut retry_queue,
+                        credential_index,
+                        credential_retry_count,
+                        &mut retry_errors,
+                        &mut rejected_indexes,
+                    )
+                    .await;
+                    if terminal {
+                        return Err(error_message);
+                    }
+                    continue;
+                }
+            };
+            let next_index = (credential_index + 1) % credentials.len();
+            let _ =
+                RoutePoolRepository::save_cursor_index(pool, &platform, next_index as i64).await;
+            let mut observer = StreamObserver::new_audio(LIVE_LOG_RAW_PREVIEW_LIMIT);
+            observer.observe(&output);
+            let completion = StreamCompletion {
+                state: state.clone(),
+                credential: credential.clone(),
+                platform: platform.clone(),
+                attempt,
+                path: path.clone(),
+                target_url: target_url.clone(),
+                status,
+                trace_id: trace_id.clone(),
+                request_start,
+                requested_model: requested_model.clone(),
+                upstream_model: upstream_model.clone(),
+                model_key: selected_model_key.clone(),
+                bridge_name: bridge_name.clone(),
+                client_request: body_bytes.clone(),
+                upstream_request: upstream_request_bytes.clone(),
+                upstream_headers: request_headers.clone(),
+                observer,
+                audio_raw_preview: Some(raw.into_iter().take(LIVE_LOG_RAW_PREVIEW_LIMIT).collect()),
+                quota_failure_recorded: false,
+                client_headers: outbound_headers.clone(),
+                upstream_query: upstream_query.clone(),
+                _activity_lease: activity_lease,
+            };
+            let body = Body::from_stream(observed_audio_stream(
+                output.into(),
+                stream,
+                adapter,
+                completion,
+            ));
+            upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+            upstream_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            return proxy_upstream_stream_response(status, upstream_headers, body);
+        }
+
+        // Stream the response through instead of buffering it, when nothing
+        // downstream needs the complete body.
+        //
+        // The gate is deliberately narrow. Buffering is what makes the retry
+        // loop able to switch accounts on a failure that only shows up late in
+        // the body, so it stays the default; streaming is opt-in per request
+        // and only where every buffered-path consumer has an incremental
+        // equivalent. See `route_proxy_stream` for those.
+        if should_stream_upstream_response(
+            bridge_kind,
+            streaming_request,
+            status,
+            &custom_tool_names,
+            &credential,
+            &tool_namespaces,
+        ) {
+            // The incremental transformer for a bridged response. `None` leaves
+            // the unbridged path a verbatim byte forward, as it has always been.
+            let transform = bridge_kind
+                .and_then(|kind| {
+                    IncrementalResponseBridge::new(kind, &tool_namespaces)
+                        .map(|bridge| (kind, bridge))
+                })
+                .map(|(kind, bridge)| {
+                    StreamResponseTransform::new(
+                        kind,
+                        bridge,
+                        status,
+                        upstream_headers
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        tool_namespaces.clone(),
+                        custom_tool_names.clone(),
+                    )
+                });
+            let mut stream = Box::pin(upstream.bytes_stream());
+            // Wait for real content while still inside the retry loop: until a
+            // payload byte reaches the client this attempt can still be
+            // abandoned for the next account, which is the whole reason to prime
+            // rather than return immediately.
+            //
+            // "Real content" deliberately excludes keepalive comments. A gateway
+            // that has to queue the request answers with comment frames first —
+            // OpenRouter sends `: OPENROUTER PROCESSING` for seconds — and only
+            // then emits either the opening payload frame or a failure frame.
+            // Forwarding the comments would spend the one moment a retry is
+            // still possible, which is how a queued request that later reported
+            // `provider_unavailable` used to reach the client as
+            // `stream disconnected before completion` with nothing to retry on.
+            let mut primed: Vec<u8> = Vec::new();
+            // `Some((message, delay))` ends the attempt before any payload byte
+            // reached the client, so it is still a retry. The delay is carried
+            // per failure kind rather than read once from the policy: see
+            // `STREAM_DISCONNECT_RETRY_DELAY`.
+            let prime_failure: Option<(String, Option<Duration>)> = loop {
+                match futures_util::StreamExt::next(&mut stream).await {
+                    Some(Ok(chunk)) => {
+                        primed.extend_from_slice(&chunk);
+                        if primed.len() >= STREAM_PRIME_HOLDBACK_LIMIT {
+                            // Nothing left worth protecting: hand it on and let
+                            // the observer judge how the stream ends.
+                            break None;
+                        }
+                        if let Some(failure) = detect_response_failed(&primed)
+                            .filter(is_definitive_quota_exhaustion_failure)
+                        {
+                            break Some((format!("{}: {}", credential.display_name, failure.message), None));
+                        }
+                        // A 200 body that opens with a 11155 `reasoning_content`
+                        // rejection still reaches the client as a failure frame. Arm
+                        // the forced-reasoning rebuild so the upcoming same-account
+                        // retry (below) rebuilds the body with the field present, and
+                        // persist the account flag for later requests. Restricted to
+                        // Chat-body shapes, matching the buffered self-heal.
+                        if !reasoning_forced
+                            && matches!(
+                                bridge_kind,
+                                None
+                                    | Some(ProtocolBridgeKind::ResponsesToChat)
+                                    | Some(ProtocolBridgeKind::ClaudeToChat)
+                            )
+                            && detect_response_failed(&primed)
+                                .is_some_and(|failure| is_missing_reasoning_failure(&failure))
+                        {
+                            reasoning_forced = true;
+                            let heal_pool = pool.clone();
+                            let heal_id = credential.id.clone();
+                            tokio::spawn(async move {
+                                let _ = RouteCredentialService::enable_force_reasoning_content(
+                                    &heal_pool,
+                                    &heal_id,
+                                )
+                                .await;
+                            });
+                        }
+                        if !sse_payload_started(&primed) {
+                            continue;
+                        }
+                        // A Chat upstream often opens with a content-less
+                        // `role: assistant` chunk and only then sends either the
+                        // first token or a failure frame. Committing on that
+                        // announcement would hand the client a 200 before the
+                        // failure is known, so keep priming until real output
+                        // (or an error) arrives.
+                        if sse_is_chat_role_prelude(&primed) {
+                            continue;
+                        }
+                        // A gateway that reports failure in a 200 body usually
+                        // does it in the opening payload frame. Catch it here,
+                        // where failover still works.
+                        break detect_response_failed(&primed).map(|failure| {
+                            (
+                                format!("{}: {}", credential.display_name, failure.message),
+                                Some(STREAM_DISCONNECT_RETRY_DELAY),
+                            )
+                        });
+                    }
+                    Some(Err(error)) => {
+                        break Some((
+                            describe_upstream_transport_error(
+                                &credential.display_name,
+                                "could not read upstream response",
+                                &error,
+                                state.upstream_timeouts,
+                            ),
+                            None,
+                        ));
+                    }
+                    None => {
+                        break Some((
+                            format!(
+                                "{}: upstream closed the stream before sending any data",
+                                credential.display_name
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            };
+            if let Some((error_message, retry_delay)) = prime_failure {
+                // The image limit reported in a 200 opening frame gets the same
+                // self-heal as the buffered path: switch the account's
+                // compatibility on, drop the older images, ask the same account
+                // again. Doing it here rather than inside the handler keeps the
+                // rewrite next to the body it changes.
+                if !images_trimmed
+                    && detect_response_failed(&primed)
+                        .as_ref()
+                        .is_some_and(is_too_many_images_failure)
+                {
+                    images_trimmed = true;
+                    enable_image_limit_compat_in_background(pool, &credential.id);
+                    if let Some(trimmed) = request_image_limit::trim_old_images(&body_bytes) {
+                        body_bytes = axum::body::Bytes::from(trimmed);
+                        retry_queue.push_front((credential_index, credential_retry_count));
+                        continue;
+                    }
+                }
+                let terminal = handle_stream_prime_failure(
+                    &state,
+                    pool,
+                    &platform,
+                    &credential,
+                    &error_message,
+                    StreamPrimeContext {
+                        attempt,
+                        path: &path,
+                        target_url: &target_url,
+                        status,
+                        trace_id: trace_id.as_deref(),
+                        request_start,
+                        requested_model: requested_model.as_deref(),
+                        upstream_model: upstream_model.as_deref(),
+                        model_key: selected_model_key.as_deref(),
+                        bridge_name: bridge_name.as_deref(),
+                        client_request: &body_bytes,
+                        upstream_request: &upstream_request_bytes,
+                        upstream_headers: &request_headers,
+                        response_body: (!primed.is_empty()).then_some(primed.as_slice()),
+                    },
+                    !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                        && credential_retry_count < failure_policy.retry_count as usize,
+                    failure_policy,
+                    retry_delay,
+                    &mut retry_queue,
+                    credential_index,
+                    credential_retry_count,
+                    &mut retry_errors,
+                    &mut rejected_indexes,
+                )
+                .await;
+                if terminal {
+                    let failure = detect_response_failed(&primed);
+                    if let Some(failure) = failure
+                        .as_ref()
+                        .filter(|failure| is_context_length_failure(failure))
+                    {
+                        // Codex only compacts on a 200 `response.failed` with a
+                        // structured code; a buffered HTTP 502 cannot trigger it.
+                        return context_length_failure_response(
+                            &platform,
+                            &path,
+                            status,
+                            upstream_headers,
+                            &primed,
+                            failure,
+                        );
+                    }
+                    return proxy_upstream_response(status, upstream_headers, primed);
+                }
+                continue;
+            }
+            let first_chunk = axum::body::Bytes::from(primed);
+
+            let next_index = (credential_index + 1) % credentials.len();
+            let _ =
+                RoutePoolRepository::save_cursor_index(pool, &platform, next_index as i64).await;
+
+            // Health, usage and the request log are all settled by the
+            // completion handle when the stream ends — success here only means
+            // "the first chunk looked fine", not that the response is whole.
+            let completion = StreamCompletion {
+                state: state.clone(),
+                credential: credential.clone(),
+                platform: platform.clone(),
+                attempt,
+                path: path.clone(),
+                target_url: target_url.clone(),
+                status,
+                trace_id: trace_id.clone(),
+                request_start,
+                requested_model: requested_model.clone(),
+                upstream_model: upstream_model.clone(),
+                model_key: selected_model_key.clone(),
+                bridge_name: bridge_name.clone(),
+                client_request: body_bytes.clone(),
+                upstream_request: upstream_request_bytes.clone(),
+                upstream_headers: request_headers.clone(),
+                // Keeps more raw bytes than a stage preview needs: the echo of
+                // the request inside `response.created` has to be stripped
+                // before the preview is cut, and stripping it is pointless if
+                // the bytes behind it were never retained. See
+                // `LIVE_LOG_RAW_PREVIEW_LIMIT`.
+                observer: StreamObserver::new(LIVE_LOG_RAW_PREVIEW_LIMIT, streaming_request),
+                audio_raw_preview: None,
+                quota_failure_recorded: false,
+                client_headers: outbound_headers.clone(),
+                upstream_query: upstream_query.clone(),
+                // Held until the stream ends so the account's concurrency slot
+                // is not handed out while this response is still in flight.
+                _activity_lease: activity_lease,
+            };
+
+            let body = Body::from_stream(observed_upstream_stream(
+                first_chunk,
+                stream,
+                transform,
+                completion,
+            ));
+            upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+            return proxy_upstream_stream_response(status, upstream_headers, body);
+        }
+
+        let mut response_bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let error_message = describe_upstream_transport_error(
+                    &credential.display_name,
+                    "could not read upstream response",
+                    &error,
+                    state.upstream_timeouts,
+                );
+                let should_retry_same_credential =
+                    credential_retry_count < failure_policy.retry_count as usize;
+                let metadata = route_proxy_request_metadata(
+                    attempt,
+                    &platform,
+                    &credential,
+                    &path,
+                    Some(&target_url),
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error_message),
+                    requested_model.as_deref(),
+                    upstream_model.as_deref(),
+                    None,
+                );
+                let _ = insert_route_credential_request_event(
+                    state,
+                    &credential.id,
+                    &metadata,
+                    &RouteUsageBreakdown::default(),
+                    None,
+                )
+                .await;
+                emit_live_log(
+                    state,
+                    &platform,
+                    &credential,
+                    attempt,
+                    &path,
+                    Some(&target_url),
+                    Some(&request_headers),
+                    None,
+                    false,
+                    trace_id.as_deref(),
+                    request_start,
+                    Some(&error_message),
+                    requested_model.as_deref(),
+                    upstream_model.as_deref(),
+                    bridge_name.as_deref(),
+                    Some(&body_bytes),
+                    Some(&upstream_request_bytes),
+                    None,
+                    None,
+                    None,
+                );
+                if should_retry_same_credential {
+                    wait_for_credential_retry(failure_policy).await;
+                    retry_queue.push_front((credential_index, credential_retry_count + 1));
+                } else {
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "transport",
+                        &error_message,
+                        None,
+                    )
+                    .await;
+                    retry_errors.push(error_message);
+                    stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+                }
+                continue;
+            }
+        };
+        // Snapshot the raw upstream body before any bridge transform mutates it
+        // in place, so the live log can show stage 3 (raw) and stage 4 (final)
+        // separately. `Bytes` clone is a cheap ref-count bump.
+        let raw_upstream_bytes = response_bytes.clone();
+        // Capture the upstream's plaintext reasoning + tool calls so the next
+        // Codex turn can restore them (Responses→Chat only). See enrich above.
+        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToChat) && status.is_success() {
+            state
+                .codex_history
+                .record_from_chat_response(&raw_upstream_bytes);
+        }
+        let upstream_content_type = upstream_headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let stream_disconnected = stream_disconnected_before_completion(
+            &raw_upstream_bytes,
+            upstream_content_type,
+            streaming_request,
+        );
+        // 文本协议桥与音频方言回程共用同一个「转换 → 失败即切号」的出口。
+        // 音频只转 2xx：错误体按上游原样透传（与协议桥的口径一致）。
+        let response_transform = if let Some(bridge_kind) = bridge_kind {
+            let content_type = upstream_headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok());
+            Some(transform_protocol_bridge_response(
+                bridge_kind,
+                status.as_u16(),
+                content_type,
+                &response_bytes,
+                &tool_namespaces,
+            ))
+        } else if let Some(adapter) = audio_response_adapter.filter(|_| status.is_success()) {
+            Some(transform_audio_upstream_response(adapter, &response_bytes))
+        } else {
+            None
+        };
+        if let Some(response_transform) = response_transform {
+            let transformed = match response_transform {
+                Ok(response) => response,
+                Err(error) => {
+                    let error_message = format!(
+                        "{}: could not transform upstream response: {error}",
+                        credential.display_name
+                    );
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "response_transform",
+                        &error_message,
+                        Some(&response_bytes),
+                    )
+                    .await;
+                    let metadata = route_proxy_request_metadata(
+                        attempt,
+                        &platform,
+                        &credential,
+                        &path,
+                        Some(&target_url),
+                        Some(status.as_u16()),
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error_message),
+                        requested_model.as_deref(),
+                        upstream_model.as_deref(),
+                        Some(&response_bytes),
+                    );
+                    let _ = insert_route_credential_request_event(
+                        state,
+                        &credential.id,
+                        &metadata,
+                        &RouteUsageBreakdown::default(),
+                        crate::services::upstream_response_id::extract_upstream_response_id(
+                            &response_bytes,
+                        )
+                        .as_deref(),
+                    )
+                    .await;
+                    emit_live_log(
+                        state,
+                        &platform,
+                        &credential,
+                        attempt,
+                        &path,
+                        Some(&target_url),
+                        Some(&request_headers),
+                        Some(status.as_u16()),
+                        false,
+                        trace_id.as_deref(),
+                        request_start,
+                        Some(&error_message),
+                        requested_model.as_deref(),
+                        upstream_model.as_deref(),
+                        bridge_name.as_deref(),
+                        Some(&body_bytes),
+                        Some(&upstream_request_bytes),
+                        Some(&raw_upstream_bytes),
+                        None,
+                        None,
+                    );
+                    retry_errors.push(error_message);
+                    continue;
+                }
+            };
+            response_bytes = transformed.body.into();
+            upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
+            if let Some(content_type) = transformed.content_type {
+                if let Ok(value) = HeaderValue::from_str(&content_type) {
+                    upstream_headers.insert(axum::http::header::CONTENT_TYPE, value);
+                }
+            }
+        }
+        if !custom_tool_names.is_empty() {
+            response_bytes =
+                restore_custom_tools_in_responses_payload(&response_bytes, &custom_tool_names)
+                    .into();
+        }
+        // Capture official subscription/quota signals (e.g. Grok free-usage-exhausted).
+        let quota_exhausted = if credential.kind == "official" {
+            if let Ok(body_text) = std::str::from_utf8(&response_bytes) {
+                maybe_persist_official_quota_from_response(pool, &credential, body_text)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let response_text = std::str::from_utf8(&response_bytes).ok();
+        let semantic_failure = detect_response_failed(&response_bytes).or_else(|| {
+            stream_disconnected.then(|| {
+                crate::services::response_failure_service::SemanticResponseFailure {
+                    code: None,
+                    error_type: None,
+                    message: STREAM_DISCONNECTED_FAILURE_MESSAGE.to_string(),
+                }
+            })
+        });
+        let quota_failure = semantic_failure
+            .as_ref()
+            .is_some_and(is_quota_exhaustion_failure);
+        let failure_kind = classify_proxy_failure(Some(status), response_text);
+        let should_retry = !status.is_success() || !matches!(failure_kind, ProxyFailureKind::None);
+        let proxy_success = status.is_success()
+            && !quota_exhausted
+            && !should_retry
+            && !quota_failure
+            && semantic_failure.is_none();
+        let retry_error = if let Some(failure) = semantic_failure.as_ref() {
+            Some(failure.message.clone())
+        } else if quota_failure || quota_exhausted {
+            Some("upstream quota exhausted".to_string())
+        } else if should_retry {
+            Some("upstream returned retryable status".to_string())
+        } else {
+            None
+        };
+        let metadata = route_proxy_request_metadata(
+            attempt,
+            &platform,
+            &credential,
+            &path,
+            Some(&target_url),
+            Some(status.as_u16()),
+            proxy_success,
+            trace_id.as_deref(),
+            request_start,
+            retry_error.as_deref(),
+            requested_model.as_deref(),
+            upstream_model.as_deref(),
+            // Keep a body preview for every request (short on success, full on
+            // failure) so the stats view can confirm real AI output.
+            Some(response_bytes.as_ref()),
+        );
+        let usage = extract_usage_breakdown(&response_bytes);
+        let mut usage = usage;
+        // Prefer the model the upstream itself reported (a gateway may serve a
+        // different one than was asked for), then the mapped upstream model, then
+        // whatever the client requested.
+        let priced_model = extract_response_model(&response_bytes)
+            .or_else(|| upstream_model.clone())
+            .or_else(|| requested_model.clone());
+        apply_estimated_price(&mut usage, priced_model.as_deref());
+        let _ = insert_route_credential_request_event(
+            state,
+            &credential.id,
+            &metadata,
+            &usage,
+            crate::services::upstream_response_id::extract_upstream_response_id(&response_bytes)
+                .as_deref(),
+        )
+        .await;
+        emit_live_log(
+            state,
+            &platform,
+            &credential,
+            attempt,
+            &path,
+            Some(&target_url),
+            Some(&request_headers),
+            Some(status.as_u16()),
+            proxy_success,
+            trace_id.as_deref(),
+            request_start,
+            retry_error.as_deref(),
+            requested_model.as_deref(),
+            upstream_model.as_deref(),
+            bridge_name.as_deref(),
+            Some(&body_bytes),
+            Some(&upstream_request_bytes),
+            Some(&raw_upstream_bytes),
+            Some(response_bytes.as_ref()),
+            None,
+        );
+
+        let next_index = (credential_index + 1) % credentials.len();
+        let _ = RoutePoolRepository::save_cursor_index(pool, &platform, next_index as i64).await;
+
+        // A text-only Chat gateway rejects an image/file part from history. Every
+        // account pointed at that model would reject the same conversation, and
+        // retrying cannot rewrite the client's history, so return the actionable
+        // explanation immediately and leave the credential healthy.
+        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToChat)
+            && semantic_failure
+                .as_ref()
+                .is_some_and(is_text_only_chat_content_failure)
+        {
+            let body = json!({
+                "error": {
+                    "message": TEXT_ONLY_CHAT_CONTENT_MESSAGE,
+                    "type": "invalid_request_error",
+                    "param": "",
+                    "code": "text_only_chat_content"
+                }
+            });
+            return proxy_upstream_response(
+                status,
+                upstream_headers,
+                body.to_string().into_bytes(),
+            );
+        }
+
+        // The assembled prompt is larger than the model's window. Every account
+        // pointed at this model rejects the same bytes identically, so walking the
+        // pool produces only the aggregated "all route credentials failed" error
+        // and parks healthy accounts for a request the caller has to shrink. Hand
+        // the upstream's own sentence back — it names the fix ("reduce the length
+        // of the messages or run compaction") and lets the client compact and
+        // resend, which is the only thing that can actually recover the turn.
+        if let Some(failure) = semantic_failure
+            .as_ref()
+            .filter(|failure| is_context_length_failure(failure))
+        {
+            return context_length_failure_response(
+                &platform,
+                &path,
+                status,
+                upstream_headers,
+                &response_bytes,
+                failure,
+            );
+        }
+
+        // The conversation carries more images than one request may hold. Every
+        // account in the pool counts the same images and refuses the same history
+        // identically, so failover cannot recover the turn. Recover it in place
+        // instead: switch this account's image compatibility on for good, drop the
+        // older images from this request, and ask the same account once more. The
+        // client's own history is never modified — only the copy that goes
+        // upstream.
+        if semantic_failure
+            .as_ref()
+            .is_some_and(is_too_many_images_failure)
+        {
+            enable_image_limit_compat_in_background(pool, &credential.id);
+            if !images_trimmed {
+                images_trimmed = true;
+                if let Some(trimmed) = request_image_limit::trim_old_images(&body_bytes) {
+                    body_bytes = axum::body::Bytes::from(trimmed);
+                    // Same account, and the failure policy's retry budget is left
+                    // alone: this attempt asks a different question.
+                    retry_queue.push_front((credential_index, credential_retry_count));
+                    continue;
+                }
+            }
+            // Nothing left to drop (or the trimmed body was refused as well).
+            // The upstream's sentence names the fix, so hand it back rather than
+            // parking the pool for a request only the caller can shrink.
+            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+        }
+
+        // A refused `thinking` signature is not this account's doing. The block
+        // was minted by whichever account served the previous turn, and the pool
+        // deliberately advances past that account (the cursor above), so the first
+        // turn that replays the reasoning lands somewhere that cannot verify it.
+        // Every remaining account would refuse the same history identically, so
+        // switching accounts cannot recover the turn — only rewriting the body
+        // can. Nothing is charged to the credential or its model: both work.
+        if semantic_failure
+            .as_ref()
+            .is_some_and(|failure| is_thinking_signature_failure(&failure.message))
+        {
+            if !thinking_stripped {
+                if let Some(stripped) = strip_replayed_thinking_from_bytes(&body_bytes) {
+                    body_bytes = axum::body::Bytes::from(stripped);
+                    thinking_stripped = true;
+                    // The same account, and the failure policy's retry budget is
+                    // left alone: this attempt asks a different question.
+                    retry_queue.push_front((credential_index, credential_retry_count));
+                    continue;
+                }
+            }
+            // Nothing left to strip, or the upstream refused the stripped body as
+            // well. Its own answer names the problem better than the aggregated
+            // "all route credentials failed" error a pool walk would end in.
+            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+        }
+
+        // A thinking upstream (DeepSeek/MiMo behind new-api) rejected the turn
+        // because a prior assistant message carried no `reasoning_content`
+        // (`reasoning_content_missing` / code 11155). The credential and model
+        // are both fine; the request body is just missing a field the bridge can
+        // supply. Arm the forced-reasoning rebuild and re-ask the *same* account
+        // once. A second failure falls through to normal failover. The failure
+        // policy's retry budget is untouched: this asks a different question.
+        // Covers every Chat-body shape: a Responses→Chat bridge, a Claude→Chat
+        // bridge, and a direct Chat/Completions passthrough (`None`).
+        if matches!(
+            bridge_kind,
+            None | Some(ProtocolBridgeKind::ResponsesToChat) | Some(ProtocolBridgeKind::ClaudeToChat)
+        ) && !reasoning_forced
+            && semantic_failure
+                .as_ref()
+                .is_some_and(is_missing_reasoning_failure)
+        {
+            reasoning_forced = true;
+            // Persist the account-level self-heal flag so the next request proactively
+            // carries `reasoning_content` and never hits 11155 again. Fire-and-forget:
+            // the in-flight retry above already answers this turn, so a slow or failed
+            // write must never block or fail it.
+            let heal_pool = pool.clone();
+            let heal_id = credential.id.clone();
+            tokio::spawn(async move {
+                let _ =
+                    RouteCredentialService::enable_force_reasoning_content(&heal_pool, &heal_id)
+                        .await;
+            });
+            retry_queue.push_front((credential_index, credential_retry_count));
+            continue;
+        }
+
+        // A resource-scoped reference cannot be recreated from its ID. Preserve
+        // the upstream explanation and request history instead of fabricating an
+        // empty reasoning item or penalizing every account in the pool.
+        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
+            && semantic_failure
+                .as_ref()
+                .is_some_and(|failure| is_cross_resource_item_failure(&failure.message))
+        {
+            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+        }
+
+        if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
+            && semantic_failure
+                .as_ref()
+                .is_some_and(is_encrypted_content_failure)
+        {
+            if !reasoning_sanitized
+                && !outbound_reasoning_sanitized
+                // The bridge may already have cleared an unstored orphan ID.
+                // Only retry if cleanup can still change the body actually sent.
+                && sanitize_replayed_reasoning_from_bytes(&upstream_request_bytes).is_some()
+            {
+                if let Some(cleaned) = sanitize_replayed_reasoning_from_bytes(&body_bytes) {
+                    body_bytes = axum::body::Bytes::from(cleaned);
+                    reasoning_sanitized = true;
+                    retry_queue.push_front((credential_index, credential_retry_count));
+                    continue;
+                }
+            }
+            return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+        }
+
+        // A content-policy rejection is deterministic for this body. Consume
+        // this candidate without touching its retry budget or health, then let
+        // the existing queue decide whether aggregate mode has another account
+        // to try. The one compatibility rewrite is handled after the first
+        // candidate pass by the account-level B1 switch.
+        if let Some(failure) = semantic_failure
+            .as_ref()
+            .filter(|failure| is_content_rejection(failure))
+        {
+            if RouteCredentialRepository::record_content_rejection(
+                pool,
+                &credential.id,
+                &failure.message,
+                Some(&response_bytes),
+            )
+            .await
+            .is_ok()
+            {
+                state
+                    .activity
+                    .notify_status_change(&platform, &credential.id);
+            }
+            rejected_indexes.push(credential_index);
+            retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
+            stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+            continue;
+        }
+
+        if quota_failure || quota_exhausted {
+            // A spent balance is as deterministic as a revoked key: settle the
+            // account on the first occurrence, and only walk to another account
+            // when the pool runs in aggregate mode.
+            if let Some(failure) = semantic_failure
+                .as_ref()
+                .filter(|failure| is_definitive_quota_exhaustion_failure(failure))
+            {
+                record_definitive_quota_failure(state, &platform, &credential,
+                    Some(status.as_u16()), &failure.message, Some(&response_bytes)).await;
+                if !quota_failover_allowed(state, &platform).await {
+                    return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+                }
+            } else if let Some(failure) = semantic_failure.as_ref() {
+                let _ = RouteCredentialRepository::record_semantic_failure_with_status(
+                    pool,
+                    &credential.id,
+                    Some(status.as_u16()),
+                    1,
+                    &failure.message,
+                    Some(&response_bytes),
+                )
+                .await;
+                state
+                    .activity
+                    .notify_status_change(&platform, &credential.id);
+            } else {
+                mark_route_credential_error(&state.activity, &platform, pool, &credential.id).await;
+            }
+            retry_errors.push(format!("{}: {}", credential.display_name,
+                semantic_failure.as_ref().map(|failure| failure.message.as_str()).unwrap_or("upstream quota exhausted")));
+            stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+            continue;
+        }
+        // A key that is missing a scope is refused for every model on it, and no
+        // retry, model swap or cooldown can grant the permission — only its owner
+        // can, in the provider's console. Settle it at the account level right
+        // away: the semantic branch below would charge it to the requested model
+        // and leave the pool routing to a credential that cannot answer anything.
+        if let Some(failure) = semantic_failure
+            .as_ref()
+            .filter(|failure| is_insufficient_permissions_failure(failure))
+        {
+            let _ = RouteCredentialRepository::record_semantic_failure_with_status(
+                pool,
+                &credential.id,
+                Some(status.as_u16()),
+                1,
+                &failure.message,
+                Some(&response_bytes),
+            )
+            .await;
+            state
+                .activity
+                .notify_status_change(&platform, &credential.id);
+            // The upstream sentence names the missing scope, so it is worth far
+            // more to the user than a generic "insufficient permissions" would be.
+            retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
+            continue;
+        }
+        if matches!(failure_kind, ProxyFailureKind::Permanent) {
+            mark_route_credential_revoked(&state.activity, &platform, pool, &credential.id).await;
+            let error_message = semantic_failure
+                .as_ref()
+                .map(|failure| failure.message.as_str())
+                .unwrap_or("upstream credentials are invalid");
+            retry_errors.push(format!("{}: {error_message}", credential.display_name));
+            continue;
+        }
+        if let Some(failure) = semantic_failure.as_ref() {
+            let can_retry_same_credential = !matches!(status, StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN)
+                && !is_invalid_parameter_failure(status, &failure.message);
+            if can_retry_same_credential
+                && credential_retry_count < failure_policy.retry_count as usize
+            {
+                wait_for_credential_retry(failure_policy).await;
+                retry_queue.push_front((credential_index, credential_retry_count + 1));
+            } else {
+                record_route_credential_failure(
+                    &state.activity,
+                    &platform,
+                    pool,
+                    &credential,
+                    selected_model_key.as_deref(),
+                    "semantic_response_transient",
+                    &failure.message,
+                    Some(&response_bytes),
+                )
+                .await;
+                retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
+                stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+            }
+            continue;
+        }
+        if should_retry_same_credential_status(status) {
+            let error_message = format!("upstream returned {}", status.as_u16());
+            if credential_retry_count < failure_policy.retry_count as usize {
+                wait_for_credential_retry(failure_policy).await;
+                retry_queue.push_front((credential_index, credential_retry_count + 1));
+            } else {
+                record_route_credential_failure_with_status(
+                    &state.activity,
+                    &platform,
+                    pool,
+                    &credential,
+                    selected_model_key.as_deref(),
+                    "upstream_status",
+                    Some(status.as_u16()),
+                    &error_message,
+                    Some(&response_bytes),
+                )
+                .await;
+                retry_errors.push(format!("{}: {error_message}", credential.display_name));
+                stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+            }
+            continue;
+        }
+        if should_retry {
+            let error_message = format!("upstream returned {}", status.as_u16());
+            record_route_credential_failure_with_status(
+                &state.activity,
+                &platform,
+                pool,
+                &credential,
+                selected_model_key.as_deref(),
+                "upstream_status",
+                Some(status.as_u16()),
+                &error_message,
+                Some(&response_bytes),
+            )
+            .await;
+            retry_errors.push(format!(
+                "{}: upstream returned {}",
+                credential.display_name,
+                status.as_u16()
+            ));
+            stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
+            continue;
+        }
+
+        // Only a real transition is announced. Reporting every success as a
+        // status change made the account screen refetch its whole list once per
+        // proxied request.
+        if matches!(
+            RouteCredentialRepository::clear_transient_failure(
+                pool,
+                &credential.id,
+                selected_model_key.as_deref(),
+            )
+            .await,
+            Ok(true)
+        ) {
+            state
+                .activity
+                .notify_status_change(&platform, &credential.id);
+        }
+        return proxy_upstream_response(status, upstream_headers, response_bytes.to_vec());
+    }
+
+    if !acquired_any {
+        return Err(format!(
+            "route_pool.concurrency_exhausted: all route credentials are at their concurrency limit on platform '{platform}'"
+        ));
+    }
+
+    Err(format!(
+        "All route credentials failed for {platform}: {}",
+        retry_errors.join(" | ")
+    ))
+}
+
+/// Whether this account opted into sending only its newest images.
+///
+/// A config that cannot be parsed reads as "off": the rewrite is a convenience,
+/// and guessing at a broken config would change a request the user never asked
+/// to have changed.
+fn image_limit_trim_enabled(config_json: &str) -> bool {
+    parse_json_object(config_json, "config")
+        .ok()
+        .is_some_and(|config| request_image_limit::trim_enabled(&config))
+}
+
+/// Turn on the account's image-count compatibility for every later request.
+///
+/// Fire-and-forget: the trimmed retry already answers this turn, so a slow or
+/// failed write must never block or fail it — the same rule the missing-reasoning
+/// self-heal follows.
+fn enable_image_limit_compat_in_background(pool: &SqlitePool, credential_id: &str) {
+    let pool = pool.clone();
+    let id = credential_id.to_string();
+    tokio::spawn(async move {
+        let _ = RouteCredentialService::enable_image_limit_compat(&pool, &id).await;
+    });
+}
+
+fn content_rejection_retry_indexes(
+    credentials: &[SelectedCredential],
+    rejected_indexes: &[usize],
+) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    rejected_indexes
+        .iter()
+        .copied()
+        .filter(|index| *index < credentials.len())
+        .filter(|index| seen.insert(*index))
+        .filter(|index| {
+            parse_json_object(&credentials[*index].config_json, "config")
+                .ok()
+                .is_some_and(|config| request_content_rejection::trim_enabled(&config))
+        })
+        .collect()
+}
+
+fn map_to_reqwest_headers(headers: &HeaderMap) -> reqwest::header::HeaderMap {
+    let mut mapped = reqwest::header::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        if let (Ok(req_name), Ok(req_value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            mapped.append(req_name, req_value);
+        }
+    }
+    mapped
+}
+
+fn strip_route_proxy_auth_query(query: Option<&str>) -> Option<String> {
+    let query = query?.trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let remaining: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(*pair);
+            !matches!(key, "key" | "api_key" | "apiKey")
+        })
+        .collect();
+    if remaining.is_empty() {
+        None
+    } else {
+        Some(remaining.join("&"))
+    }
+}
+
+fn strip_route_proxy_auth_headers(headers: &mut HeaderMap) {
+    headers.remove(axum::http::header::AUTHORIZATION);
+    headers.remove("x-api-key");
+    headers.remove("api-key");
+    headers.remove("x-goog-api-key");
+    headers.remove(ROUTE_PROXY_PLATFORM_HEADER);
+    headers.remove(ROUTE_PROXY_TRACE_HEADER);
+}
+
+/// Force `accept-encoding: identity` so upstreams never compress the response.
+/// The outbound reqwest client has no gzip/br/zstd decompression support, so a
+/// compressed body would be relayed and inspected as raw bytes.
+fn force_identity_accept_encoding(headers: &mut HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
+}
+
+fn route_proxy_trace_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(ROUTE_PROXY_TRACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The path of the URL the request was actually sent to.
+///
+/// `/v1/chat/completions`, `/v1/messages`, `/v1/responses` — this is what says
+/// which protocol the bridge spoke *upstream*, and it is the one thing the
+/// request log could not answer: `entry_path` and `path` are both the *client's*
+/// path, so every Codex turn was recorded as `/v1/responses` no matter which
+/// upstream it really reached. Grouping by those two fields therefore says
+/// nothing about the upstream dialect.
+///
+/// A base URL with its own prefix is kept (`/openai/v1/chat/completions`), since
+/// that is the endpoint as it really was.
+fn upstream_path_from_target_url(target_url: Option<&str>) -> Option<String> {
+    let url = target_url?;
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let path = after_scheme.split_once('/').map(|(_, path)| path)?;
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    (!path.is_empty()).then(|| format!("/{path}"))
+}
+
+/// `entry_path` is the path the *client* called, not the upstream endpoint.
+/// The upstream endpoint is `upstream_path`, derived from `target_url`.
+fn route_proxy_request_metadata(
+    // Which try this row records: 1 for the first send, 2 for the first retry.
+    attempt: usize,
+    platform: &str,
+    credential: &SelectedCredential,
+    entry_path: &str,
+    target_url: Option<&str>,
+    status: Option<u16>,
+    success: bool,
+    trace_id: Option<&str>,
+    started_at: Instant,
+    error_message: Option<&str>,
+    requested_model: Option<&str>,
+    upstream_model: Option<&str>,
+    response_body: Option<&[u8]>,
+) -> String {
+    let mut metadata = serde_json::json!({
+        "platform": platform,
+        "route_credential_id": credential.id,
+        "route_credential_name": credential.display_name,
+        "entry_path": entry_path,
+        // Kept for older readers that only ever knew this key. It has always
+        // held the client path; `upstream_path` is the new, correct field.
+        "path": entry_path,
+        "upstream_path": upstream_path_from_target_url(target_url),
+        "target_url": target_url,
+        "status": status,
+        "success": success,
+        // A request log that cannot say how many times a request had to
+        // be re-sent cannot answer the first question anyone asks of a
+        // model that keeps dropping streams: is the proxy retrying, or is
+        // the upstream failing? `attempt` is the ordinal; `retry_count` is
+        // the retries behind it.
+        "attempt": attempt,
+        "retry_count": attempt.saturating_sub(1),
+        "duration_ms": elapsed_millis(started_at),
+        "trace_id": trace_id,
+        "error_message": error_message,
+    });
+    if let Some(object) = metadata.as_object_mut() {
+        if let Some(model) = requested_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            object.insert("requested_model".to_string(), json!(model));
+        }
+        if let Some(model) = upstream_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            object.insert("upstream_model".to_string(), json!(model));
+        }
+        if let Some(response_body) = route_proxy_response_body_metadata(response_body, success) {
+            object.insert(
+                ROUTE_PROXY_RESPONSE_BODY_KEY.to_string(),
+                json!(response_body),
+            );
+        }
+    }
+    metadata.to_string()
+}
+
+/// Cap one response preview and hand it back as plain text.
+fn route_proxy_response_body_metadata(
+    response_body: Option<&[u8]>,
+    success: bool,
+) -> Option<String> {
+    let body = response_body?;
+    if body.is_empty() {
+        return None;
+    }
+    let limit = if success {
+        ROUTE_PROXY_SUCCESS_BODY_LIMIT
+    } else {
+        ROUTE_PROXY_RESPONSE_BODY_LIMIT
+    };
+    let truncated_body = &body[..body.len().min(limit)];
+    let text = String::from_utf8_lossy(truncated_body);
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text.into_owned())
+}
+
+/// Record one proxied request into the in-memory live log, carrying whichever of
+/// the four stages are available at the call site (missing stages pass `None`).
+///
+/// **Everything this function does to the four stages is log-only.** The
+/// parameters are immutable borrows, the function returns `()`, and the redacted
+/// buffers it builds never leave it — so the request that went upstream and the
+/// response that reached the client are the original bytes, untouched. Keep it
+/// that way: taking `&mut` here, or returning a redacted buffer, would silently
+/// start rewriting live traffic.
+///
+/// The redaction exists because agent clients re-send tens of kilobytes of
+/// identical boilerplate on every turn (system prompt, tool catalogue) and
+/// Responses gateways echo the whole request back inside `response.created`.
+/// Left in, that boilerplate consumed the entire per-stage byte budget and hid
+/// every event after it — reasoning deltas included.
+///
+/// Stripping it here only works if the caller retained enough raw bytes to
+/// begin with: the streaming path hands over a preview the observer has already
+/// capped, so that cap has to leave room for both the echo and the events
+/// behind it — see [`LIVE_LOG_RAW_PREVIEW_LIMIT`].
+#[allow(clippy::too_many_arguments)]
+fn emit_live_log(
+    state: &ProxyAppState,
+    platform: &str,
+    credential: &SelectedCredential,
+    attempt: usize,
+    path: &str,
+    target_url: Option<&str>,
+    upstream_headers: Option<&HeaderMap>,
+    status: Option<u16>,
+    success: bool,
+    trace_id: Option<&str>,
+    started_at: Instant,
+    error_message: Option<&str>,
+    requested_model: Option<&str>,
+    upstream_model: Option<&str>,
+    bridge: Option<&str>,
+    client_request: Option<&[u8]>,
+    upstream_request: Option<&[u8]>,
+    upstream_response: Option<&[u8]>,
+    final_response: Option<&[u8]>,
+    upstream_reasoning_deltas: Option<usize>,
+) {
+    let client_request = redact_verbose_request_fields(client_request);
+    let upstream_request = redact_verbose_request_fields(upstream_request);
+    let upstream_response = redact_verbose_response_fields(upstream_response);
+    let (client_request, t1) = stage_preview(client_request.as_deref());
+    let (upstream_request, t2) = stage_preview(upstream_request.as_deref());
+    let (upstream_response, t3) = stage_preview(upstream_response.as_deref());
+    let notes = diagnostic_notes(success, bridge, client_request.as_deref(), final_response);
+    let final_response = redact_verbose_response_fields(final_response);
+    let (final_response, t4) = stage_preview(final_response.as_deref());
+    state.live_log.record(RouteProxyLiveLogEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        trace_id: trace_id.map(str::to_string),
+        platform: platform.to_string(),
+        credential_id: credential.id.clone(),
+        credential_name: credential.display_name.clone(),
+        attempt,
+        path: path.to_string(),
+        target_url: target_url.map(redact_sensitive_url),
+        upstream_headers: upstream_headers.map(format_upstream_headers),
+        requested_model: requested_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        upstream_model: upstream_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        status,
+        success,
+        error_message: error_message.map(str::to_string),
+        duration_ms: elapsed_millis(started_at),
+        bridge: bridge.map(str::to_string),
+        client_request,
+        upstream_request,
+        upstream_response,
+        final_response,
+        upstream_reasoning_deltas,
+        notes,
+        truncated: t1 || t2 || t3 || t4,
+        truncated_stages: truncated_stage_names(t1, t2, t3, t4),
+        created_at: Utc::now().to_rfc3339(),
+    });
+}
+
+/// Derive non-error, troubleshooting-only hints from a completed proxied
+/// request. Currently flags the "agent turn ended without a tool call" and
+/// "empty upstream output" cases that make bridged clients (Codex, Claude Code)
+/// look like they stopped responding. Heuristic text scan by design — this only
+/// annotates the live log, it never drives control flow.
+fn diagnostic_notes(
+    success: bool,
+    bridge: Option<&str>,
+    client_request: Option<&str>,
+    final_response: Option<&[u8]>,
+) -> Vec<String> {
+    if !success || bridge.is_none() {
+        return Vec::new();
+    }
+    let Some(final_text) = final_response.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
+        return Vec::new();
+    };
+    // A streamed Responses answer opens with `response.created` /
+    // `response.in_progress` scaffolding whose `output` is always `[]`, so a
+    // substring scan of the whole body reports every streamed turn as empty.
+    // Inspect the terminal completed frame (or the buffered JSON body) instead.
+    let Some(final_body) = terminal_diagnostic_body(final_text) else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    if diagnostic_output_is_empty(&final_body) {
+        notes.push("上游返回空输出（无文本/推理/工具调用）".to_string());
+        return notes;
+    }
+    let has_tool_call = diagnostic_body_has_tool_call(&final_body);
+    let request_offered_tools = client_request.is_some_and(|request| request.contains("\"tools\""));
+    if request_offered_tools && !has_tool_call {
+        notes.push("上游未发起工具调用（纯文本回合，agent 可能就此停止）".to_string());
+    }
+    notes
+}
+
+/// The response object a completed turn should be judged on.
+///
+/// For a streamed body it is the `response` payload of the terminal
+/// `response.completed` / `response.incomplete` / `response.failed` frame, so the
+/// empty `output` on the opening scaffolding frames is ignored. For a buffered
+/// JSON body it is the document itself. `None` means the turn never completed,
+/// which is not something to annotate.
+fn terminal_diagnostic_body(final_text: &str) -> Option<Value> {
+    let looks_sse = final_text
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"));
+    if looks_sse {
+        let mut terminal = None;
+        for block in final_text.replace("\r\n", "\n").split("\n\n") {
+            let data = block
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let is_terminal = matches!(
+                value.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete" | "response.failed")
+            );
+            if is_terminal {
+                // Prefer the wrapped `response` payload; fall back to the frame.
+                terminal = Some(value.get("response").cloned().unwrap_or(value));
+            }
+        }
+        return terminal;
+    }
+    let value = serde_json::from_str::<Value>(final_text).ok()?;
+    let completed = value.get("status").and_then(Value::as_str) == Some("completed")
+        || value.get("stop_reason").is_some()
+        || value.get("choices").is_some();
+    completed.then_some(value)
+}
+
+/// True when a completed response carries no visible output — no message text,
+/// reasoning, tool call, Anthropic content block, or chat choice content.
+fn diagnostic_output_is_empty(body: &Value) -> bool {
+    // Responses shape: an `output` array of typed items, plus `output_text`.
+    if let Some(output) = body.get("output").and_then(Value::as_array) {
+        let has_output_text = body
+            .get("output_text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        return output.is_empty() && !has_output_text;
+    }
+    // Anthropic shape: a `content` block array.
+    if let Some(content) = body.get("content").and_then(Value::as_array) {
+        return content.is_empty();
+    }
+    // Chat shape: choices carrying message content or tool calls.
+    if let Some(choices) = body.get("choices").and_then(Value::as_array) {
+        return !choices.iter().any(|choice| {
+            let message = choice.get("message").or_else(|| choice.get("delta"));
+            let Some(message) = message else {
+                return false;
+            };
+            let has_text = message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+            let has_tool_calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+            has_text || has_tool_calls
+        });
+    }
+    // An unrecognized shape is not judged as empty.
+    false
+}
+
+/// Whether a completed response contains a tool call in any of the three shapes.
+fn diagnostic_body_has_tool_call(body: &Value) -> bool {
+    if let Some(output) = body.get("output").and_then(Value::as_array) {
+        if output.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call" | "local_shell_call")
+            )
+        }) {
+            return true;
+        }
+    }
+    if let Some(content) = body.get("content").and_then(Value::as_array) {
+        if content
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"))
+        {
+            return true;
+        }
+    }
+    if let Some(choices) = body.get("choices").and_then(Value::as_array) {
+        if choices.iter().any(|choice| {
+            choice
+                .get("message")
+                .or_else(|| choice.get("delta"))
+                .and_then(|message| message.get("tool_calls"))
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty())
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Above this many bytes, a system-prompt-shaped field is replaced with a short
+/// `<field omitted: N chars>` marker in the live log preview.
+const VERBOSE_REQUEST_FIELD_LIMIT: usize = 200;
+
+/// SSE `data:` payloads at least this large are worth parsing to look for the
+/// boilerplate fields below. Reasoning deltas and text chunks are far smaller,
+/// so this keeps the redaction to the one or two events that can actually hold a
+/// whole system prompt, instead of parsing every event of every stream.
+const VERBOSE_RESPONSE_EVENT_MIN_PARSE: usize = 1024;
+
+/// Strip the fields that every turn re-sends verbatim and that dwarf the parts
+/// worth reading — a system prompt is tens of kilobytes of the same text on each
+/// call. Returns whether anything changed.
+fn redact_verbose_fields_in_object(object: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    // The system prompt under each protocol's own name: Responses `instructions`
+    // and Anthropic `system` are strings, Gemini's `systemInstruction` is an
+    // object of parts.
+    for key in ["instructions", "system", "systemInstruction"] {
+        if let Some(field) = object.get_mut(key) {
+            changed |= redact_long_string(field, key);
+            changed |= redact_large_collection(field, key);
+        }
+    }
+    // Chat Completions carries the system prompt as a system/developer message.
+    if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let is_system = message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| matches!(role, "system" | "developer"));
+            if is_system {
+                if let Some(content) = message.get_mut("content") {
+                    changed |= redact_long_string(content, "system");
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Fields that are *pure echo* in a response: the gateway re-sends the request
+/// it was handed, so `tools` here is a verbatim copy of what the request stage
+/// already holds. Dropping it costs no information and buys back the bytes that
+/// were pushing the reasoning events past the cut.
+///
+/// Deliberately not applied to request stages, where the tool catalogue is the
+/// payload rather than a copy.
+fn redact_echoed_fields_in_object(object: &mut serde_json::Map<String, Value>) -> bool {
+    match object.get_mut("tools") {
+        Some(tools) => redact_large_collection(tools, "tools"),
+        None => false,
+    }
+}
+
+/// The live log keeps a preview of every request stage, but agent clients ship a
+/// huge system prompt on every call — Responses `instructions`, the Chat system
+/// message it converts into, or Anthropic's `system`. That blob dwarfs the parts
+/// worth reading (messages, tools) and eats the per-stage byte budget, so strip
+/// it to a marker before storing. Non-JSON bodies (SSE, etc.) pass through
+/// untouched.
+fn redact_verbose_request_fields(body: Option<&[u8]>) -> Option<Vec<u8>> {
+    let body = body?;
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return Some(body.to_vec());
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Some(body.to_vec());
+    };
+    if !redact_verbose_fields_in_object(object) {
+        return Some(body.to_vec());
+    }
+    serde_json::to_vec(&value)
+        .ok()
+        .or_else(|| Some(body.to_vec()))
+}
+
+/// Redact the same boilerplate out of a *response* stage.
+///
+/// A Responses gateway echoes the whole request back inside its opening
+/// `response.created` event — `instructions` (the system prompt) and `tools`
+/// included. Measured against a real gateway, that single event consumed the
+/// entire 64 KB per-stage budget, so the byte cut landed inside it and every
+/// later event — the reasoning deltas included — was lost. The upstream then
+/// looked like it never sent any reasoning at all.
+///
+/// Only bodies that would be truncated anyway are touched, and only their
+/// `data:` payloads: shorter bodies stay byte-faithful, which is what makes the
+/// "upstream and final stages are identical" comparison meaningful.
+fn redact_verbose_response_fields(body: Option<&[u8]>) -> Option<Cow<'_, [u8]>> {
+    let body = body?;
+    if body.len() <= LIVE_LOG_STAGE_LIMIT || !looks_like_sse(body) {
+        return Some(Cow::Borrowed(body));
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut changed = false;
+    let mut start = 0usize;
+    while start < body.len() {
+        let (end, next) = match body[start..].iter().position(|byte| *byte == b'\n') {
+            Some(offset) => (start + offset, start + offset + 1),
+            None => (body.len(), body.len()),
+        };
+        let line = &body[start..end];
+        start = next;
+
+        let payload = line
+            .strip_suffix(b"\r")
+            .unwrap_or(line)
+            .strip_prefix(b"data:")
+            .map(|rest| rest.strip_prefix(b" ").unwrap_or(rest));
+        match payload {
+            Some(payload) if payload.len() >= VERBOSE_RESPONSE_EVENT_MIN_PARSE => {
+                match redact_response_event_payload(payload) {
+                    Some(redacted) => {
+                        out.extend_from_slice(b"data: ");
+                        out.extend_from_slice(&redacted);
+                        changed = true;
+                    }
+                    None => out.extend_from_slice(line),
+                }
+            }
+            _ => out.extend_from_slice(line),
+        }
+        out.extend_from_slice(&body[end..next]);
+    }
+    if !changed {
+        return Some(Cow::Borrowed(body));
+    }
+    Some(Cow::Owned(out))
+}
+
+/// Redact one SSE event's JSON payload. Returns `None` when the payload is not
+/// JSON or holds nothing to strip, so the caller keeps the original bytes.
+fn redact_response_event_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(payload).ok()?;
+    let mut changed = false;
+    // The Responses API nests the echoed request under `response`; some gateways
+    // also flatten it onto the event itself.
+    if let Some(response) = value.get_mut("response").and_then(Value::as_object_mut) {
+        changed |= redact_verbose_fields_in_object(response);
+        changed |= redact_echoed_fields_in_object(response);
+    }
+    if let Some(object) = value.as_object_mut() {
+        changed |= redact_verbose_fields_in_object(object);
+        changed |= redact_echoed_fields_in_object(object);
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&value).ok()
+}
+
+/// Whether the body looks like a `text/event-stream` payload: its first line
+/// begins with an SSE field name. Guards against JSON bodies, which contain
+/// blank lines inside string literals but are not streams.
+fn looks_like_sse(body: &[u8]) -> bool {
+    let first_line = body.split(|byte| *byte == b'\n').next().unwrap_or(body);
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+    for prefix in [
+        &b"data:"[..],
+        &b"event:"[..],
+        &b"id:"[..],
+        &b"retry:"[..],
+        &b":"[..],
+    ] {
+        if first_line.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Replace `value` with a `<label omitted: N chars>` marker when it is a string
+/// longer than [`VERBOSE_REQUEST_FIELD_LIMIT`]. Returns whether it changed.
+fn redact_long_string(value: &mut Value, label: &str) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    if text.len() <= VERBOSE_REQUEST_FIELD_LIMIT {
+        return false;
+    }
+    let chars = text.chars().count();
+    *value = Value::String(format!("<{label} omitted: {chars} chars>"));
+    true
+}
+
+/// Replace a collection that dwarfs the parts worth reading with a short marker.
+/// Used for `tools` (an array of definitions) and Gemini's `systemInstruction`
+/// (an object of prompt parts) — both byte-identical on every turn. Returns
+/// whether it changed.
+fn redact_large_collection(value: &mut Value, label: &str) -> bool {
+    let (count, unit) = match value {
+        Value::Array(items) if !items.is_empty() => (items.len(), "items"),
+        Value::Object(fields) if !fields.is_empty() => (fields.len(), "fields"),
+        _ => return false,
+    };
+    let size = serde_json::to_vec(value).map_or(0, |bytes| bytes.len());
+    if size <= VERBOSE_REQUEST_FIELD_LIMIT {
+        return false;
+    }
+    *value = Value::String(format!("<{label} omitted: {count} {unit}, {size} bytes>"));
+    true
+}
+
+fn elapsed_millis(started_at: Instant) -> i64 {
+    started_at.elapsed().as_millis().min(i64::MAX as u128) as i64
+}
+
+/// Header names whose values carry a credential and must never reach the live log.
+///
+/// Everything else is shown in full — the identity headers the proxy injects to
+/// look like an official CLI (`user-agent`, `anthropic-beta`, `x-app`,
+/// `x-stainless-*`, `originator`) are exactly what a gateway fingerprints on, so
+/// masking them would defeat the purpose of logging headers at all.
+const SENSITIVE_HEADER_NAMES: [&str; 5] = [
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "x-xai-token-auth",
+];
+
+/// Query keys that carry a credential in the URL rather than a header.
+const SENSITIVE_QUERY_KEYS: [&str; 2] = ["key", "api_key"];
+
+/// Keep the shape of a secret without revealing it: a short value is fully
+/// masked, a long one keeps its last four characters so two credentials can be
+/// told apart in a log.
+fn mask_secret(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let chars = trimmed.chars().count();
+    if chars <= 8 {
+        return "***".to_string();
+    }
+    let tail: String = trimmed.chars().skip(chars - 4).collect();
+    format!("***{tail}")
+}
+
+/// Mask credential-bearing query values in a URL.
+///
+/// Gemini puts the API key in `?key=` (see `append_query_param` at the Gemini
+/// dialect arm), so the target URL is itself a secret-bearing string and cannot
+/// be logged verbatim.
+fn redact_sensitive_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let redacted = query
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((key, value))
+                if SENSITIVE_QUERY_KEYS
+                    .iter()
+                    .any(|sensitive| key.eq_ignore_ascii_case(sensitive)) =>
+            {
+                format!("{key}={}", mask_secret(value))
+            }
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted}")
+}
+
+/// Render outbound headers as sorted `name: value` lines for the live log.
+///
+/// Sorted so two requests can be diffed by eye, which is the whole point when a
+/// gateway accepts one request and rejects another with `unauthorized client
+/// detected`.
+fn format_upstream_headers(headers: &HeaderMap) -> String {
+    let mut lines = headers
+        .iter()
+        .map(|(name, value)| {
+            let name = name.as_str();
+            let value = value.to_str().unwrap_or("<non-utf8>");
+            if SENSITIVE_HEADER_NAMES
+                .iter()
+                .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+            {
+                format!("{name}: {}", mask_secret(value))
+            } else {
+                format!("{name}: {value}")
+            }
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn retry_credential_indexes(len: usize, cursor: i64) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let first = cursor.rem_euclid(len as i64) as usize;
+    (0..len).map(|offset| (first + offset) % len).collect()
+}
+
+fn proxy_upstream_response(
+    status: StatusCode,
+    upstream_headers: HeaderMap,
+    response_bytes: Vec<u8>,
+) -> Result<Response, String> {
+    let mut response = Response::builder().status(status);
+    if let Some(header_map) = response.headers_mut() {
+        for (name, value) in upstream_headers.iter() {
+            if is_hop_by_hop_header(name) {
+                continue;
+            }
+            header_map.append(name.clone(), value.clone());
+        }
+    }
+    response
+        .body(Body::from(response_bytes))
+        .map_err(|error| format!("Could not build proxy response: {error}"))
+}
+
+/// Re-encode a context-window rejection into the error shape the inbound
+/// client actually speaks.
+///
+/// Codex only compacts after a **200** `response.failed` event carrying the
+/// structured `context_length_exceeded` code. Chat Completions clients have no
+/// such event type: they expect a normal OpenAI error document, and an HTTP 400
+/// is the failure their accumulators already handle. The upstream sentence is
+/// kept verbatim so the UI still names the actionable problem.
+#[allow(clippy::too_many_arguments)]
+fn context_length_failure_response(
+    platform: &str,
+    path: &str,
+    upstream_status: StatusCode,
+    upstream_headers: HeaderMap,
+    upstream_body: &[u8],
+    failure: &crate::services::response_failure_service::SemanticResponseFailure,
+) -> Result<Response, String> {
+    if is_chat_completions_path(path) {
+        let mut headers = upstream_headers;
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return proxy_upstream_response(
+            StatusCode::BAD_REQUEST,
+            headers,
+            json!({ "error": {
+                "message": failure.message,
+                "type": "invalid_request_error",
+                "param": Value::Null,
+                "code": "context_length_exceeded",
+            }})
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    if platform != PlatformId::Codex.as_str() || !is_responses_path(path) {
+        // Neither Codex's compaction code nor Chat's error document applies.
+        // Hand the upstream's own answer back byte for byte.
+        return proxy_upstream_response(upstream_status, upstream_headers, upstream_body.to_vec());
+    }
+    let body = json!({
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_ai_switch_context_length",
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "status": "failed",
+            "error": {
+                "code": "context_length_exceeded",
+                // Codex reads this to decide whether to compact; keep the
+                // upstream's own wording so the user sees the actionable text.
+                "message": failure.message,
+            },
+            "output": [],
+            "usage": Value::Null,
+        },
+    });
+    let mut headers = upstream_headers;
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    proxy_upstream_response(
+        StatusCode::OK,
+        headers,
+        format!("data: {body}\n\n").into_bytes(),
+    )
+}
+
+/// Build the client response around a streaming body.
+///
+/// Same header handling as [`proxy_upstream_response`] — `is_hop_by_hop_header`
+/// already drops `content-length` and `transfer-encoding`, so hyper is free to
+/// frame the response as chunked.
+fn proxy_upstream_stream_response(
+    status: StatusCode,
+    upstream_headers: HeaderMap,
+    body: Body,
+) -> Result<Response, String> {
+    let mut response = Response::builder().status(status);
+    if let Some(header_map) = response.headers_mut() {
+        for (name, value) in upstream_headers.iter() {
+            if is_hop_by_hop_header(name) {
+                continue;
+            }
+            header_map.append(name.clone(), value.clone());
+        }
+    }
+    response
+        .body(body)
+        .map_err(|error| format!("Could not build proxy response: {error}"))
+}
+
+/// Whether this response can be streamed to the client rather than buffered.
+///
+/// Every condition here exists because some consumer of the buffered path needs
+/// the complete body:
+///
+/// - a non-streaming reply has no frames to inspect incrementally, and nothing
+///   to gain — the client waits for one JSON document either way;
+/// - a non-2xx body decides retry classification, which must happen before
+///   anything reaches the client;
+/// - official credentials parse the body for subscription/quota signals.
+///
+/// A bridge used to be on this list wholesale, because five of the seven
+/// aggregate the entire stream before re-emitting it. That is still true of
+/// those five, but it was never true of `ResponsesToResponses` or
+/// `ResponsesToChat`: both rewrite the body record by record, so
+/// [`IncrementalResponseBridge`] can drive them off a live stream. Buffering
+/// them cost the client every incremental frame — a Codex turn went silent until
+/// the upstream had finished, which for a long thinking turn is minutes.
+///
+/// Custom tool restoration was on the list for the same reason, and for the same
+/// fix: it is a per-record rewrite too, so it no longer forces a buffer once the
+/// response is framed. It still does on the unbridged path, which forwards bytes
+/// verbatim and so has nowhere to hook it.
+fn should_stream_upstream_response(
+    bridge_kind: Option<ProtocolBridgeKind>,
+    streaming_request: bool,
+    status: StatusCode,
+    custom_tool_names: &std::collections::HashSet<String>,
+    credential: &SelectedCredential,
+    tool_namespaces: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    if !(streaming_request && status.is_success() && credential.kind != "official") {
+        return false;
+    }
+    match bridge_kind {
+        None => custom_tool_names.is_empty(),
+        Some(kind) => IncrementalResponseBridge::new(kind, tool_namespaces).is_some(),
+    }
+}
+
+/// The per-request values a streamed response still has to report once it ends.
+struct StreamPrimeContext<'a> {
+    attempt: usize,
+    path: &'a str,
+    target_url: &'a str,
+    status: StatusCode,
+    trace_id: Option<&'a str>,
+    request_start: Instant,
+    requested_model: Option<&'a str>,
+    upstream_model: Option<&'a str>,
+    /// Upstream model key this attempt is charged under, `None` when the request
+    /// carried no model.
+    model_key: Option<&'a str>,
+    bridge_name: Option<&'a str>,
+    client_request: &'a [u8],
+    upstream_request: &'a [u8],
+    upstream_headers: &'a HeaderMap,
+    response_body: Option<&'a [u8]>,
+}
+
+/// Record a failure that happened before any byte reached the client.
+///
+/// Mirrors the buffered path's transport-failure arm: log the attempt, then
+/// either queue the same account again or record the failure and let the caller
+/// fall through to the next candidate.
+///
+/// Returns `true` when the failure is terminal for the whole request — the
+/// caller must hand the buffered bytes straight back to the client instead of
+/// walking the pool. The cases today are the request-body verdicts (an oversized
+/// prompt, a conversation over the image count limit): every account rejects the
+/// same bytes, so a walk can only burn the pool and end in the aggregated error
+/// that hides the upstream's own sentence.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_prime_failure(
+    state: &ProxyAppState,
+    pool: &SqlitePool,
+    platform: &str,
+    credential: &SelectedCredential,
+    error_message: &str,
+    context: StreamPrimeContext<'_>,
+    retry_same_credential: bool,
+    failure_policy: RouteCredentialFailurePolicy,
+    // Overrides the policy's own backoff when this failure kind has a better
+    // delay than a generic one. `None` keeps the policy's interval.
+    retry_delay: Option<Duration>,
+    retry_queue: &mut VecDeque<(usize, usize)>,
+    credential_index: usize,
+    credential_retry_count: usize,
+    retry_errors: &mut Vec<String>,
+    rejected_indexes: &mut Vec<usize>,
+) -> bool {
+    let metadata = route_proxy_request_metadata(
+        context.attempt,
+        platform,
+        credential,
+        context.path,
+        Some(context.target_url),
+        Some(context.status.as_u16()),
+        false,
+        context.trace_id,
+        context.request_start,
+        Some(error_message),
+        context.requested_model,
+        context.upstream_model,
+        context.response_body,
+    );
+    let _ = insert_route_credential_request_event(
+        state,
+        &credential.id,
+        &metadata,
+        &RouteUsageBreakdown::default(),
+        None,
+    )
+    .await;
+    emit_live_log(
+        state,
+        platform,
+        credential,
+        context.attempt,
+        context.path,
+        Some(context.target_url),
+        Some(context.upstream_headers),
+        Some(context.status.as_u16()),
+        false,
+        context.trace_id,
+        context.request_start,
+        Some(error_message),
+        context.requested_model,
+        context.upstream_model,
+        context.bridge_name,
+        Some(context.client_request),
+        Some(context.upstream_request),
+        context.response_body,
+        context.response_body,
+        None,
+    );
+    // A request-body verdict is terminal for the whole request: every account
+    // rejects the same bytes, so walking the pool would burn it down to an
+    // aggregated error that hides the upstream's own sentence. Hand the buffered
+    // bytes straight back, leaving every credential untouched.
+    if context
+        .response_body
+        .and_then(detect_response_failed)
+        .as_ref()
+        .is_some_and(|failure| {
+            is_context_length_failure(failure) || is_too_many_images_failure(failure)
+        })
+    {
+        return true;
+    }
+    // A content-policy rejection in the opening frame is still a verdict on
+    // this request body, not a transport failure. Do not retry this account or
+    // charge its retry budget; the caller may continue through the existing
+    // aggregate-mode queue.
+    if let Some(failure) = context
+        .response_body
+        .and_then(detect_response_failed)
+        .filter(is_content_rejection)
+    {
+        if RouteCredentialRepository::record_content_rejection(
+            pool,
+            &credential.id,
+            &failure.message,
+            context.response_body,
+        )
+        .await
+        .is_ok()
+        {
+            state
+                .activity
+                .notify_status_change(platform, &credential.id);
+        }
+        rejected_indexes.push(credential_index);
+        retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
+        stop_failover_when_disabled(retry_queue, failure_policy.failover_enabled);
+        return false;
+    }
+    if let Some(failure) = context
+        .response_body
+        .and_then(detect_response_failed)
+        .filter(is_definitive_quota_exhaustion_failure)
+    {
+        record_definitive_quota_failure(
+            state,
+            platform,
+            credential,
+            Some(context.status.as_u16()),
+            &failure.message,
+            context.response_body,
+        )
+        .await;
+        retry_queue.retain(|(index, _)| *index != credential_index);
+        if !quota_failover_allowed(state, platform).await {
+            retry_queue.clear();
+        }
+        retry_errors.push(error_message.to_string());
+        return false;
+    }
+    if retry_same_credential {
+        match retry_delay {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => wait_for_credential_retry(failure_policy).await,
+        }
+        retry_queue.push_front((credential_index, credential_retry_count + 1));
+    } else {
+        record_route_credential_failure(
+            &state.activity,
+            platform,
+            pool,
+            credential,
+            context.model_key,
+            "transport",
+            error_message,
+            None,
+        )
+        .await;
+        retry_errors.push(error_message.to_string());
+        stop_failover_when_disabled(retry_queue, failure_policy.failover_enabled);
+    }
+    false
+}
+
+/// Everything needed to close the books on a streamed response.
+///
+/// Carries the request's identity plus the observer accumulating what passed
+/// through, and settles usage, the request log and account health when the
+/// stream ends.
+struct StreamCompletion {
+    state: ProxyAppState,
+    credential: SelectedCredential,
+    platform: String,
+    attempt: usize,
+    path: String,
+    target_url: String,
+    status: StatusCode,
+    trace_id: Option<String>,
+    request_start: Instant,
+    requested_model: Option<String>,
+    upstream_model: Option<String>,
+    /// Upstream model key this response is charged under, `None` when the request
+    /// carried no model.
+    model_key: Option<String>,
+    bridge_name: Option<String>,
+    client_request: axum::body::Bytes,
+    upstream_request: Vec<u8>,
+    upstream_headers: HeaderMap,
+    observer: StreamObserver,
+    /// 音频方言原始帧与客户端 OpenAI 事件分开保留，避免日志把转换前后混在一起。
+    audio_raw_preview: Option<Vec<u8>>,
+    /// 强额度错误已单独记录，结账时不能再用普通断流覆盖其原因或清回正常。
+    quota_failure_recorded: bool,
+    /// 客户端原始请求头。聚合模式换账号续写时，用它重新构造上游请求。
+    client_headers: HeaderMap,
+    /// 原请求的 query（如 `beta=true`）；重建续写 URL 需要。
+    upstream_query: Option<String>,
+    _activity_lease: RouteCredentialActivityLease,
+}
+
+impl StreamCompletion {
+    /// 内容已经完整、只差收尾事件：所有 item 都已 done，且上游没给终止标记。
+    fn can_synthesize_completion(&self) -> bool {
+        let state = self.observer.continuation();
+        state.response_id.is_some()
+            && !self.observer.has_semantic_failure()
+            && !self.observer.has_open_messages()
+            && state.open_item.is_none()
+            && !state.completed_items.is_empty()
+            && self.observer.ended_without_terminal_event()
+    }
+
+    /// 补一条 `response.completed` 并把这次请求按成功结账。
+    ///
+    /// 返回要发给客户端的那段字节；`finish()` 之后仍照常记账、写日志——
+    /// 只是标记成正常结束，不再记 `semantic_response_transient`。
+    async fn finish_with_synthesized_completion(mut self) -> axum::body::Bytes {
+        let state = self.observer.continuation().clone();
+        let usage = self.observer.usage_snapshot();
+        let block = crate::services::route_stream_continuation::synthesized_completion_block(
+            state.response_id.as_deref().unwrap_or_default(),
+            state.last_sequence_number + 1,
+            &usage,
+        );
+        self.observer.mark_completed();
+        self.finish().await;
+        axum::body::Bytes::from(block)
+    }
+
+    /// Persist usage, log the request, and update account health.
+    ///
+    /// Runs whether the stream ended on its own or the client hung up, so a
+    /// half-read response is still accounted for rather than silently dropped.
+    async fn finish(self) {
+        let StreamCompletion {
+            state,
+            credential,
+            platform,
+            attempt,
+            path,
+            target_url,
+            status,
+            trace_id,
+            request_start,
+            requested_model,
+            upstream_model,
+            model_key,
+            bridge_name,
+            client_request,
+            upstream_request,
+            upstream_headers,
+            observer,
+            audio_raw_preview,
+            quota_failure_recorded,
+            client_headers: _client_headers,
+            upstream_query: _upstream_query,
+            _activity_lease,
+        } = self;
+
+        let preview = observer.preview().to_vec();
+        let outcome = observer.finish();
+        let truncated = outcome.disconnected_before_completion;
+        // Prefer the upstream's own failure sentence whenever it sent one. The
+        // context-limit classifier already narrows *when* that sentence changes
+        // retry and account-health behavior; once the upstream has spoken, the
+        // log must quote it rather than substitute generic disconnect wording
+        // for every other semantic failure.
+        let error_message = truncated.then(|| {
+            outcome
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| STREAM_DISCONNECTED_FAILURE_MESSAGE.to_string())
+        });
+
+        let mut usage = outcome.usage;
+        let priced_model = outcome
+            .response_model
+            .or_else(|| upstream_model.clone())
+            .or_else(|| requested_model.clone());
+        apply_estimated_price(&mut usage, priced_model.as_deref());
+
+        let metadata = route_proxy_request_metadata(
+            attempt,
+            &platform,
+            &credential,
+            &path,
+            Some(&target_url),
+            Some(status.as_u16()),
+            !truncated,
+            trace_id.as_deref(),
+            request_start,
+            error_message.as_deref(),
+            requested_model.as_deref(),
+            upstream_model.as_deref(),
+            Some(&preview),
+        );
+        let _ = insert_route_credential_request_event(
+            &state,
+            &credential.id,
+            &metadata,
+            &usage,
+            crate::services::upstream_response_id::extract_upstream_response_id(&preview)
+                .as_deref(),
+        )
+        .await;
+        emit_live_log(
+            &state,
+            &platform,
+            &credential,
+            attempt,
+            &path,
+            Some(&target_url),
+            Some(&upstream_headers),
+            Some(status.as_u16()),
+            !truncated,
+            trace_id.as_deref(),
+            request_start,
+            error_message.as_deref(),
+            requested_model.as_deref(),
+            upstream_model.as_deref(),
+            bridge_name.as_deref(),
+            Some(&client_request),
+            Some(&upstream_request),
+            Some(audio_raw_preview.as_deref().unwrap_or(&preview)),
+            Some(&preview),
+            // The one stage whose reasoning count is actually known: this path
+            // watched every frame of the upstream stream, so a zero here is a
+            // statement about the upstream rather than a gap in the log.
+            Some(outcome.reasoning_deltas),
+        );
+
+        if quota_failure_recorded {
+            return;
+        }
+
+        if truncated {
+            // 请求过大不是账号的问题：同一池里的每个账号都会以同样方式拒绝同一批
+            // 字节，记成账号故障只会把一个健康账号冷却掉，而真正的修复是缩请求。
+            // 日志已经保留了上游原文（见 `error_message`），不再给账号记失败。
+            //
+            // 「会话里的图片数量超过单次请求上限」同理：张数写在客户端发来的 body
+            // 里，换号数出的是同一个数字。
+            //
+            // 真正的断流（上游没说明原因）照旧记账：账号的退避与健康状态正是用来
+            // 阻止号池优先挑一个老是断流的上游。
+            let request_verdict = outcome.failure.as_ref().is_some_and(|failure| {
+                is_context_length_failure(failure) || is_too_many_images_failure(failure)
+            });
+            // The stream is already on its way to the client, so this turn cannot
+            // be recovered here — but the account can: switch its image
+            // compatibility on so the next request sends only its newest images
+            // instead of hitting the same limit again.
+            if outcome
+                .failure
+                .as_ref()
+                .is_some_and(is_too_many_images_failure)
+            {
+                enable_image_limit_compat_in_background(&state.pool, &credential.id);
+            }
+            if !request_verdict {
+                record_route_credential_failure(
+                    &state.activity,
+                    &platform,
+                    &state.pool,
+                    &credential,
+                    model_key.as_deref(),
+                    "semantic_response_transient",
+                    error_message
+                        .as_deref()
+                        .unwrap_or(STREAM_DISCONNECTED_FAILURE_MESSAGE),
+                    Some(&preview),
+                )
+                .await;
+            }
+            return;
+        }
+
+        // Same rule as the buffered path: a success that had no failure state to
+        // clear is not a status change, and announcing it made every streamed
+        // response reload the account screen.
+        if matches!(
+            RouteCredentialRepository::clear_transient_failure(
+                &state.pool,
+                &credential.id,
+                model_key.as_deref(),
+            )
+            .await,
+            Ok(true)
+        ) {
+            state
+                .activity
+                .notify_status_change(&platform, &credential.id);
+        }
+    }
+}
+
+/// Wrap the upstream stream so every chunk is observed on its way to the client.
+///
+/// The completion handle is moved into the stream, so it is dropped — and the
+/// books closed — when the stream ends or the client disconnects.
+/// Rewrites a streamed upstream response as it passes through.
+///
+/// A streamed response never exists as one buffer, so the whole-body bridge
+/// transform cannot run on it. This holds the incremental counterpart: it frames
+/// the byte stream, hands each complete record to the bridge, and restores custom
+/// tool names per record. A frame split across chunks is held until its
+/// terminator arrives, so it is never emitted as two malformed halves.
+///
+/// An upstream that answers a streaming request with a single JSON document
+/// never produces a frame. The whole buffer is then handed to the buffered
+/// transform at the end, which is exactly what the buffered path would have done
+/// with it — including the error bodies that arrive that way.
+struct StreamResponseTransform {
+    framer: crate::services::route_proxy_stream::SseFramer,
+    bridge: Option<IncrementalResponseBridge>,
+    custom_tool_names: std::collections::HashSet<String>,
+    /// Present whenever `bridge` is: the request facts the buffered path would
+    /// have used, for the not-actually-SSE fallback.
+    whole_body: Option<WholeBodyTransform>,
+    saw_block: bool,
+    finished: bool,
+    item_holdback: crate::services::route_stream_continuation::ResponsesItemHoldback,
+}
+
+/// The request facts the whole-body fallback needs.
+struct WholeBodyTransform {
+    kind: ProtocolBridgeKind,
+    status: u16,
+    content_type: Option<String>,
+    tool_namespaces: std::collections::BTreeMap<String, String>,
+}
+
+impl StreamResponseTransform {
+    fn new(
+        kind: ProtocolBridgeKind,
+        bridge: IncrementalResponseBridge,
+        status: StatusCode,
+        content_type: Option<String>,
+        tool_namespaces: std::collections::BTreeMap<String, String>,
+        custom_tool_names: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            framer: crate::services::route_proxy_stream::SseFramer::new(),
+            bridge: Some(bridge),
+            custom_tool_names,
+            whole_body: Some(WholeBodyTransform {
+                kind,
+                status: status.as_u16(),
+                content_type,
+                tool_namespaces,
+            }),
+            saw_block: false,
+            finished: false,
+            item_holdback: if kind == ProtocolBridgeKind::ResponsesToChat {
+                crate::services::route_stream_continuation::ResponsesItemHoldback::for_chat_bridge()
+            } else {
+                Default::default()
+            },
+        }
+    }
+
+    /// Rewrites one already-complete record. `record` carries its own `\n\n`.
+    fn rewrite(&mut self, record: &str) -> Result<String, String> {
+        let converted = match self.bridge.as_mut() {
+            // The bridge frames its own output, so the terminator the framer
+            // stripped has to come back for the record to stay well-formed.
+            Some(bridge) => match bridge.push_block(record.trim_end_matches("\n\n"))? {
+                Some(converted) if !converted.ends_with("\n\n") => format!("{converted}\n\n"),
+                Some(converted) => converted,
+                None => return Ok(String::new()),
+            },
+            None => format!("{record}\n\n"),
+        };
+        self.hold_restored_records(&converted)
+    }
+
+    /// 工具名恢复之后再暂存，首次流和续写都不会泄漏半截调用。
+    fn hold_restored_records(&mut self, text: &str) -> Result<String, String> {
+        let text = self.restore_custom_tools(text);
+        let mut output = String::new();
+        for block in text.split("\n\n").filter(|block| !block.trim().is_empty()) {
+            for block in self.item_holdback.push_block(block)? {
+                output.push_str(&block);
+            }
+        }
+        Ok(output)
+    }
+
+    fn can_continue(&self) -> bool {
+        !self.failed() && self.item_holdback.can_continue()
+            // Chat 桥没有回滚工具状态的接口，不能把新参数接在上一轮的半截参数后。
+            && !(self.is_chat_bridge() && (self.item_holdback.has_pending() || self.item_holdback.discarded()))
+    }
+
+    fn release_interrupted(&mut self) -> String {
+        self.item_holdback.discard_incomplete().concat()
+    }
+
+    fn flush_pending_record(&mut self) -> Result<String, String> {
+        match self.framer.finish_block() {
+            Some(tail) => self.rewrite(&tail),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// Applies the same custom-tool rewrite the buffered path runs on the whole
+    /// body.
+    ///
+    /// It is line-delimited, so one record and a whole stream go through it
+    /// identically — which is the point: every byte this transform emits has to
+    /// pass here, the closing events included. Routing only `rewrite` through it
+    /// leaves the final `output_item.done` carrying a `function_call` where the
+    /// buffered path would have written a `custom_tool_call`.
+    fn restore_custom_tools(&self, text: &str) -> String {
+        String::from_utf8_lossy(&restore_custom_tools_in_responses_payload(
+            text.as_bytes(),
+            &self.custom_tool_names,
+        ))
+        .into_owned()
+    }
+
+    /// Whether the bridge reported a terminal failure. Nothing further is
+    /// convertible once it has, and the closing events must not follow it.
+    fn failed(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .is_some_and(IncrementalResponseBridge::failed)
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
+    /// 是不是「Responses → Chat」桥：它的续写要沿用同一个 bridge 实例，
+    /// 而不是换成 [`crate::services::route_stream_continuation::ResponsesResumeRewriter`]。
+    fn is_chat_bridge(&self) -> bool {
+        matches!(
+            self.bridge,
+            Some(IncrementalResponseBridge::ResponsesToChat(_))
+        )
+    }
+
+    /// 丢掉 framer 里没凑成完整记录的尾巴。
+    ///
+    /// 断流时这条尾巴本身就是残缺的（上游死在记录中间）。要接续写流之前必须丢掉，
+    /// 否则它会同续写流的第一个字节拼成一条坏记录，被 bridge 整条忽略。
+    fn drop_pending_record(&mut self) {
+        let _ = self.framer.finish_block();
+    }
+
+    /// Converts whatever this chunk completes. Returns the bytes to forward —
+    /// empty while a record is still split across chunks.
+    fn push(&mut self, chunk: &[u8]) -> Result<String, String> {
+        let mut output = String::new();
+        for record in self.framer.push_blocks(chunk) {
+            self.saw_block = true;
+            output.push_str(&self.rewrite(&record)?);
+            if self.failed() {
+                return Ok(output);
+            }
+        }
+        Ok(output)
+    }
+
+    /// Flushes the trailing bytes and emits the bridge's closing events.
+    fn finish(&mut self) -> Result<String, String> {
+        if self.finished {
+            return Ok(String::new());
+        }
+        self.finished = true;
+        let mut output = String::new();
+        let tail = self.framer.finish_block();
+        if !self.saw_block {
+            // Never framed: this is one document, not a stream. Run the buffered
+            // transform on it, which also covers an error body the upstream sent
+            // in place of the stream.
+            let Some(whole_body) = self.whole_body.take() else {
+                return Ok(tail.unwrap_or_default());
+            };
+            let body = tail.unwrap_or_default().into_bytes();
+            let converted =
+                crate::services::route_protocol_bridge::transform_response_with_tool_namespaces(
+                    whole_body.kind,
+                    whole_body.status,
+                    whole_body.content_type.as_deref(),
+                    &body,
+                    &whole_body.tool_namespaces,
+                )?;
+            return Ok(
+                String::from_utf8_lossy(&restore_custom_tools_in_responses_payload(
+                    &converted.body,
+                    &self.custom_tool_names,
+                ))
+                .into_owned(),
+            );
+        }
+        if let Some(tail) = tail {
+            output.push_str(&self.rewrite(&tail)?);
+        }
+        if self.failed() {
+            return Ok(output);
+        }
+        if let Some(bridge) = self.bridge.as_mut() {
+            let closing = bridge.finish()?;
+            output.push_str(&self.hold_restored_records(&closing)?);
+        }
+        Ok(output)
+    }
+}
+
+/// 内层上游流在续写泵里所处的形态。
+enum StreamStage {
+    /// 原上游（含 Chat 桥）：逐块交给 `transform`；`None` 表示纯字节透传。
+    Primary(Option<StreamResponseTransform>),
+    /// Responses 续写流：事件先重写成「原 response 的后续」再转发。
+    Resume(ResumeStage),
+}
+
+/// 续写流的重写状态。
+///
+/// 跨多轮续写保留同一份：重写器自己持有 `sequence_number` / `output_index`
+/// 游标，重建一个会让序号从旧值重来。`framer` 每轮开始前清空。
+struct ResumeStage {
+    rewriter: crate::services::route_stream_continuation::ResponsesResumeRewriter,
+    framer: crate::services::route_proxy_stream::SseFramer,
+    bridge: IncrementalResponseBridge,
+    custom_tool_names: HashSet<String>,
+}
+
+impl ResumeStage {
+    fn rewrite_block(&mut self, block: &str) -> Result<Option<String>, String> {
+        let Some(converted) = self.bridge.push_block(block.trim_end_matches("\n\n"))? else {
+            return Ok(None);
+        };
+        let restored = restore_custom_tools_in_responses_payload(
+            converted.as_bytes(),
+            &self.custom_tool_names,
+        );
+        let restored = String::from_utf8_lossy(&restored);
+        let mut output = String::new();
+        for block in restored
+            .split("\n\n")
+            .filter(|block| !block.trim().is_empty())
+        {
+            if let Some(block) = self.rewriter.rewrite_block(block)? {
+                output.push_str(&block);
+            }
+        }
+        Ok((!output.is_empty()).then_some(output))
+    }
+}
+
+/// 驱动内层上游流的泵。
+///
+/// 除了「观察每一块、必要时转换」，它还负责在流中途断掉、且还有续写预算时，
+/// 悄悄换一条续写流接着吐给客户端（设计见
+/// `docs/superpowers/specs/2026-10-09-stream-continuation-design.md`）。
+struct StreamPump {
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>,
+    >,
+    guard: StreamCompletionGuard,
+    current_credential: SelectedCredential,
+    current_status: u16,
+    quota_error_handled: bool,
+    stage: StreamStage,
+    /// 已经用掉的续写轮次。
+    rounds: u32,
+    /// 当前内层流是不是续写流：续写流的帧只并用量与正文，不写原响应的事件状态。
+    continuing: bool,
+    /// 收尾已经做过：接下来只把流结束掉，不再续写、不再补事件。
+    done: bool,
+    /// 换流前要补发给客户端的字节（断流 item 的合成 `done`）。
+    pending_output: Option<axum::body::Bytes>,
+    upstream_ended: bool,
+    upstream_error: Option<String>,
+}
+
+impl StreamPump {
+    /// 已下发内容的流不重放；收到明确额度错误即标记实际账号，并停止继续读取上游。
+    async fn record_observed_quota_failure(&mut self) {
+        if self.quota_error_handled {
+            return;
+        }
+        let Some(completion) = self.guard.completion.as_mut() else {
+            return;
+        };
+        let Some(failure) = completion.observer.quota_failure().cloned() else {
+            return;
+        };
+        let body = json!({"error":{"message":failure.message,"type":failure.error_type,"code":failure.code}}).to_string();
+        record_definitive_quota_failure(
+            &completion.state,
+            &completion.platform,
+            &self.current_credential,
+            Some(self.current_status),
+            &failure.message,
+            Some(body.as_bytes()),
+        )
+        .await;
+        if self.current_credential.id == completion.credential.id {
+            completion.quota_failure_recorded = true;
+        }
+        self.quota_error_handled = true;
+        self.stream = Box::pin(futures_util::stream::empty());
+    }
+
+    async fn reject_quota_candidate(
+        &mut self,
+        state: &ProxyAppState,
+        platform: &str,
+        credential: &SelectedCredential,
+        status: u16,
+        body: &[u8],
+    ) -> bool {
+        let Some(failure) =
+            detect_response_failed(body).filter(is_definitive_quota_exhaustion_failure)
+        else {
+            return false;
+        };
+        record_definitive_quota_failure(
+            state,
+            platform,
+            credential,
+            Some(status),
+            &failure.message,
+            Some(body),
+        )
+        .await;
+        if let Some(completion) = self.guard.completion.as_mut() {
+            if completion.credential.id == credential.id {
+                completion.quota_failure_recorded = true;
+            }
+        }
+        quota_failover_allowed(state, platform).await
+    }
+
+    /// 刚结束的内层流是不是「正常收尾」（见到了终止标记）。
+    ///
+    /// 正常收尾就该结束整条响应；只有「没看到终止标记」才值得续写。原上游的
+    /// 终止标记由 observer 直接看，续写流的要单独记（它不走 `observe`）。
+    fn ended_with_terminal(&self) -> bool {
+        match self.guard.completion.as_ref() {
+            // 已经结账了：别再来一轮。
+            None => true,
+            Some(completion) => {
+                if self.continuing {
+                    completion.observer.continuation_saw_terminal()
+                } else {
+                    completion.observer.saw_terminal_marker()
+                }
+            }
+        }
+    }
+
+    fn can_synthesize_primary(&self) -> bool {
+        !self.continuing
+            && self
+                .guard
+                .completion
+                .as_ref()
+                .is_some_and(StreamCompletion::can_synthesize_completion)
+            && match &self.stage {
+                StreamStage::Primary(Some(transform)) => {
+                    !transform.item_holdback.has_pending() && !transform.item_holdback.discarded()
+                }
+                StreamStage::Primary(None) => true,
+                _ => false,
+            }
+    }
+
+    fn finish_current_records(&mut self) -> Result<String, String> {
+        if let Some(completion) = self.guard.completion.as_mut() {
+            completion.observer.flush_pending_frame(self.continuing);
+        }
+        let clean = self.ended_with_terminal();
+        let mut output = String::new();
+        match &mut self.stage {
+            StreamStage::Primary(Some(transform)) => {
+                if !transform.is_chat_bridge() && !transform.finished() {
+                    output.push_str(&transform.finish()?);
+                } else if transform.is_chat_bridge() && !clean {
+                    output.push_str(&transform.flush_pending_record()?);
+                }
+                if !clean {
+                    output.push_str(&transform.release_interrupted());
+                }
+            }
+            StreamStage::Resume(resume) => {
+                if let Some(tail) = resume.framer.finish_block() {
+                    if let Some(block) = resume.rewrite_block(&tail)? {
+                        output.push_str(&block);
+                    }
+                }
+                if !clean {
+                    output.push_str(&resume.rewriter.release_interrupted()?);
+                }
+            }
+            _ => {}
+        }
+        Ok(output)
+    }
+
+    /// 断流时尝试把内层流换成一次续写请求的响应流。
+    ///
+    /// 返回 `true` 表示新流已经接上（`stage` / `rounds` 一并更新），调用方应回到
+    /// 循环顶部继续 poll；`false` 表示这轮不续写，按既有断流路径收尾。
+    async fn try_continue(&mut self) -> bool {
+        if self.ended_with_terminal()
+            || self
+                .guard
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.observer.has_semantic_failure())
+        {
+            return false;
+        }
+        match &self.stage {
+            StreamStage::Primary(Some(transform)) if !transform.can_continue() => return false,
+            StreamStage::Resume(resume) if !resume.rewriter.can_continue() => return false,
+            _ => {}
+        }
+        if self.can_synthesize_primary() {
+            return false;
+        }
+        // 先把施工图与重建请求所需的事实从 completion 里取出，借用随即结束。
+        let Some((
+            plan,
+            state,
+            platform,
+            path,
+            query,
+            headers,
+            current_id,
+            failover_enabled,
+        )) = ({
+            let Some(completion) = self.guard.completion.as_ref() else {
+                return false;
+            };
+            // 续写开关与预算属于断流的那个账号：它决定「要不要续写、最多续几轮」。
+            // 换号只决定这一轮续写请求打给谁——被换到的账号的策略不参与本轮决策，
+            // 否则两个账号的策略会互相引用，绕不出来。
+            let policy =
+                RouteCredentialFailurePolicy::from_config_json(&completion.credential.config_json);
+            if !policy.stream_continue_enabled
+                || self.rounds >= policy.stream_continue_max
+            {
+                return false;
+            }
+            plan_continuation(
+                &completion.client_request,
+                completion.observer.continuation(),
+            )
+            .map(|mut plan| {
+                plan.next_output_index = plan
+                    .next_output_index
+                    .max(completion.observer.next_output_index());
+                (
+                    plan,
+                    completion.state.clone(),
+                    completion.platform.clone(),
+                    completion.path.clone(),
+                    completion.upstream_query.clone(),
+                    completion.client_headers.clone(),
+                    completion.credential.id.clone(),
+                    policy.failover_enabled,
+                )
+            })
+        }) else {
+            return false;
+        };
+
+        let mut rejected = HashSet::new();
+        let (credential, status, stream, resume_bridge, resume_custom_tools) = 'candidates: loop {
+            let Some(credential) = pick_continuation_credential(
+                &state,
+                &platform,
+                &current_id,
+                failover_enabled,
+                &rejected,
+            )
+            .await
+            else {
+                return false;
+            };
+            let built = match build_upstream_request_internal(
+                &credential,
+                &platform,
+                &path,
+                query.as_deref(),
+                headers.clone(),
+                &plan.body,
+                Some(&state.codex_history),
+                TurnReminderMode::Apply,
+                state.model_match_mode,
+            ) {
+                Ok(built) => built,
+                Err(error) => {
+                    eprintln!("[route-continuation] 重建上游请求失败: {error}");
+                    return false;
+                }
+            };
+            let expected_bridge = match &self.stage {
+                StreamStage::Primary(Some(transform)) if transform.is_chat_bridge() => {
+                    Some(ProtocolBridgeKind::ResponsesToChat)
+                }
+                _ => Some(ProtocolBridgeKind::ResponsesToResponses),
+            };
+            if built.bridge_kind != expected_bridge || credential.kind != "api" {
+                return false;
+            }
+            let default_client =
+                match build_outbound_http_client_with_timeouts(state.upstream_timeouts) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        eprintln!("[route-continuation] 构造 HTTP 客户端失败: {error}");
+                        return false;
+                    }
+                };
+            let client =
+                match state.outbound_client_for_config(&default_client, &credential.config_json) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        eprintln!("[route-continuation] 构造账号代理客户端失败: {error}");
+                        return false;
+                    }
+                };
+            let resume_bridge = IncrementalResponseBridge::new(
+                ProtocolBridgeKind::ResponsesToResponses,
+                &built.tool_namespaces,
+            )
+            .expect("native Responses bridge");
+            let resume_custom_tools = match &self.stage {
+                StreamStage::Primary(Some(transform)) => transform.custom_tool_names.clone(),
+                StreamStage::Resume(resume) => resume.custom_tool_names.clone(),
+                _ => HashSet::new(),
+            };
+            // 与原请求同一条编码路径，别让压缩设置上的差异暴露出来。
+            let mut request_headers = built.headers;
+            let outbound_body = request_compression::encode_request_body(
+                &built.target_url,
+                &mut request_headers,
+                &built.body,
+                &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+            )
+            .unwrap_or(built.body);
+            let response = match client
+                .post(&built.target_url)
+                .headers(map_to_reqwest_headers(&request_headers))
+                .body(outbound_body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("[route-continuation] 续写请求发送失败: {error}");
+                    return false;
+                }
+            };
+            let status = response.status().as_u16();
+            if !response.status().is_success() {
+                let body = response.bytes().await.unwrap_or_default();
+                rejected.insert(credential.id.clone());
+                if self
+                    .reject_quota_candidate(&state, &platform, &credential, status, &body)
+                    .await
+                {
+                    continue 'candidates;
+                }
+                return false;
+            }
+            // 续写同样要检查首帧：new-api 可能用 HTTP 200 JSON 或 SSE error 返回余额不足。
+            let mut rest = Box::pin(response.bytes_stream());
+            let mut prefix = Vec::new();
+            loop {
+                match futures_util::StreamExt::next(&mut rest).await {
+                    Some(Ok(chunk)) => {
+                        prefix.extend_from_slice(&chunk);
+                        if detect_response_failed(&prefix)
+                            .as_ref()
+                            .is_some_and(is_definitive_quota_exhaustion_failure)
+                        {
+                            rejected.insert(credential.id.clone());
+                            if self
+                                .reject_quota_candidate(
+                                    &state,
+                                    &platform,
+                                    &credential,
+                                    status,
+                                    &prefix,
+                                )
+                                .await
+                            {
+                                continue 'candidates;
+                            }
+                            return false;
+                        }
+                        if sse_payload_started(&prefix)
+                            || prefix.len() >= STREAM_PRIME_HOLDBACK_LIMIT
+                        {
+                            break;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            let stream: std::pin::Pin<
+                Box<dyn futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>,
+            > = Box::pin(futures_util::StreamExt::chain(
+                futures_util::stream::once(async move { Ok(axum::body::Bytes::from(prefix)) }),
+                rest,
+            ));
+            break (
+                credential,
+                status,
+                stream,
+                resume_bridge,
+                resume_custom_tools,
+            );
+        };
+        eprintln!(
+            "[route-continuation] round={} credential={} response_id={:?}",
+            self.rounds + 1,
+            credential.display_name,
+            plan.response_id,
+        );
+
+        // 断流时还开着的那个文本 item 必须先收尾：客户端靠 `output_item.done`
+        // 记录会话历史，不补这条它会把断流前那一段整段丢掉（实机复验确认）。
+        // Chat 桥不走这里——它的 item 跨轮保留，由 bridge 最后统一收尾。
+        let keep_same_item = matches!(
+            &self.stage,
+            StreamStage::Primary(Some(transform)) if transform.is_chat_bridge()
+        );
+        let original_ids = self
+            .guard
+            .completion
+            .as_ref()
+            .map(|completion| completion.observer.seen_item_ids())
+            .unwrap_or_default();
+        let mut resume_sequence = plan.next_sequence_number;
+        let mut open_item_done = None;
+        if !keep_same_item {
+            match &mut self.stage {
+                StreamStage::Resume(resume) => {
+                    open_item_done = resume.rewriter.take_dangling_message_done()
+                }
+                StreamStage::Primary(_) => {
+                    if let Some(completion) = self.guard.completion.as_mut() {
+                        open_item_done = completion
+                            .observer
+                            .take_dangling_messages_done(&mut resume_sequence);
+                    }
+                }
+            }
+        }
+        // 原上游那条 open item 已经（或就此）收尾，别再让下一轮把它当还开着。
+        if let Some(completion) = self.guard.completion.as_mut() {
+            completion.observer.begin_continuation();
+        }
+        if let Some(block) = open_item_done {
+            self.pending_output = Some(axum::body::Bytes::from(block.into_bytes()));
+        }
+        // 换流：Chat 桥沿用同一个 transform（bridge 状态跨请求保留），
+        // Responses 走事件重写器。
+        let previous = std::mem::replace(&mut self.stage, StreamStage::Primary(None));
+        self.stage = match previous {
+            StreamStage::Primary(Some(mut transform)) if transform.is_chat_bridge() => {
+                // 丢掉没凑完的半截记录，免得同续写流的第一个字节拼成坏记录。
+                transform.drop_pending_record();
+                StreamStage::Primary(Some(transform))
+            }
+            // 多轮续写沿用同一个重写器与游标；但上一轮没等到
+            // `output_item.done` 的半截工具调用要丢掉，让模型重发一条完整的。
+            StreamStage::Resume(mut resume) => {
+                let _ = resume.framer.finish_block();
+                resume.rewriter.begin_next_stream();
+                resume.bridge = resume_bridge;
+                resume.custom_tool_names = resume_custom_tools;
+                StreamStage::Resume(resume)
+            }
+            _ => {
+                let mut rewriter =
+                    crate::services::route_stream_continuation::ResponsesResumeRewriter::new(
+                        plan.response_id,
+                        resume_sequence,
+                        plan.next_output_index,
+                    );
+                rewriter.reserve_item_ids(original_ids);
+                StreamStage::Resume(ResumeStage {
+                    rewriter,
+                    framer: crate::services::route_proxy_stream::SseFramer::new(),
+                    bridge: resume_bridge,
+                    custom_tool_names: resume_custom_tools,
+                })
+            }
+        };
+        self.stream = stream;
+        self.current_credential = credential;
+        self.current_status = status;
+        self.quota_error_handled = false;
+        self.upstream_ended = false;
+        self.upstream_error = None;
+        self.rounds += 1;
+        self.continuing = true;
+        true
+    }
+}
+
+type AudioUpstreamStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>>;
+
+async fn prime_audio_stream(
+    stream: &mut AudioUpstreamStream,
+    adapter: &mut crate::audiogen::stream::SpeechStreamAdapter,
+) -> Result<(Vec<u8>, Vec<u8>), (String, Vec<u8>)> {
+    let mut raw = Vec::new();
+    let mut output = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(stream).await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => return Err((format!("Could not read speech stream: {error}"), raw)),
+        };
+        if raw.len().saturating_add(chunk.len())
+            > crate::audiogen::stream::SPEECH_STREAM_FRAME_LIMIT
+        {
+            return Err((
+                "Speech stream exceeded the first-audio holdback limit".to_string(),
+                raw,
+            ));
+        }
+        raw.extend_from_slice(&chunk);
+        match adapter.push(&chunk) {
+            Ok(converted) => output.extend(converted),
+            Err(error) => return Err((error, raw)),
+        }
+        if adapter.started() {
+            return Ok((raw, output));
+        }
+    }
+    match adapter.finish() {
+        Ok(tail) => {
+            output.extend(tail);
+            Ok((raw, output))
+        }
+        Err(error) => Err((error, raw)),
+    }
+}
+
+struct AudioStreamPump {
+    stream: AudioUpstreamStream,
+    adapter: crate::audiogen::stream::SpeechStreamAdapter,
+    first_chunk: Option<axum::body::Bytes>,
+    guard: StreamCompletionGuard,
+    done: bool,
+}
+
+/// 音频不能续写或合成文本收尾：只转帧，完整 done + EOF 才记成功。
+fn observed_audio_stream(
+    first_chunk: axum::body::Bytes,
+    stream: AudioUpstreamStream,
+    adapter: crate::audiogen::stream::SpeechStreamAdapter,
+    completion: StreamCompletion,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    let pump = AudioStreamPump {
+        stream,
+        adapter,
+        first_chunk: Some(first_chunk),
+        guard: StreamCompletionGuard {
+            completion: Some(completion),
+        },
+        done: false,
+    };
+    futures_util::stream::unfold(pump, |mut pump| async move {
+        loop {
+            if let Some(chunk) = pump.first_chunk.take() {
+                return Some((Ok(chunk), pump));
+            }
+            if pump.done {
+                return None;
+            }
+            let next = futures_util::StreamExt::next(&mut pump.stream).await;
+            let converted = match next {
+                Some(Ok(chunk)) => {
+                    if let Some(completion) = pump.guard.completion.as_mut() {
+                        if let Some(raw) = completion.audio_raw_preview.as_mut() {
+                            let take = LIVE_LOG_RAW_PREVIEW_LIMIT
+                                .saturating_sub(raw.len())
+                                .min(chunk.len());
+                            raw.extend_from_slice(&chunk[..take]);
+                        }
+                    }
+                    pump.adapter.push(&chunk)
+                }
+                Some(Err(error)) => {
+                    pump.done = true;
+                    Err(format!("Speech stream interrupted: {error}"))
+                }
+                None => {
+                    pump.done = true;
+                    pump.adapter.finish()
+                }
+            };
+            match converted {
+                Ok(output) => {
+                    if let Some(completion) = pump.guard.completion.as_mut() {
+                        completion.observer.observe(&output);
+                    }
+                    if pump.done {
+                        if let Some(completion) = pump.guard.completion.take() {
+                            completion.finish().await;
+                        }
+                    }
+                    if !output.is_empty() {
+                        return Some((Ok(axum::body::Bytes::from(output)), pump));
+                    }
+                    if pump.done {
+                        return None;
+                    }
+                }
+                Err(error) => {
+                    pump.done = true;
+                    if let Some(mut completion) = pump.guard.completion.take() {
+                        completion.observer.mark_stream_failed();
+                        completion.finish().await;
+                    }
+                    return Some((Err(std::io::Error::other(error)), pump));
+                }
+            }
+        }
+    })
+}
+
+fn observed_upstream_stream(
+    first_chunk: axum::body::Bytes,
+    rest: impl futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send + 'static,
+    transform: Option<StreamResponseTransform>,
+    completion: StreamCompletion,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    // 装箱是为了让 unfold 里的流**可以被替换**：断流续写时要把内层流换成
+    // 续写请求的响应流（Task 7）。类型必须唯一，`chain` 的具体类型换不了。
+    let replayed: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>,
+    > = Box::pin(futures_util::StreamExt::chain(
+        futures_util::stream::once(async move { Ok(first_chunk) }),
+        rest,
+    ));
+    let pump = StreamPump {
+        stream: replayed,
+        current_credential: completion.credential.clone(),
+        current_status: completion.status.as_u16(),
+        quota_error_handled: false,
+        guard: StreamCompletionGuard {
+            completion: Some(completion),
+        },
+        stage: StreamStage::Primary(transform),
+        rounds: 0,
+        continuing: false,
+        done: false,
+        pending_output: None,
+        upstream_ended: false,
+        upstream_error: None,
+    };
+    futures_util::stream::unfold(pump, |mut pump| async move {
+        loop {
+            // 换流前攒下的字节（断流 item 的合成 done）先发出去，保证它排在
+            // 续写流的第一条事件之前。
+            if let Some(pending) = pump.pending_output.take() {
+                return Some((Ok(pending), pump));
+            }
+            if pump.done {
+                return None;
+            }
+            let next = if pump.upstream_ended {
+                None
+            } else {
+                futures_util::StreamExt::next(&mut pump.stream).await
+            };
+            match next {
+                Some(Ok(chunk)) => {
+                    let continuing = pump.continuing;
+                    let chat_bridge = matches!(
+                        &pump.stage,
+                        StreamStage::Primary(Some(transform)) if transform.is_chat_bridge()
+                    );
+                    if let Some(completion) = pump.guard.completion.as_mut() {
+                        if continuing {
+                            // 续写流的帧只并用量与正文；它的 id / 序号归重写器管。
+                            completion.observer.observe_continuation(&chunk);
+                        } else {
+                            completion.observer.observe(&chunk);
+                        }
+                    }
+                    pump.record_observed_quota_failure().await;
+                    let mut failure = None;
+                    let converted = match &mut pump.stage {
+                        // A response that is not bridged is forwarded verbatim.
+                        StreamStage::Primary(transform) => match transform.as_mut() {
+                            None => Some(chunk),
+                            Some(transform) => match transform.push(&chunk) {
+                                Ok(output) => (!output.is_empty())
+                                    .then(|| axum::body::Bytes::from(output.into_bytes())),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    None
+                                }
+                            },
+                        },
+                        StreamStage::Resume(resume) => {
+                            let mut output = String::new();
+                            for block in resume.framer.push_blocks(&chunk) {
+                                match resume.rewrite_block(&block) {
+                                    Ok(Some(block)) => output.push_str(&block),
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                            (!output.is_empty())
+                                .then(|| axum::body::Bytes::from(output.into_bytes()))
+                        }
+                    };
+                    if let Some(error) = failure {
+                        pump.done = true;
+                        if let Some(mut completion) = pump.guard.completion.take() {
+                            completion.observer.mark_stream_failed();
+                            completion.finish().await;
+                        }
+                        return Some((Err(std::io::Error::other(error)), pump));
+                    }
+                    if chat_bridge && !continuing {
+                        // Chat 桥：客户端看到的事件是桥合成的，续写状态从桥的
+                        // 输出里补读；原始 Chat 帧喂不了这些字段。续写轮里桥上
+                        // 的正文已经由 `observe_continuation` 收过，别再接一遍。
+                        if let (Some(completion), Some(converted)) =
+                            (pump.guard.completion.as_mut(), converted.as_deref())
+                        {
+                            completion.observer.observe_client_events(converted);
+                        }
+                    }
+                    match converted {
+                        Some(converted) => return Some((Ok(converted), pump)),
+                        // Still mid-record: nothing to forward yet.
+                        None => continue,
+                    }
+                }
+                ended => {
+                    if !pump.upstream_ended {
+                        pump.upstream_error = ended
+                            .and_then(Result::err)
+                            .map(|error| format!("upstream stream failed: {error}"));
+                        pump.upstream_ended = true;
+                        let finished = pump.finish_current_records();
+                        pump.record_observed_quota_failure().await;
+                        match finished {
+                            Ok(output) if !output.is_empty() => {
+                                return Some((Ok(axum::body::Bytes::from(output)), pump))
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                pump.done = true;
+                                if let Some(mut completion) = pump.guard.completion.take() {
+                                    completion.observer.mark_stream_failed();
+                                    completion.finish().await;
+                                }
+                                return Some((Err(std::io::Error::other(error)), pump));
+                            }
+                        }
+                    }
+                    // 内层流断了或写完了：还差内容就先续写。
+                    if pump.try_continue().await {
+                        continue;
+                    }
+                    pump.done = true;
+                    // 先在动 `stage` 之前把要读 completion 的判定做完，
+                    // 免得同时借 `pump.stage` 与 `pump.guard`。
+                    let can_synthesize = pump.can_synthesize_primary();
+                    let ended_cleanly = pump.ended_with_terminal();
+                    let usage = pump
+                        .guard
+                        .completion
+                        .as_ref()
+                        .map(|completion| completion.observer.usage_snapshot())
+                        .unwrap_or_default();
+
+                    let mut output = String::new();
+                    let mut failure: Option<String> = None;
+                    match &mut pump.stage {
+                        StreamStage::Primary(transform) => {
+                            // Flush the tail before settling the completion, so
+                            // the closing frames still reach the client.
+                            if let Some(transform) = transform.as_mut() {
+                                if !transform.finished() && (ended_cleanly || !transform.saw_block)
+                                {
+                                    match transform.finish() {
+                                        Ok(tail) => output.push_str(&tail),
+                                        Err(error) => failure = Some(error),
+                                    }
+                                }
+                            }
+                        }
+                        StreamStage::Resume(resume) => {
+                            if ended_cleanly {
+                                // 续写流写完了一轮：它自己的收尾事件已被重写器丢掉，
+                                // 这里补一条属于原 response 的收尾。
+                                if let Some(tail) = resume.framer.finish_block() {
+                                    match resume.rewrite_block(&tail) {
+                                        Ok(Some(block)) => output.push_str(&block),
+                                        Ok(None) => {}
+                                        Err(error) => failure = Some(error),
+                                    }
+                                }
+                                if failure.is_none() {
+                                    output.push_str(&resume.rewriter.finish(&usage));
+                                }
+                            } else {
+                                // 预算用尽、续写流也断了：丢掉半截记录，不补收尾，
+                                // 让客户端按断流处理，并照旧给原账号记一次失败。
+                                let _ = resume.framer.finish_block();
+                            }
+                        }
+                    }
+                    if let Some(error) = failure {
+                        pump.done = true;
+                        if let Some(mut completion) = pump.guard.completion.take() {
+                            completion.observer.mark_stream_failed();
+                            completion.finish().await;
+                        }
+                        return Some((Err(std::io::Error::other(error)), pump));
+                    }
+                    if can_synthesize {
+                        // 内容已经完整、只缺收尾事件：补一条 response.completed，
+                        // 按成功结账，不记断流、不报错。
+                        let completion = pump.guard.completion.take().expect("checked above");
+                        let bytes = completion.finish_with_synthesized_completion().await;
+                        if output.is_empty() {
+                            return Some((Ok(bytes), pump));
+                        }
+                        let mut merged = output.into_bytes();
+                        merged.extend_from_slice(&bytes);
+                        return Some((Ok(axum::body::Bytes::from(merged)), pump));
+                    }
+                    if let Some(completion) = pump.guard.completion.take() {
+                        completion.finish().await;
+                    }
+                    if let Some(error) = pump.upstream_error.take() {
+                        if output.is_empty() {
+                            return Some((Err(std::io::Error::other(error)), pump));
+                        }
+                    }
+                    if output.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(axum::body::Bytes::from(output.into_bytes())), pump));
+                }
+            }
+        }
+    })
+}
+
+/// 选一个账号来做这一轮续写。
+///
+/// 聚合模式允许换账号（排除当前这个，尽量换一条通道）；精确模式只允许同账号
+/// 重试（spec 第 6 节）。断流账号关掉故障转移时，聚合模式也退回只试自己。
+async fn pick_continuation_credential(
+    state: &ProxyAppState,
+    platform: &str,
+    current_id: &str,
+    failover_enabled: bool,
+    rejected: &HashSet<String>,
+) -> Option<SelectedCredential> {
+    let mode = RoutePoolRepository::model_mode(&state.pool, platform)
+        .await
+        .ok()?;
+    // 沿用池的冷却分区，同时保留本次请求的账号范围，不能因续写绕开授权范围。
+    let candidates = load_request_candidates(state, platform).await.ok()?;
+    let candidates = partition_by_cooldown(candidates, &HashMap::new(), Utc::now())
+        .into_iter()
+        .filter(|credential| credential.kind == "api" && !rejected.contains(&credential.id));
+    match mode {
+        PoolModelMode::Precise => candidates
+            .into_iter()
+            .find(|candidate| candidate.id == current_id),
+        PoolModelMode::Aggregate if !failover_enabled => candidates
+            .into_iter()
+            .find(|candidate| candidate.id == current_id),
+        PoolModelMode::Aggregate => candidates
+            .into_iter()
+            .find(|candidate| candidate.id != current_id),
+    }
+}
+
+/// Ensures a streamed response is always accounted for.
+///
+/// The stream is dropped without being polled to completion whenever the client
+/// hangs up early, which would otherwise lose the request from usage stats and
+/// leave the account's last-failure state stale. `Drop` cannot await, so the
+/// remaining work is handed to a task.
+struct StreamCompletionGuard {
+    completion: Option<StreamCompletion>,
+}
+
+impl Drop for StreamCompletionGuard {
+    fn drop(&mut self) {
+        let Some(mut completion) = self.completion.take() else {
+            return;
+        };
+        if completion.audio_raw_preview.is_some() {
+            completion.observer.mark_stream_failed();
+        }
+        // Only reachable when the stream never finished, i.e. the client went
+        // away. Spawning needs a runtime; during shutdown there is none, and
+        // dropping the handle is the right outcome then.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { completion.finish().await });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFailureKind {
+    Transient,
+    Permanent,
+    None,
+}
+
+pub fn classify_proxy_failure(
+    status: Option<StatusCode>,
+    message: Option<&str>,
+) -> ProxyFailureKind {
+    let lower = message.unwrap_or_default().to_ascii_lowercase();
+    if lower.contains("invalid_grant")
+        || lower.contains("refresh token has been revoked")
+        || lower.contains("token has been revoked")
+        || lower.contains("官方 oauth 凭证已失效")
+    {
+        return ProxyFailureKind::Permanent;
+    }
+    if status.is_some_and(should_retry_proxy_failure) || status.is_none() {
+        return ProxyFailureKind::Transient;
+    }
+    ProxyFailureKind::None
+}
+
+fn should_retry_proxy_failure(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+}
+
+pub(crate) fn should_retry_same_credential_status(status: StatusCode) -> bool {
+    !status.is_success() && !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+/// A `4xx` whose body names an invalid parameter or bad request is a
+/// deterministic client error: the request itself is malformed for this
+/// upstream, so retrying the same credential can never flip the verdict. Keeping
+/// it out of the same-credential retry budget avoids hammering the upstream and
+/// returning a slow, misleading "transient" failure. Auth (`401`/`403`) and
+/// rate-limit (`429`) are intentionally excluded — those are still worth a
+/// retry, and server errors fall through to the normal retry path.
+fn is_invalid_parameter_failure(status: StatusCode, message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let bad_request_body = lower.contains("invalid_parameter")
+        || lower.contains("invalid_request")
+        || lower.contains("bad request");
+    if !bad_request_body {
+        return false;
+    }
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => false,
+        s if s.is_client_error() => true,
+        _ => false,
+    }
+}
+
+/// Account-level retry eligibility. `partition_by_cooldown` supersedes this for
+/// selection — it has to, because it also weighs the requested model — so this
+/// now only pins down the account-level rule the partition inherits.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn credential_is_retryable_now(
+    next_retry_at: Option<&str>,
+    cooldown_until: Option<&str>,
+    now: DateTime<Utc>,
+) -> bool {
+    [next_retry_at, cooldown_until]
+        .into_iter()
+        .all(|timestamp| {
+            timestamp
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc) <= now)
+                .unwrap_or(true)
+        })
+}
+
+/// Record a failure whose scope can be decided from `kind` alone.
+///
+/// The account's mapped models are only parsed when the failure could be
+/// model-scoped, so the common account-wide case stays as cheap as before.
+async fn record_route_credential_failure(
+    activity: &RouteCredentialActivityRegistry,
+    platform: &str,
+    pool: &SqlitePool,
+    credential: &SelectedCredential,
+    model_key: Option<&str>,
+    kind: &str,
+    message: &str,
+    response_body: Option<&[u8]>,
+) {
+    record_route_credential_failure_with_status(
+        activity,
+        platform,
+        pool,
+        credential,
+        model_key,
+        kind,
+        None,
+        message,
+        response_body,
+    )
+    .await;
+}
+
+/// Same, for failures whose scope also depends on the upstream status code
+/// (`upstream_status` / `model_test_status`: 401/403 condemn the key, anything
+/// else is a verdict on one model).
+#[allow(clippy::too_many_arguments)]
+async fn record_route_credential_failure_with_status(
+    activity: &RouteCredentialActivityRegistry,
+    platform: &str,
+    pool: &SqlitePool,
+    credential: &SelectedCredential,
+    model_key: Option<&str>,
+    kind: &str,
+    status: Option<u16>,
+    message: &str,
+    response_body: Option<&[u8]>,
+) {
+    // Without a model name there is nothing to charge but the account — Gemini
+    // keeps its model in the path, and some routes carry none at all.
+    let baseline_models = if platform.eq_ignore_ascii_case("codex") {
+        RoutePoolRepository::baseline_models(pool, platform).await.ok()
+    } else {
+        None
+    };
+    let siblings = (!is_account_scoped_failure(kind, status))
+        .then(|| {
+            model_key.map(|_| {
+                let capability = parse_model_capability(&credential.config_json);
+                known_upstream_models_with_baseline(
+                    platform,
+                    &capability,
+                    &credential.kind,
+                    baseline_models.as_deref(),
+                )
+            })
+        })
+        .flatten();
+    let scope = match (model_key, siblings.as_deref()) {
+        (Some(key), Some(siblings)) => FailureScope::Model { key, siblings },
+        _ => FailureScope::Account,
+    };
+    if RouteCredentialRepository::record_transient_failure(
+        pool,
+        &credential.id,
+        kind,
+        message,
+        response_body,
+        scope,
+    )
+    .await
+    .is_ok()
+    {
+        activity.notify_status_change(platform, &credential.id);
+    }
+}
+
+async fn mark_route_credential_revoked(
+    activity: &RouteCredentialActivityRegistry,
+    platform: &str,
+    pool: &SqlitePool,
+    credential_id: &str,
+) {
+    if RouteCredentialRepository::update_status(pool, credential_id, "revoked")
+        .await
+        .is_ok()
+    {
+        activity.notify_status_change(platform, credential_id);
+    }
+}
+
+async fn quota_failover_allowed(state: &ProxyAppState, platform: &str) -> bool {
+    matches!(
+        RoutePoolRepository::model_mode(&state.pool, platform).await,
+        Ok(PoolModelMode::Aggregate)
+    )
+}
+
+/// 确定的账号级额度/余额错误：立即异常，不受普通失败阈值与「错误自动异常」开关影响。
+async fn record_definitive_quota_failure(
+    state: &ProxyAppState,
+    platform: &str,
+    credential: &SelectedCredential,
+    status: Option<u16>,
+    message: &str,
+    body: Option<&[u8]>,
+) {
+    if RouteCredentialRepository::record_quota_exhaustion_failure(
+        &state.pool,
+        &credential.id,
+        status,
+        message,
+        body,
+    )
+    .await
+    .is_ok()
+    {
+        state
+            .activity
+            .notify_status_change(platform, &credential.id);
+    }
+}
+
+async fn mark_route_credential_error(
+    activity: &RouteCredentialActivityRegistry,
+    platform: &str,
+    pool: &SqlitePool,
+    credential_id: &str,
+) {
+    if RouteCredentialRepository::update_status(pool, credential_id, "error")
+        .await
+        .is_ok()
+    {
+        activity.notify_status_change(platform, credential_id);
+    }
+}
+
+fn json_error(status: StatusCode, message: &str) -> Response {
+    let key_invalid = message.contains("route_proxy.key_invalid");
+    let platform_unresolved = message.contains("route_proxy.platform_unresolved");
+    let code = if key_invalid {
+        "route_proxy.key_invalid"
+    } else if platform_unresolved {
+        "route_proxy.auth_required"
+    } else if message.contains("route_proxy.request_body_too_large") {
+        "route_proxy.request_body_too_large"
+    } else if message.contains("No enabled route credentials in pool") {
+        "route_pool.empty"
+    } else if message.contains("route_pool.model_unmatched") {
+        "route_pool.model_unmatched"
+    } else if message.contains("route_pool.model_unavailable") {
+        // Every account that could serve this model is paused, marked unhealthy,
+        // or still cooling. Distinct from `model_unmatched`: the mapping exists,
+        // it is just unusable right now.
+        "route_pool.model_unavailable"
+    } else {
+        "route_proxy.error"
+    };
+    let body = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "type": "route_proxy_error",
+        }
+    })
+    .to_string();
+    let mut response = (status, [("content-type", "application/json")], body).into_response();
+    if key_invalid || platform_unresolved {
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer"),
+        );
+    }
+    response
+}
+
+fn route_proxy_error_status(message: &str) -> StatusCode {
+    if message.contains("route_proxy.request_body_too_large") {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    if message.contains("route_proxy.platform_unresolved")
+        || message.contains("route_proxy.key_invalid")
+    {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+async fn resolve_platform(
+    state: &ProxyAppState,
+    _headers: &HeaderMap,
+    inbound_key: Option<&str>,
+) -> Result<PlatformId, AppError> {
+    if let Some(scope) = &state.access_scope {
+        return Ok(scope.platform);
+    }
+    // Preferred: stable per-platform local proxy key written into CLI configs.
+    // Keys are cached in memory and refreshed at most every 30s.
+    if let Some(key) = inbound_key {
+        if let Some(platform) = lookup_platform_by_proxy_key(state, key).await? {
+            return PlatformId::parse(&platform);
+        }
+    }
+
+    if inbound_key.is_some() {
+        return Err(AppError::Validation {
+            code: "route_proxy.key_invalid",
+            message: "route_proxy.key_invalid: Local route proxy key is invalid, expired, or belongs to another ai-switch instance; provide a valid local route proxy key with Authorization: Bearer, x-api-key, api-key, x-goog-api-key, or the key query parameter".to_string(),
+            details: None,
+            recoverable: true,
+        });
+    }
+
+    Err(AppError::Validation {
+        code: "route_proxy.platform_unresolved",
+        message: "Local AI listener requires a local API key; provide it with Authorization: Bearer, x-api-key, api-key, x-goog-api-key, or the key query parameter".to_string(),
+        details: None,
+        recoverable: true,
+    })
+}
+
+async fn lookup_platform_by_proxy_key(
+    state: &ProxyAppState,
+    proxy_key: &str,
+) -> Result<Option<String>, AppError> {
+    let key = proxy_key.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+
+    let fresh_hit = {
+        let cache = state.key_cache.lock().await;
+        cache.get_if_fresh(key)
+    };
+    if let Some(Some(platform)) = fresh_hit {
+        return Ok(Some(platform));
+    }
+    // Fresh negative cache hit: still re-check DB so newly written keys work before TTL.
+    if matches!(fresh_hit, Some(None)) {
+        if let Some(platform) =
+            RouteProxyKeyRepository::get_platform_by_key(&state.pool, key).await?
+        {
+            let mut cache = state.key_cache.lock().await;
+            cache.upsert(key.to_string(), platform.clone());
+            return Ok(Some(platform));
+        }
+        return Ok(None);
+    }
+
+    let rows = RouteProxyKeyRepository::list_all(&state.pool).await?;
+    let mut cache = state.key_cache.lock().await;
+    cache.replace(rows);
+    Ok(cache.by_key.get(key).cloned())
+}
+
+pub fn extract_inbound_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+    // Codex may keep its ChatGPT login in Authorization while authenticating
+    // this local listener with x-api-key. An explicit nonempty key is decisive:
+    // if it is invalid, callers must reject it rather than try another identity.
+    if let Some(key) = headers.get("x-api-key").and_then(|value| value.to_str().ok()) {
+        let key = key.trim();
+        if !key.is_empty() {
+            return Some(key.to_string());
+        }
+    }
+
+    if let Some(value) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        let trimmed = value.trim();
+        if let Some(token) = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+        {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    for name in ["api-key", "x-goog-api-key"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or_default();
+            let value = parts.next().unwrap_or_default();
+            if matches!(key, "key" | "api_key" | "apiKey") {
+                let decoded = urlencoding_decode(value);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn urlencoding_decode(value: &str) -> String {
+    // Minimal percent-decoding for query api keys (hex digits only).
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedCredential {
+    pub id: String,
+    pub platform: String,
+    pub kind: String,
+    pub display_name: String,
+    pub status: String,
+    pub route_priority: i64,
+    pub max_concurrency: i64,
+    pub secret_payload_json: String,
+    pub config_json: String,
+}
+
+/// A pool row plus the state needed to decide whether it may serve *this*
+/// request. `model_key` is filled in by `filter_candidates_for_model` and stays
+/// `None` when the request carries no model (Gemini puts it in the path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolCandidate {
+    pub credential: SelectedCredential,
+    pub cooldown_until: Option<String>,
+    pub model_key: Option<String>,
+}
+
+/// Load the pool rows a request could use: SQL-level filters and quota only.
+/// Cooldown partitioning deliberately happens later — which rows count as
+/// cooling depends on the requested model, which is not known here.
+pub async fn load_pool_candidates(
+    pool: &SqlitePool,
+    platform: &str,
+) -> Result<Vec<PoolCandidate>, AppError> {
+    load_scoped_candidates(pool, platform, None).await
+}
+
+async fn load_request_candidates(
+    state: &ProxyAppState,
+    platform: &str,
+) -> Result<Vec<PoolCandidate>, AppError> {
+    load_scoped_candidates(
+        &state.pool,
+        platform,
+        state
+            .access_scope
+            .as_ref()
+            .and_then(|scope| scope.credential_ids.as_ref()),
+    )
+    .await
+}
+
+/// 视频路由的一组账号：**同一个上游方言**（`config_json.interface_format`）。
+///
+/// 视频只有一个平台 `video`，方言在账号自己身上，所以「落到哪家」要等选完账号
+/// 才知道——上游请求体的形状取决于它。这个结构就是「选完账号」的产物。
+#[derive(Debug, Clone)]
+pub(crate) struct VideoRouteGroup {
+    /// 账号声明的 `interface_format`（原样，未归一；解析交给 `videogen`）
+    pub interface_format: String,
+    /// 该方言下可用账号，已按 `route_priority` 升序 + 游标轮转排好序
+    pub credential_ids: Vec<String>,
+}
+
+/// 把「能服务这个 model」的视频账号按方言分组并排序（跨供应商路由的选号步骤）。
+///
+/// 一次做完候选加载 → 模型过滤 → `video.generate` 能力过滤 → 冷却剔除 →
+/// 优先级/游标排序，然后按 `interface_format` 分组。组序 = 组内首个账号在排序里的
+/// 位置，所以游标推进时「哪家优先」也会跟着轮转。
+///
+/// 为什么放在这里而不是 `videogen`：`partition_by_cooldown` /
+/// `credential_indexes_by_priority` / `load_candidate_model_states` 都是本模块的
+/// 内部机制，让视频侧再实现一遍必然漂移。
+/// 跨供应商选号的结果。
+#[derive(Debug, Clone)]
+pub(crate) struct VideoRoutePlan {
+    /// 按选择顺序排好的方言分组，**第一组优先**
+    pub groups: Vec<VideoRouteGroup>,
+    /// 候选账号总数与当前游标。
+    ///
+    /// 调用方成功后按 `(cursor + 1) % ready_len` 推进——必须由调用方推进，因为
+    /// 视频每次提交只钉**一个**账号（轮询要回到它），而 `forward_request` 的游标
+    /// 推进是 `(0 + 1) % 1 = 0`，会把游标按回 0，轮转就停了。
+    pub cursor: i64,
+    pub ready_len: usize,
+}
+
+pub(crate) async fn video_route_plan(
+    pool: &SqlitePool,
+    platform: &str,
+    model: &str,
+    credential_ids: Option<&HashSet<String>>,
+    model_match_mode: ModelMatchMode,
+) -> Result<VideoRoutePlan, AppError> {
+    // 候选池是**池身份**（通常是 `codex`），里面同时挂着文本账号和视频账号 ——
+    // 视频不是平台，只是账号的一个模态分类。所以下面那一步能力筛选是**必需的**，
+    // 不是可有可无的收窄：少了它，文本账号会进入视频的候选集。
+    let candidates = load_scoped_candidates(pool, platform, credential_ids).await?;
+    // 只留「这个 model 在它自己的方言下可用、且声明了 video.generate」的账号
+    let matched = candidates
+        .into_iter()
+        .filter(|candidate| {
+            supports_requested_capability_with_mode(
+                platform,
+                &candidate_capability(candidate),
+                Some(model),
+                VIDEO_GENERATE_CAPABILITY,
+                model_match_mode,
+            )
+        })
+        .collect::<Vec<_>>();
+    if matched.is_empty() {
+        return Ok(VideoRoutePlan { groups: Vec::new(), cursor: 0, ready_len: 0 });
+    }
+    let model_states = load_candidate_model_states(pool, &matched).await?;
+    let ready = partition_by_cooldown(matched, &model_states, Utc::now());
+    if ready.is_empty() {
+        return Ok(VideoRoutePlan { groups: Vec::new(), cursor: 0, ready_len: 0 });
+    }
+    let ready_len = ready.len();
+    let cursor = RoutePoolRepository::next_cursor_index(pool, platform).await?;
+    let order = credential_indexes_by_priority(&ready, cursor);
+    let mut groups: Vec<VideoRouteGroup> = Vec::new();
+    for index in order {
+        let credential = &ready[index];
+        let interface_format =
+            config_string_field(&credential.config_json, "interface_format").unwrap_or_default();
+        match groups.iter_mut().find(|group| group.interface_format == interface_format) {
+            Some(group) => group.credential_ids.push(credential.id.clone()),
+            None => groups.push(VideoRouteGroup {
+                interface_format,
+                credential_ids: vec![credential.id.clone()],
+            }),
+        }
+    }
+    Ok(VideoRoutePlan { groups, cursor, ready_len })
+}
+
+async fn load_scoped_candidates(
+    pool: &SqlitePool,
+    platform: &str,
+    credential_ids: Option<&HashSet<String>>,
+) -> Result<Vec<PoolCandidate>, AppError> {
+    // 统一账号池（G-P8 P4a）：候选一律从唯一池 `codex` 加载；传入的 platform 是
+    // 对接身份，只影响请求侧的能力/方言判断，不决定账号住在哪。
+    let platform = crate::database::repositories::route_pool_repository::UNIFIED_POOL_PLATFORM;
+    if credential_ids.is_some_and(HashSet::is_empty) {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT c.id, c.platform, c.kind, c.display_name, c.status,
+                c.route_priority, c.max_concurrency,
+                c.secret_payload_json, c.config_json,
+                c.next_retry_at, c.cooldown_until
+         FROM route_pool_members rpm
+         INNER JOIN route_credentials c ON c.id = rpm.route_credential_id
+         INNER JOIN route_pool_groups groups ON groups.id = rpm.group_id
+         WHERE rpm.platform = c.platform AND groups.platform = c.platform
+           AND groups.deleted_at IS NULL
+           AND c.status = 'ok'
+           AND (c.primary_remain IS NULL OR c.primary_remain > 0)
+           AND (c.weekly_remain IS NULL OR c.weekly_remain > 0)
+           AND c.platform = ",
+    );
+    query.push_bind(platform);
+    if let Some(credential_ids) = credential_ids {
+        query.push(" AND c.id IN (");
+        let mut separated = query.separated(", ");
+        for credential_id in credential_ids {
+            separated.push_bind(credential_id);
+        }
+        separated.push_unseparated(")");
+    } else {
+        query.push(" AND groups.is_active = 1");
+    }
+    query.push(" ORDER BY c.route_priority ASC, rpm.sort_order ASC, rpm.created_at ASC");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|err| AppError::Database {
+            code: "database.route_proxy_credentials",
+            message: "Could not load route credentials for proxy".to_string(),
+            details: Some(err.to_string()),
+            recoverable: true,
+        })?;
+
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let next_retry_at: Option<String> = row.get("next_retry_at");
+        let cooldown_until: Option<String> = row.get("cooldown_until");
+        let credential = SelectedCredential {
+            id: row.get("id"),
+            platform: row.get("platform"),
+            kind: row.get("kind"),
+            display_name: row.get("display_name"),
+            status: row.get("status"),
+            route_priority: row.get("route_priority"),
+            max_concurrency: row.get("max_concurrency"),
+            secret_payload_json: row.get("secret_payload_json"),
+            config_json: row.get("config_json"),
+        };
+        // Skip official accounts already known to have zero remaining quota.
+        if !is_route_credential_quota_available(&credential.config_json) {
+            continue;
+        }
+        candidates.push(PoolCandidate {
+            credential,
+            // The two account columns are always written the same value, so the
+            // later of them is the single deadline that matters.
+            cooldown_until: latest_deadline(next_retry_at.as_deref(), cooldown_until.as_deref()),
+            model_key: None,
+        });
+    }
+    Ok(candidates)
+}
+
+fn latest_deadline(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    [left, right]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|parsed| (parsed.with_timezone(&Utc), value.to_string()))
+        })
+        .max_by_key(|(parsed, _)| *parsed)
+        .map(|(_, value)| value)
+}
+
+/// Batch-read the per-model state for candidates that carry a model key.
+///
+/// One query for the whole pool rather than one per account: the forward path
+/// runs this on every request, so the round trip count has to stay flat.
+pub(crate) async fn load_candidate_model_states(
+    pool: &SqlitePool,
+    candidates: &[PoolCandidate],
+) -> Result<HashMap<(String, String), RouteCredentialModelState>, AppError> {
+    let keys: Vec<(String, String)> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            Some((
+                candidate.credential.id.clone(),
+                candidate.model_key.clone()?,
+            ))
+        })
+        .collect();
+    RouteCredentialModelRepository::load_states(pool, &keys).await
+}
+
+/// Split candidates into "may serve now" and "still cooling", then hand back the
+/// usable set.
+///
+/// Order matters: `paused`/`error` models are dropped outright, because those are
+/// verdicts rather than waits and must never be reached by the all-cooling probe
+/// below. Only time-based cooldowns get that second chance — otherwise a pool
+/// where everything is briefly cooling would fail requests it could still serve.
+pub fn partition_by_cooldown(
+    candidates: Vec<PoolCandidate>,
+    model_states: &HashMap<(String, String), RouteCredentialModelState>,
+    now: DateTime<Utc>,
+) -> Vec<SelectedCredential> {
+    let mut eligible = Vec::new();
+    let mut cooling: Vec<(DateTime<Utc>, usize, SelectedCredential)> = Vec::new();
+
+    for candidate in candidates {
+        let state = candidate.model_key.as_ref().and_then(|model_key| {
+            model_states.get(&(candidate.credential.id.clone(), model_key.clone()))
+        });
+        if state.is_some_and(|state| state.status != MODEL_STATUS_OK) {
+            continue;
+        }
+        let model_cooldown = state.and_then(|state| state.cooldown_until.clone());
+        let deadline = latest_deadline(
+            candidate.cooldown_until.as_deref(),
+            model_cooldown.as_deref(),
+        )
+        .and_then(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .ok()
+                .map(|parsed| parsed.with_timezone(&Utc))
+        });
+
+        match deadline {
+            Some(deadline) if deadline > now => {
+                cooling.push((deadline, cooling.len(), candidate.credential));
+            }
+            _ => eligible.push(candidate.credential),
+        }
+    }
+
+    if !eligible.is_empty() {
+        return eligible;
+    }
+
+    cooling.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    cooling
+        .into_iter()
+        .take(1)
+        .map(|(_, _, credential)| credential)
+        .collect()
+}
+
+pub async fn select_pool_credentials(
+    pool: &SqlitePool,
+    platform: &str,
+) -> Result<Vec<SelectedCredential>, AppError> {
+    let candidates = load_pool_candidates(pool, platform).await?;
+    Ok(partition_by_cooldown(
+        candidates,
+        &HashMap::new(),
+        Utc::now(),
+    ))
+}
+
+fn filter_candidates_for_rule(
+    mut candidates: Vec<PoolCandidate>,
+    rule: &CapabilityRule,
+) -> Vec<PoolCandidate> {
+    if !rule.credential_kinds.is_empty() {
+        candidates.retain(|candidate| {
+            rule.credential_kinds
+                .iter()
+                .any(|kind| kind == &candidate.credential.kind)
+        });
+    }
+    candidates
+}
+
+/// The capability the router judges a candidate by.
+///
+pub(crate) fn candidate_capability(candidate: &PoolCandidate) -> ModelCapability {
+    parse_model_capability(&candidate.credential.config_json)
+}
+
+/// Resolve a precise-mode model id (`<账号前缀>/<别名>`) to the one account it names.
+///
+/// Returns the candidates that may serve the request, the model name the rest of
+/// the pipeline should use, and the body to forward. Accepted in every mode, so
+/// switching a platform back to aggregate never strands a client config that was
+/// written while it was precise, and a hand-typed prefix works too.
+///
+/// **Order matters.** The prefix interpretation is tried *first* because an
+/// account carrying a catch-all mapping accepts any model name — asking "can
+/// anyone serve `Grox/gpt-5.6-sol` as written" would let that account swallow the
+/// request and send the prefixed name upstream. And it *falls back* to the whole
+/// string, because relays publish vendor-pathed model names of their own
+/// (`z-ai/glm-5.3`) that must keep working whether or not an account happens to
+/// share the first segment's name.
+fn resolve_account_scoped_model(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<String>,
+    body: axum::body::Bytes,
+    baseline_models: Option<&[String]>,
+) -> (Vec<PoolCandidate>, Option<String>, axum::body::Bytes) {
+    let Some(model) = requested_model else {
+        return (candidates, None, body);
+    };
+    // A client we handed a tagged id to sends `AISwitch:<catalog id>`. Peel the
+    // tag — and rewrite the body to match, so the upstream never sees it — before
+    // anything tries to interpret the name. Both modes fall out of this: precise
+    // mode leaves `<账号前缀>/<别名>` for the split below, aggregate mode leaves a
+    // bare alias that simply does not split.
+    let (model, body) = match strip_vendor_model_tag(&model) {
+        Some(rest) => {
+            let rest = rest.to_string();
+            let rewritten =
+                axum::body::Bytes::from(strip_model_prefix_in_body(&body, &model, &rest));
+            (rest, rewritten)
+        }
+        None => (model, body),
+    };
+    let Some((prefix, alias)) = split_prefixed_model(&model) else {
+        return (candidates, Some(model), body);
+    };
+
+    let official_group = is_official_model_prefix(prefix);
+    let matched: Vec<bool> = candidates
+        .iter()
+        .map(|candidate| {
+            let is_official = candidate.credential.kind == "official";
+            if official_group {
+                // Every official account answers to the reserved prefix: they are
+                // pooled for quota rotation, and pinning one would cancel it.
+                return is_official;
+            }
+            !is_official
+                && accepted_prefixes(&candidate.credential.display_name, &candidate.credential.id)
+                    .iter()
+                    .any(|accepted| accepted.eq_ignore_ascii_case(prefix))
+        })
+        .collect();
+
+    let servable = candidates
+        .iter()
+        .zip(matched.iter())
+        .any(|(candidate, hit)| {
+            *hit
+                && supports_requested_model_with_mode_with_baseline(
+                    platform,
+                    &candidate_capability(candidate),
+                    Some(alias),
+                    ModelMatchMode::ClientFacing,
+                    baseline_models,
+                )
+        });
+    if !servable {
+        return (candidates, Some(model), body);
+    }
+
+    let alias = alias.to_string();
+    let body = axum::body::Bytes::from(strip_model_prefix_in_body(&body, &model, &alias));
+    let candidates = candidates
+        .into_iter()
+        .zip(matched)
+        .filter(|(_, hit)| *hit)
+        .map(|(candidate, _)| candidate)
+        .collect();
+    (candidates, Some(alias), body)
+}
+
+/// Rewrite every `model` field that spells the prefixed name back to the bare
+/// alias.
+///
+/// Has to happen before the request is built, not inside the API branch:
+/// `build_official_upstream_request` forwards the body untouched, so an official
+/// account would otherwise receive an account-prefixed model name. Recurses like
+/// [`rewrite_model_value`] because clients repeat the model inside nested
+/// structures.
+fn strip_model_prefix_in_body(body: &[u8], prefixed: &str, alias: &str) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    rewrite_matching_model_value(&mut value, prefixed.trim(), alias);
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn rewrite_matching_model_value(value: &mut Value, prefixed: &str, alias: &str) {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|model| model == prefixed)
+            {
+                object.insert("model".to_string(), Value::String(alias.to_string()));
+            }
+            for child in object.values_mut() {
+                rewrite_matching_model_value(child, prefixed, alias);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                rewrite_matching_model_value(child, prefixed, alias);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drop candidates that cannot serve the requested model, and record the model
+/// key the survivors will be charged under. Both happen in one pass because both
+/// need the same parsed capability.
+fn filter_candidates_for_model(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<&str>,
+) -> Vec<PoolCandidate> {
+    filter_candidates_for_model_with_mode(
+        platform,
+        candidates,
+        requested_model,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+fn filter_candidates_for_model_with_mode(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+) -> Vec<PoolCandidate> {
+    filter_candidates_for_model_with_mode_with_baseline(
+        platform,
+        candidates,
+        requested_model,
+        mode,
+        None,
+    )
+}
+
+fn filter_candidates_for_model_with_mode_with_baseline(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+    baseline_models: Option<&[String]>,
+) -> Vec<PoolCandidate> {
+    let Some(requested_model) = requested_model else {
+        return candidates;
+    };
+
+    candidates
+        .into_iter()
+        .filter_map(|mut candidate| {
+            let capability = candidate_capability(&candidate);
+            if !model_matches_with_baseline(
+                platform,
+                &capability,
+                Some(requested_model),
+                mode,
+                baseline_models,
+            ) {
+                return None;
+            }
+            candidate.model_key = Some(model_state_key_with_mode(
+                platform,
+                &capability,
+                &candidate.credential.kind,
+                requested_model,
+                mode,
+            ));
+            Some(candidate)
+        })
+        .collect()
+}
+
+fn requested_image_capability(path: &str) -> Option<&'static str> {
+    match path.trim().trim_end_matches('/') {
+        "/images/generations" | "/v1/images/generations" => Some("image.generate"),
+        "/images/edits" | "/v1/images/edits" => Some("image.edit"),
+        _ => None,
+    }
+}
+
+/// 音频（TTS / STT）能力。
+///
+/// **看的是「上游」路径**：`forward_request` 用它推导这次请求需要账号声明什么
+/// 能力。TTS 的上游路径与入站路径相同（OpenAI 兼容），所以这一个函数同时服务
+/// 两个方向，不存在视频那种「入站 `/v1/videos` 与 Sora 上游 `/v1/videos` 撞名」
+/// 的问题——但**加非兼容方言时要重新检查这一点**（那时上游路径会变成各家自己的，
+/// 与入站路径分离，就需要像视频那样拆成两个谓词）。
+///
+/// **只认带 `/v1` 前缀的那一种形态**：OpenAI 的路径永远是 `/v1/audio/speech`，
+/// 而加一个 `/audio/speech` 别名会让它在 `is_shared_model_api_path` 里也需要
+/// 一条对应规则（图像就是这么做的），换不到任何真实客户端。
+fn requested_audio_capability(path: &str) -> Option<&'static str> {
+    let normalized = path.trim().trim_end_matches('/');
+    if normalized == "/v1/audio/speech" {
+        return Some(AUDIO_GENERATE_CAPABILITY);
+    }
+    // STT / 翻译（multipart）。上游路径同样与入站相同，撞名问题与 TTS 一致。
+    if crate::audiogen::protocol::is_transcribe_path(normalized) {
+        return Some(AUDIO_TRANSCRIBE_CAPABILITY);
+    }
+    None
+}
+
+/// TTS uses JSON on `/v1/audio/speech`. Keep this separate from multipart
+/// STT/translations so those requests retain their original body and boundary.
+pub(crate) fn is_audio_speech_path(path: &str) -> bool {
+    path.trim().trim_end_matches('/') == "/v1/audio/speech"
+}
+
+/// 入站 STT / 翻译端点识别。
+///
+/// Route multipart STT before JSON parsing: its `model` is a form field.
+pub(crate) fn is_audio_transcribe_path(path: &str) -> bool {
+    crate::audiogen::protocol::is_transcribe_path(path.trim().trim_end_matches('/'))
+}
+
+/// 视频生成能力（G-P2c）。提交与状态查询都归 `video.generate`。
+/// 状态查询路径形如 `/v1/video/generations/{task_id}`，故按前缀判断。
+///
+/// **看的是「上游」路径**：`forward_request` 用它推导这次请求需要账号声明什么能力。
+/// 所以这里只能有 new-api 家族 —— 理由见 `is_video_generation_path`。
+fn requested_video_capability(path: &str) -> Option<&'static str> {
+    requested_video_capability_for(path)
+}
+
+/// 入站视频端点识别（G-P4）。
+///
+/// 与 `requested_video_capability` **不是同一个问题**，所以是两个函数：
+///   - `requested_video_capability`：这个**上游**路径要求账号具备什么能力；
+///   - 本函数：这个**入站**路径该不该交给 `videogen` 服务层（而不是 `proxy_handler`）。
+///
+/// **覆盖两条契约**：new-api 的 `/v1/video/generations` 家族，以及 OpenAI 原生的
+/// `/v1/videos` 家族（提交 / 查询 / 内容）。
+///
+/// ⚠️ 这里**不能**直接复用 `requested_video_capability_for` 的返回值，也不能把
+/// `/v1/videos*` 塞进那个函数：**Sora 方言的上游提交路径恰好就是 `/v1/videos`**，
+/// 可灵的是 `/v1/videos/text2video` —— 与入站的 OpenAI 原生家族同名。塞进去的话，
+/// 这两家的上游请求会被 `forward_request` 当成「入站视频端点」，于是在能力过滤
+/// 那一步要求 `video.generate` + 按 `model` 字段匹配；而可灵的上游体用的是
+/// `model_name`、根本没有 `model` 字段，匹配必然落空，账号被全部筛掉。
+/// 症状是 `route_pool.model_unmatched: no enabled route credential supports
+/// model 'unknown'`（`'unknown'` 就是「读不出 model」的占位符），离根因很远。
+///
+/// 漏掉任何一条入站路径的代价则是：那条契约在 `shared_fallback` 里静默降级成
+/// 静态兜底 404 —— 也就是「代码声称支持、实际永远 404」，本项目已踩过一次。
+pub(crate) fn is_video_generation_path(path: &str) -> bool {
+    let normalized = path.trim().trim_end_matches('/');
+    requested_video_capability_for(normalized).is_some()
+        // OpenAI 原生契约（入站）。**只有 `/v1` 前缀这一种形态**：OpenAI 的路径
+        // 永远是 `/v1/videos`，而加一个 `/videos` 别名会让 `/videos/generations`
+        // 这类无关路径被 `is_shared_model_api_path` 顺手放进来。
+        || normalized == "/v1/videos"
+        || normalized.starts_with("/v1/videos/")
+}
+
+fn requested_video_capability_for(path: &str) -> Option<&'static str> {
+    let normalized = path.trim().trim_end_matches('/');
+    if normalized == "/video/generations"
+        || normalized == "/v1/video/generations"
+        || normalized.starts_with("/video/generations/")
+        || normalized.starts_with("/v1/video/generations/")
+    {
+        return Some(VIDEO_GENERATE_CAPABILITY);
+    }
+    None
+}
+
+fn filter_candidates_for_capability(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<&str>,
+    requested_capability: &str,
+) -> Vec<PoolCandidate> {
+    filter_candidates_for_capability_with_mode(
+        platform,
+        candidates,
+        requested_model,
+        requested_capability,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+fn filter_candidates_for_capability_with_mode(
+    platform: &str,
+    candidates: Vec<PoolCandidate>,
+    requested_model: Option<&str>,
+    requested_capability: &str,
+    mode: ModelMatchMode,
+) -> Vec<PoolCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            supports_requested_capability_with_mode(
+                platform,
+                &candidate_capability(candidate),
+                requested_model,
+                requested_capability,
+                mode,
+            )
+        })
+        .collect()
+}
+
+async fn bind_route_proxy_listener() -> Result<TcpListener, AppError> {
+    bind_route_proxy_listener_from(DEFAULT_ROUTE_PROXY_PORT).await
+}
+
+async fn bind_route_proxy_listener_from(port: u16) -> Result<TcpListener, AppError> {
+    TcpListener::bind((BIND_HOST, port))
+        .await
+        .map_err(|error| AppError::Filesystem {
+            code: "filesystem.route_proxy_bind",
+            message: format!("Could not bind local AI listener at {BIND_HOST}:{port}: {error}"),
+            details: Some(error.to_string()),
+            recoverable: true,
+        })
+}
+
+pub fn pick_credential(items: &[SelectedCredential], cursor: i64) -> Option<&SelectedCredential> {
+    if items.is_empty() {
+        return None;
+    }
+    let index = cursor.rem_euclid(items.len() as i64) as usize;
+    items.get(index)
+}
+
+pub fn credential_indexes_by_priority(
+    credentials: &[SelectedCredential],
+    cursor: i64,
+) -> Vec<usize> {
+    let mut groups = BTreeMap::<i64, Vec<usize>>::new();
+    for (index, credential) in credentials.iter().enumerate() {
+        groups
+            .entry(credential.route_priority)
+            .or_default()
+            .push(index);
+    }
+
+    groups
+        .into_values()
+        .flat_map(|indexes| {
+            retry_credential_indexes(indexes.len(), cursor)
+                .into_iter()
+                .map(move |index| indexes[index])
+        })
+        .collect()
+}
+
+/// Third-party Responses gateways often reject Codex `tools[].type = "custom"`.
+/// Keep model mapping independent so callers can compose both rewrites.
+pub fn apply_responses_custom_tool_compat(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let _ = rewrite_custom_tools_in_responses_request(&mut value);
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+pub fn apply_model_mappings(body: &[u8], mappings: &[ModelMapping]) -> Vec<u8> {
+    apply_model_mappings_with_mode(body, mappings, ModelMatchMode::ClientFacing)
+}
+
+pub(crate) fn apply_model_mappings_with_mode(
+    body: &[u8],
+    mappings: &[ModelMapping],
+    mode: ModelMatchMode,
+) -> Vec<u8> {
+    if mappings.is_empty() {
+        return body.to_vec();
+    }
+
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    rewrite_model_value(&mut value, mappings, mode);
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn rewrite_model_value(value: &mut Value, mappings: &[ModelMapping], mode: ModelMatchMode) {
+    match value {
+        Value::Object(object) => {
+            if let Some(model) = object
+                .get("model")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+            {
+                if let Some(target) = resolve_mapping_target(mappings, &model, mode) {
+                    object.insert("model".to_string(), Value::String(target));
+                }
+            }
+            for child in object.values_mut() {
+                rewrite_model_value(child, mappings, mode);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                rewrite_model_value(child, mappings, mode);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Max remote images inlined per request, and max bytes per image.
+const INLINE_IMAGE_MAX_COUNT: usize = 16;
+const INLINE_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether this credential opts into inlining remote image URLs (fallback for
+/// upstreams that fetch `image_url` links and reject non-`image/*` responses,
+/// e.g. OSS objects served as `text/plain`).
+fn selected_credential_inlines_images(credential: &SelectedCredential) -> bool {
+    parse_json_object(&credential.config_json, "config")
+        .ok()
+        .is_some_and(|config| inline_remote_images_enabled(&config))
+}
+
+fn inline_remote_images_enabled(config: &Value) -> bool {
+    config
+        .get("inline_remote_images")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn is_remote_http_url(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// Fetch every remote `image_url` in the request body and replace it with a
+/// base64 `data:` URL carrying the sniffed image MIME. Best-effort: images that
+/// cannot be fetched or identified are left untouched.
+async fn inline_remote_image_urls_in_body(body: &[u8], client: &reqwest::Client) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let mut urls: Vec<String> = Vec::new();
+    collect_remote_image_urls(&value, &mut urls);
+    urls.sort();
+    urls.dedup();
+    urls.truncate(INLINE_IMAGE_MAX_COUNT);
+    if urls.is_empty() {
+        return body.to_vec();
+    }
+    let mut replacements: HashMap<String, String> = HashMap::new();
+    for url in urls {
+        if let Some(data_url) = fetch_image_as_data_url(client, &url).await {
+            replacements.insert(url, data_url);
+        }
+    }
+    if replacements.is_empty() {
+        return body.to_vec();
+    }
+    replace_remote_image_urls(&mut value, &replacements);
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn collect_remote_image_urls(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            match map.get("image_url") {
+                Some(Value::String(url)) if is_remote_http_url(url) => {
+                    out.push(url.trim().to_string());
+                }
+                Some(Value::Object(inner)) => {
+                    if let Some(Value::String(url)) = inner.get("url") {
+                        if is_remote_http_url(url) {
+                            out.push(url.trim().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for child in map.values() {
+                collect_remote_image_urls(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_remote_image_urls(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_remote_image_urls(value: &mut Value, replacements: &HashMap<String, String>) {
+    if let Value::Object(map) = value {
+        match map.get_mut("image_url") {
+            Some(Value::String(url)) => {
+                if let Some(data_url) = replacements.get(url.trim()) {
+                    *url = data_url.clone();
+                }
+            }
+            Some(Value::Object(inner)) => {
+                if let Some(Value::String(url)) = inner.get_mut("url") {
+                    if let Some(data_url) = replacements.get(url.trim()) {
+                        *url = data_url.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+        for child in map.values_mut() {
+            replace_remote_image_urls(child, replacements);
+        }
+    } else if let Value::Array(items) = value {
+        for child in items {
+            replace_remote_image_urls(child, replacements);
+        }
+    }
+}
+
+async fn fetch_image_as_data_url(client: &reqwest::Client, url: &str) -> Option<String> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    if let Some(length) = response.content_length() {
+        if length as usize > INLINE_IMAGE_MAX_BYTES {
+            return None;
+        }
+    }
+    let header_mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        });
+    let bytes = response.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > INLINE_IMAGE_MAX_BYTES {
+        return None;
+    }
+    let mime = sniff_image_mime(&bytes)
+        .or_else(|| header_mime.filter(|mime| mime.starts_with("image/")))
+        .or_else(|| image_mime_from_url(url))?;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+    Some(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(&bytes)
+    ))
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return Some("image/png".to_string());
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg".to_string());
+    }
+    if bytes.starts_with(b"GIF8") {
+        return Some("image/gif".to_string());
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp".to_string());
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp".to_string());
+    }
+    None
+}
+
+fn image_mime_from_url(url: &str) -> Option<String> {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    let extension = path.rsplit('.').next()?;
+    let mime = match extension {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+pub fn build_upstream_request(
+    credential: &SelectedCredential,
+    platform: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: HeaderMap,
+    body: &[u8],
+) -> Result<(String, HeaderMap, Vec<u8>), String> {
+    let request = build_upstream_request_internal(
+        credential,
+        platform,
+        path,
+        query,
+        headers,
+        body,
+        None,
+        TurnReminderMode::Apply,
+        ModelMatchMode::ClientFacing,
+    )?;
+    Ok((request.target_url, request.headers, request.body))
+}
+
+/// Whether a request carries the account's per-turn reminder.
+///
+/// The connectivity probe must opt out. It asks the model to reply with exactly
+/// `ai-switch-ok`, which a reminder like "answer in Chinese" contradicts head-on:
+/// the model may follow the reminder and stop emitting the token, so every probe
+/// against a reminder-enabled account would fail permanently. Spelled as an enum
+/// rather than a bool so the intent is legible at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnReminderMode {
+    Apply,
+    Skip,
+}
+
+pub(crate) fn build_upstream_request_with_bridge(
+    credential: &SelectedCredential,
+    platform: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: HeaderMap,
+    body: &[u8],
+    turn_reminder: TurnReminderMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    build_upstream_request_internal(
+        credential,
+        platform,
+        path,
+        query,
+        headers,
+        body,
+        None,
+        turn_reminder,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+fn build_upstream_request_internal(
+    credential: &SelectedCredential,
+    platform: &str,
+    path: &str,
+    query: Option<&str>,
+    mut headers: HeaderMap,
+    body: &[u8],
+    codex_history: Option<&CodexReasoningCache>,
+    turn_reminder: TurnReminderMode,
+    model_match_mode: ModelMatchMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    let secret = parse_json_object(&credential.secret_payload_json, "secret")?;
+    let config = parse_json_object(&credential.config_json, "config")?;
+
+    if credential.kind == "api" {
+        build_api_upstream_request(
+            credential,
+            platform,
+            path,
+            query,
+            &mut headers,
+            body,
+            &secret,
+            &config,
+            codex_history,
+            turn_reminder,
+            model_match_mode,
+        )
+    } else {
+        build_official_upstream_request(
+            credential,
+            platform,
+            path,
+            query,
+            &mut headers,
+            body,
+            &secret,
+            &config,
+            model_match_mode,
+        )
+    }
+}
+
+fn build_api_upstream_request(
+    credential: &SelectedCredential,
+    platform: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    secret: &Value,
+    config: &Value,
+    codex_history: Option<&CodexReasoningCache>,
+    turn_reminder: TurnReminderMode,
+    model_match_mode: ModelMatchMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    let platform = PlatformId::parse(platform).map_err(format_app_error)?;
+    PlatformCapabilityService::require(platform, PlatformOperation::GenericApiRouting)
+        .map_err(format_app_error)?;
+    // 多模态各走一条直路，判据是**端点路径 + 账号方言**，不是平台 ——
+    // 模态不是平台，视频账号住在哪个池里都可能。
+    //
+    // 音频先判：它的方言是 `openai`，与文本**同名**，只能靠端点路径区分。
+    // 上游体就是客户端给的那个 JSON（只改写 `model`），路径由方言给出。
+    if is_audio_speech_path(path) {
+        return build_audio_upstream_request(
+            credential,
+            path,
+            query,
+            headers,
+            body,
+            secret,
+            config,
+            model_match_mode,
+        );
+    }
+    // STT / 翻译（multipart）。与 TTS 同理：方言是 `openai`，只能靠端点路径
+    // 区分；上游路径与入站相同，`model` 从表单字段改写。
+    if is_audio_transcribe_path(path) {
+        return build_audio_transcribe_upstream_request(
+            credential,
+            path,
+            query,
+            headers,
+            body,
+            secret,
+            config,
+            model_match_mode,
+        );
+    }
+    // 视频的方言是 kling / ark / minimax / zhipu / sora —— 与文本方言**不相交**，
+    // 所以按账号的 `interface_format` 判定是可靠的。文本那一整套「协议桥接 /
+    // reasoning 清理 / 路径版本规范化」对视频全不适用，请求体已经由
+    // `videogen::protocol::upstream_body` 按方言建好了。
+    if config
+        .get("interface_format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| {
+            crate::videogen::protocol::dialect_from_interface_format(format).is_some()
+        })
+    {
+        return build_video_upstream_request(credential, path, query, headers, body, secret, config);
+    }
+    let dialect = match string_value(config, "interface_format") {
+        Some(value) => ApiDialect::parse(value).map_err(format_app_error)?,
+        None if matches!(
+            platform,
+            PlatformId::OpenCode | PlatformId::OpenClaw | PlatformId::Hermes
+        ) =>
+        {
+            return Err("validation.api_dialect_required".to_string());
+        }
+        None => platform
+            .default_api_credential_dialect()
+            .ok_or_else(|| "validation.api_dialect_required".to_string())?,
+    };
+    let api_key = string_value(secret, "api_key").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing api_key",
+            credential.display_name
+        )
+    })?;
+    let base_url = string_value(config, "base_url").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing base_url",
+            credential.display_name
+        )
+    })?;
+    let interface_format = dialect.as_str();
+    let mappings = parse_model_capability_value(config).mappings;
+    let upstream_path = normalize_api_upstream_path(interface_format, path);
+    let mut rewritten_body = apply_model_mappings_with_mode(body, &mappings, model_match_mode);
+    // Codex's `tools[].type = "custom"` and the `custom_tool_call` items that
+    // follow it exist only in the Responses schema, so every bridge that leaves
+    // that schema needs them spelled as plain function tools — a `custom` tool
+    // otherwise reaches the upstream with an empty `input_schema` and the model
+    // has no way to pass the patch. API relays (e.g. Xiaomi) commonly lack
+    // custom-tool support on Responses itself, which is what the account-level
+    // `responses_custom_tool_compat` switch covers.
+    let bridge_requires_custom_tool_compat = platform == PlatformId::Codex
+        && matches!(
+            dialect,
+            ApiDialect::OpenAi | ApiDialect::Anthropic | ApiDialect::Gemini
+        )
+        && is_responses_path(&upstream_path);
+    if (responses_custom_tool_compat_enabled(config) || bridge_requires_custom_tool_compat)
+        && should_rewrite_custom_tools_for_api(&upstream_path)
+    {
+        rewritten_body = apply_responses_custom_tool_compat(&rewritten_body);
+        // Third-party Responses gateways (Xiaomi MiMo, …) reject OpenAI-hosted
+        // tool types with `responses_feature_not_supported`; drop them so the
+        // rest of the request still goes through.
+        rewritten_body = strip_unsupported_hosted_tools(&rewritten_body);
+    }
+    // Restore the real reasoning_content (and, if the client dropped it, the
+    // whole function_call) onto tool-call turns before the Responses→Chat
+    // conversion. Chat reasoning providers (DeepSeek/MiMo) otherwise lose the
+    // model's plan across tool calls and stall. See [`CodexReasoningCache`].
+    // Kept to the Chat bridge: `reasoning_content` is a Chat-only field, and the
+    // Anthropic and Gemini converters drop reasoning items outright.
+    let chat_bridge_restores_reasoning = platform == PlatformId::Codex
+        && dialect == ApiDialect::OpenAi
+        && is_responses_path(&upstream_path);
+    if chat_bridge_restores_reasoning {
+        if let Some(cache) = codex_history {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&rewritten_body) {
+                if cache.enrich_responses_request(&mut value) > 0 {
+                    if let Ok(bytes) = serde_json::to_vec(&value) {
+                        rewritten_body = bytes;
+                    }
+                }
+            }
+        }
+    }
+    let PreparedBridgeRequest {
+        kind: bridge_kind,
+        upstream_path,
+        upstream_query,
+        body: rewritten_body,
+        tool_namespaces,
+        ..
+    } = prepare_protocol_bridge_request(platform, dialect, &upstream_path, &rewritten_body)?;
+    // Only now is the body in its final upstream schema — bridging may have
+    // converted a Responses request into `messages` or `contents`, so a reminder
+    // written any earlier would land in the wrong shape.
+    let mut rewritten_body = rewritten_body;
+    // 目标账号专属的出站适配：切到 Chat/Anthropic/Gemini 不经过此分支，
+    // 客户端传入的历史字节从未修改，密文清理由下方独立开关控制。
+    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
+        && crate::services::responses_plaintext_reasoning::enabled(config)
+    {
+        if let Some(normalized) =
+            crate::services::responses_plaintext_reasoning::normalize(&rewritten_body)
+        {
+            rewritten_body = normalized;
+        }
+    }
+    let mut reasoning_sanitized = false;
+    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
+        && responses_encrypted_content_cleanup_enabled(config)
+    {
+        if let Some(cleaned) =
+            sanitize_reasoning_from_bytes(&rewritten_body, responses_cleanup_mode(config))
+        {
+            rewritten_body = cleaned;
+            reasoning_sanitized = true;
+        }
+    }
+    if turn_reminder == TurnReminderMode::Apply {
+        if let Some(reminder) = turn_reminder_text(config) {
+            rewritten_body =
+                turn_reminder::append_turn_reminder(dialect, &rewritten_body, &reminder);
+        }
+    }
+    // A bridged body carries the *client's* system prompt, and no client except
+    // Claude Code sends Claude Code's. Relays gating on the Claude Code signature
+    // read it out of the body, so it has to be patched in here rather than left
+    // to the header spoofing above. Passthrough is deliberately untouched: a real
+    // Claude Code request already carries both fields.
+    if dialect == ApiDialect::Anthropic && bridge_kind.is_some() {
+        rewritten_body = apply_claude_code_body_identity(&rewritten_body, &credential.id);
+    }
+    // Everything below this point touches headers and the URL only.
+    let merged_query = merge_query_parts(query, upstream_query.as_deref());
+    let mut target_url = build_target_url(base_url, &upstream_path, merged_query.as_deref());
+
+    match dialect {
+        ApiDialect::Anthropic => {
+            match normalize_anthropic_api_key_field(string_value(config, "api_key_field"))
+                .map_err(|err| format!("Route credential {} {err}", credential.display_name))?
+            {
+                ANTHROPIC_AUTH_TOKEN_FIELD => {
+                    headers.remove("x-api-key");
+                    insert_header(headers, "authorization", &format!("Bearer {api_key}"))?;
+                }
+                ANTHROPIC_API_KEY_FIELD => {
+                    headers.remove("authorization");
+                    insert_header(headers, "x-api-key", api_key)?;
+                }
+                _ => unreachable!("normalize_anthropic_api_key_field returns known constants"),
+            }
+            headers
+                .entry(HeaderName::from_static("anthropic-version"))
+                .or_insert(HeaderValue::from_static("2023-06-01"));
+            // Impersonate Claude Code so client-fingerprinting gateways
+            // (e.g. agentrouter.org) don't reject us as an unknown client.
+            apply_claude_code_identity(headers);
+            // This request wants the 1M window when any of:
+            // - the client signalled it with a `[1M]` model suffix (Claude Code
+            //   convention) — that suffix is stripped by the mapping lookup, so it
+            //   survives only in the original inbound body;
+            // - the mapping serving it declares `supports_1m`. The declaration is
+            //   per account, while the `[1M]` tag the client sends is written
+            //   pool-wide and is withheld from every account as soon as one of
+            //   them lacks it — so on a mixed pool a tier whose tag was withheld
+            //   reaches a 1M-capable account undeclared, and that upstream answers
+            //   "please enable 1m context and retry". Read the declaration off the
+            //   account the request actually lands on instead;
+            // - the resolved upstream model is configured/advertised with a 1M
+            //   context (Codex). The catalog promises Codex the full window, so it
+            //   packs up to 1M; without the beta marker Anthropic still caps at
+            //   200K and the turn dies on a 400. Codex needs no `[1m]` model-name
+            //   variant — the configured/advertised window alone is the signal.
+            let wants_one_m = client_requested_one_m_context(body)
+                || requested_model_from_body(body).is_some_and(|model| {
+                    mapping_declares_one_m_context(&mappings, &model, model_match_mode)
+                })
+                || (platform == PlatformId::Codex
+                    && requested_model_from_body(&rewritten_body)
+                        .is_some_and(|m| {
+                            effective_context_window_for_upstream(&mappings, &m)
+                                >= CODEX_ONE_M_CONTEXT_WINDOW
+                        }));
+            if wants_one_m {
+                apply_one_m_context_beta(headers);
+            }
+            if is_messages_path(&upstream_path) {
+                target_url = ensure_query_flag(&target_url, "beta", "true");
+            }
+        }
+        ApiDialect::Gemini => {
+            target_url = append_query_param(&target_url, "key", api_key);
+        }
+        ApiDialect::OpenAi | ApiDialect::OpenAiResponses => {
+            insert_header(headers, "authorization", &format!("Bearer {api_key}"))?;
+        }
+    }
+
+    apply_credential_user_agent(headers, config)?;
+    // After the credential's own User-Agent, never before: the identity has to be
+    // decided from the value that actually goes out. See [`may_impersonate_codex_cli`].
+    if matches!(dialect, ApiDialect::OpenAi | ApiDialect::OpenAiResponses)
+        && may_impersonate_codex_cli(config)
+    {
+        apply_codex_cli_identity(headers, &credential.id);
+    }
+    let streaming_request = request_body_requests_stream(&rewritten_body);
+    Ok(BuiltUpstreamRequest {
+        target_url,
+        headers: headers.clone(),
+        body: rewritten_body,
+        bridge_kind,
+        audio_response_adapter: None,
+        audio_stream_dialect: None,
+        tool_namespaces,
+        streaming_request,
+        reasoning_sanitized,
+    })
+}
+
+/// 视频账号的上游请求：`base_url` + 路径 + `Authorization: Bearer` + **原样**请求体。
+///
+/// 为什么单独一条路：视频的请求体已经按方言建好，`interface_format` 存的是上游方言
+/// 而不是文本线协议。五家上游都用 Bearer，所以鉴权头与方言无关——方言只决定路径与
+/// 请求体，那两样都由 `videogen` 备好了。
+fn build_video_upstream_request(
+    credential: &SelectedCredential,
+    path: &str,
+    query: Option<&str>,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    secret: &Value,
+    config: &Value,
+) -> Result<BuiltUpstreamRequest, String> {
+    let api_key = string_value(secret, "api_key").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing api_key",
+            credential.display_name
+        )
+    })?;
+    let base_url = string_value(config, "base_url").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing base_url",
+            credential.display_name
+        )
+    })?;
+    insert_header(headers, "authorization", &format!("Bearer {api_key}"))?;
+    let target_url = build_target_url(base_url, path, query);
+    Ok(BuiltUpstreamRequest {
+        target_url,
+        headers: headers.clone(),
+        body: body.to_vec(),
+        bridge_kind: None,
+        audio_response_adapter: None,
+        audio_stream_dialect: None,
+        tool_namespaces: BTreeMap::new(),
+        streaming_request: false,
+        reasoning_sanitized: false,
+    })
+}
+
+/// 音频（TTS）的上游请求构造。**直路**，不进文本的 `ApiDialect` 体系。
+///
+/// 先按账号的 `model_mappings` 改写 OpenAI 形状的 `model`，再按方言转换：
+///   - `openai`：改写后的 JSON 原样发出，回程原样透传（不带回程适配器）；
+///   - `minimax`：转成 `/v1/t2a_v2` 原生体，回程是 JSON + hex，由
+///     [`AudioResponseAdapter`] 在重试循环里还原成音频字节。HTTP 200 里的业务
+///     错误也在那里变成转换失败，从而进入切号，而不是被当成成功结算。
+///
+/// 上游路径取自**方言**而不是入站的 `path`。
+///
+/// 鉴权头现在硬写 `Bearer`（OpenAI 与 MiniMax 都是）。**加 ElevenLabs
+/// （`xi-api-key`）或 Azure（`Ocp-Apim-Subscription-Key`）时必须改成按方言取头名。**
+fn build_audio_upstream_request(
+    credential: &SelectedCredential,
+    path: &str,
+    query: Option<&str>,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    secret: &Value,
+    config: &Value,
+    model_match_mode: ModelMatchMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    let api_key = string_value(secret, "api_key").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing api_key",
+            credential.display_name
+        )
+    })?;
+    let base_url = string_value(config, "base_url").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing base_url",
+            credential.display_name
+        )
+    })?;
+    let dialect = crate::audiogen::protocol::dialect_from_interface_format(
+        string_value(config, "interface_format").unwrap_or_default(),
+    )
+    .ok_or_else(|| {
+        format!(
+            "Route credential {} has an unsupported audio interface_format '{}'; expected openai or minimax",
+            credential.display_name,
+            string_value(config, "interface_format").unwrap_or("")
+        )
+    })?;
+
+    // 校验并取字符数。**超限在这里拒绝，不是截断**：截断会让「计费的文本」与
+    // 「实际合成出去的文本」分叉（视频那条「计价口径与上游口径必须同源」的同一个
+    // 教训）。这里只需要「通过/不通过」，字符数由计费侧自己从同一份请求体再算一次
+    // —— 两边都调 `audiogen::protocol`，所以不会各算一套。
+    crate::audiogen::protocol::validate_speech_request(dialect, body)
+        .map_err(|error| format!("validation.audio_request: {error}"))?;
+
+    // `model` 改写：客户端看到的名字 → 上游认的名字。OpenAI 方言其余字段一律原样
+    // 透传（`voice` 是各家私有的，统一词表是自找的抽象泄漏）。
+    let streaming_request = crate::audiogen::protocol::speech_request_streams(body);
+    let mappings = parse_model_capability_value(config).mappings;
+    let rewritten_body = apply_model_mappings_with_mode(body, &mappings, model_match_mode);
+    let (rewritten_body, audio_response_adapter) = match dialect {
+        crate::audiogen::protocol::AudioDialect::OpenAi => (rewritten_body, None),
+        crate::audiogen::protocol::AudioDialect::MiniMax => {
+            let prepared =
+                crate::audiogen::protocol::prepare_speech_request(dialect, &rewritten_body)
+                    .map_err(|error| format!("validation.audio_request: {error}"))?;
+            (
+                prepared.body,
+                Some(AudioResponseAdapter {
+                    dialect,
+                    response_format: prepared.response_format,
+                }),
+            )
+        }
+    };
+
+    insert_header(headers, "authorization", &format!("Bearer {api_key}"))?;
+    if audio_response_adapter.is_some() {
+        insert_header(headers, "content-type", "application/json")?;
+    }
+    if streaming_request {
+        insert_header(headers, "accept", "text/event-stream")?;
+    }
+    let target_url = build_target_url(base_url, dialect.speech_path(), query);
+    Ok(BuiltUpstreamRequest {
+        target_url,
+        headers: headers.clone(),
+        body: rewritten_body,
+        bridge_kind: None,
+        audio_response_adapter: audio_response_adapter.filter(|_| !streaming_request),
+        audio_stream_dialect: streaming_request.then_some(dialect),
+        tool_namespaces: BTreeMap::new(),
+        streaming_request,
+        reasoning_sanitized: false,
+    })
+}
+
+/// 把非 OpenAI 音频方言的回程还原成 OpenAI `/v1/audio/speech` 的原始字节。
+///
+/// 只对 2xx 调用（错误体原样透传，与协议桥同一口径）。失败（含 MiniMax 在 HTTP 200
+/// 里报的业务错误）由调用方归类为 `response_transform`，进入切号。
+fn transform_audio_upstream_response(
+    adapter: AudioResponseAdapter,
+    body: &[u8],
+) -> Result<TransformedBridgeResponse, String> {
+    let audio = crate::audiogen::protocol::extract_audio_response(adapter.dialect, body)?;
+    Ok(TransformedBridgeResponse {
+        body: audio,
+        content_type: Some(adapter.response_format.content_type().to_string()),
+    })
+}
+
+/// STT / 翻译（multipart）的上游请求构造（遗留 1）。
+///
+/// 与 [`build_audio_upstream_request`]**同构但有两条根本差异**：
+///   1. 请求体是 multipart/form-data，`model` 住在**表单字段**里 —— 校验与改写
+///      都走 `audiogen::protocol` 的 multipart 层（解析 → 改 `model` 段 → 重建），
+///      文件段逐字节原样保留；
+///   2. 改写了 `model` 之后**必须重设 Content-Type**：重建体用的是新的 boundary
+///      （`MultipartForm::REBUILD_BOUNDARY`），沿用客户端的旧 boundary 上游解不开。
+///      没改写（无映射命中）时 body 与头都原样透传。
+///
+/// 上游路径与入站相同（OpenAI 兼容方言，能走到这里的 path 已经是两条 STT 路径
+/// 之一）；`query` 原样透传。鉴权头与 TTS 一样硬写 `Bearer`，加非 OpenAI 兼容
+/// 方言时与 TTS 一起改。
+fn build_audio_transcribe_upstream_request(
+    credential: &SelectedCredential,
+    path: &str,
+    query: Option<&str>,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    secret: &Value,
+    config: &Value,
+    model_match_mode: ModelMatchMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    let api_key = string_value(secret, "api_key").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing api_key",
+            credential.display_name
+        )
+    })?;
+    let base_url = string_value(config, "base_url").ok_or_else(|| {
+        format!(
+            "Route credential {} is missing base_url",
+            credential.display_name
+        )
+    })?;
+    // 方言校验：账号的 `interface_format` 必须是**支持 STT** 的音频方言。
+    // MiniMax 只有 TTS，误配到 STT 的账号在这里拒绝，不能落到 OpenAI 的 multipart 路径上。
+    let interface_format = string_value(config, "interface_format").unwrap_or_default();
+    match crate::audiogen::protocol::dialect_from_interface_format(interface_format) {
+        Some(dialect) if dialect.supports_transcription() => {}
+        Some(dialect) => {
+            return Err(format!(
+                "Route credential {} uses the '{}' audio dialect, which does not support transcription",
+                credential.display_name,
+                dialect.as_str()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "Route credential {} has an unsupported audio interface_format '{}'; expected openai",
+                credential.display_name, interface_format
+            ));
+        }
+    }
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    // 校验（model + file 表单字段）。改写只动 `model` 段，文件字节原样保留。
+    let model = crate::audiogen::protocol::validate_transcribe_request(content_type, body)
+        .map_err(|error| format!("validation.audio_transcribe_request: {error}"))?;
+    let mappings = parse_model_capability_value(config).mappings;
+    let upstream_model = resolve_mapping_target(&mappings, &model, model_match_mode);
+    let (rewritten_body, content_type) = match upstream_model {
+        Some(target) if target != model => {
+            let form = crate::audiogen::protocol::multipart_boundary(content_type)
+                .ok_or_else(|| {
+                    "validation.audio_transcribe_request: missing multipart boundary".to_string()
+                })
+                .and_then(|boundary| crate::audiogen::protocol::parse_multipart(body, boundary))
+                .map_err(|error| format!("validation.audio_transcribe_request: {error}"))?;
+            let rebuilt = form.rewrite_field("model", &target).ok_or_else(|| {
+                "validation.audio_transcribe_request: model form field vanished".to_string()
+            })?;
+            (
+                rebuilt.body,
+                format!("multipart/form-data; boundary={}", rebuilt.boundary),
+            )
+        }
+        // 无映射命中（或目标就是原名）：body 与 Content-Type 原样透传。
+        _ => (body.to_vec(), content_type.to_string()),
+    };
+
+    insert_header(headers, "authorization", &format!("Bearer {api_key}"))?;
+    if !content_type.is_empty() {
+        insert_header(headers, "content-type", &content_type)?;
+    }
+    let target_url = build_target_url(base_url, path, query);
+    Ok(BuiltUpstreamRequest {
+        target_url,
+        headers: headers.clone(),
+        body: rewritten_body,
+        bridge_kind: None,
+        audio_response_adapter: None,
+        audio_stream_dialect: None,
+        tool_namespaces: BTreeMap::new(),
+        streaming_request: false,
+        reasoning_sanitized: false,
+    })
+}
+
+fn build_official_upstream_request(
+    credential: &SelectedCredential,
+    platform: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &mut HeaderMap,
+    body: &[u8],
+    secret: &Value,
+    config: &Value,
+    model_match_mode: ModelMatchMode,
+) -> Result<BuiltUpstreamRequest, String> {
+    let platform = PlatformId::parse(platform).map_err(format_app_error)?;
+    PlatformCapabilityService::require(platform, PlatformOperation::OfficialAccountRouting)
+        .map_err(format_app_error)?;
+    let mappings = parse_model_capability_value(config).mappings;
+    let mut rewritten_body = apply_model_mappings_with_mode(body, &mappings, model_match_mode);
+    // Apply credential-provided headers first (CPA may ship extra headers).
+    apply_config_headers(headers, config)?;
+
+    if let Some(agent_identity) = resolve_agent_identity_headers(secret, config)? {
+        insert_header(headers, "authorization", &agent_identity.authorization)?;
+        insert_header(
+            headers,
+            "chatgpt-account-id",
+            &agent_identity.chatgpt_account_id,
+        )?;
+        if agent_identity.is_fedramp_account {
+            insert_header(headers, "x-openai-fedramp", "true")?;
+        }
+    } else {
+        let access_token = resolve_official_access_token(credential, secret, config)?;
+        insert_header(headers, "authorization", &format!("Bearer {access_token}"))?;
+    }
+    if platform == PlatformId::Claude {
+        headers
+            .entry(HeaderName::from_static("anthropic-version"))
+            .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+    let base_url = match string_value(config, "base_url") {
+        Some(base_url) => base_url,
+        None => default_official_base_url(platform)?,
+    };
+    // Official Codex credentials speak Responses too. Other clients may send
+    // Chat Completions or Anthropic Messages, so use the same bidirectional bridge
+    // as API credentials instead of forwarding an unsupported backend path.
+    // Convert before backend normalization: the bridge introduces fields such as
+    // max_output_tokens and would otherwise discard the required store=false.
+    let mut upstream_path = path.to_string();
+    let mut bridge_kind = None;
+    let normalized_path = normalize_api_upstream_path("openai-responses", path);
+    if platform == PlatformId::Codex
+        && matches!(
+            normalized_path.trim_end_matches('/'),
+            "/chat/completions" | "/messages"
+        )
+    {
+        let bridge = prepare_protocol_bridge_request(
+            platform,
+            ApiDialect::OpenAiResponses,
+            &normalized_path,
+            &rewritten_body,
+        )?;
+        upstream_path = bridge.upstream_path;
+        rewritten_body = bridge.body;
+        bridge_kind = bridge.kind;
+    }
+    // ChatGPT's backend needs to know which account of the token's owner to bill,
+    // the way the agent-identity branch above already tells it. The Codex CLI sends
+    // this on every request; only accounts with several workspaces notice its
+    // absence, which is why it can look optional. Scoped to that host: a relay
+    // holding an OAuth token has no use for it.
+    if platform == PlatformId::Codex && is_codex_backend_base_url(base_url) {
+        rewritten_body = normalize_chatgpt_codex_request_body(&rewritten_body);
+        let account_id = codex_chatgpt_account_id(secret, config)
+            .map(str::to_string)
+            .or_else(|| codex_chatgpt_account_id_from_token(secret));
+        if let Some(account_id) = account_id {
+            fill_header_if_absent(headers, "chatgpt-account-id", &account_id);
+        }
+    }
+    // cli-chat-proxy rejects unversioned clients with HTTP 426 (version = none).
+    if platform == PlatformId::Grok && is_grok_cli_chat_proxy_base_url(base_url) {
+        apply_official_grok_cli_headers(headers)?;
+    }
+    apply_credential_user_agent(headers, config)?;
+    // An official Codex account is reached over the same Responses dialect as an API
+    // one — from ChatGPT's own endpoint to a relay hosting the OAuth token — and both
+    // fingerprint the client. The probe starts from an empty header map, so without
+    // this it would carry no client identity at all.
+    if platform == PlatformId::Codex && may_impersonate_codex_cli(config) {
+        apply_codex_cli_identity(headers, &credential.id);
+    }
+    // Codex's backend answers a `stream: true` body with SSE, and rejects an
+    // Accept header that still says JSON.
+    if platform == PlatformId::Codex && request_body_requests_stream(&rewritten_body) {
+        insert_header(headers, "accept", "text/event-stream")?;
+    }
+    let (upstream_path, rewritten_body, bridge_kind) = if is_openai_images_path(path) {
+        match platform {
+            PlatformId::Codex => (
+                "/responses".to_string(),
+                crate::imagegen::protocol::openai_request_to_responses(&rewritten_body)?,
+                Some(ProtocolBridgeKind::ImagesToResponses),
+            ),
+            PlatformId::Gemini => {
+                let (model, body) =
+                    crate::imagegen::protocol::openai_request_to_gemini(&rewritten_body)?;
+                (
+                    format!(
+                        "/v1beta/models/{}:generateContent",
+                        model.trim_start_matches("models/")
+                    ),
+                    body,
+                    Some(ProtocolBridgeKind::ImagesToGemini),
+                )
+            }
+            _ => {
+                return Err(format!(
+                    "Official {} credentials do not support image generation",
+                    platform.as_str()
+                ))
+            }
+        }
+    } else {
+        (upstream_path, rewritten_body, bridge_kind)
+    };
+    let target_url = build_target_url(base_url, &upstream_path, query);
+    let streaming_request = request_body_requests_stream(&rewritten_body);
+    Ok(BuiltUpstreamRequest {
+        target_url,
+        headers: headers.clone(),
+        body: rewritten_body,
+        bridge_kind,
+        audio_response_adapter: None,
+        audio_stream_dialect: None,
+        tool_namespaces: BTreeMap::new(),
+        streaming_request,
+        reasoning_sanitized: false,
+    })
+}
+
+fn is_grok_cli_chat_proxy_base_url(base_url: &str) -> bool {
+    base_url
+        .to_ascii_lowercase()
+        .contains(GROK_CLI_CHAT_PROXY_MARKER)
+}
+
+fn request_body_requests_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Normalize fields that ChatGPT's private Codex Responses endpoint rejects.
+///
+/// Some OpenAI-compatible clients always emit max_output_tokens, but the private
+/// ChatGPT Codex backend rejects that public Responses API field. It also requires
+/// requests to be non-stored. Keep this scoped to ChatGPT's endpoint so explicit
+/// third-party Responses relays retain the fields they support.
+fn normalize_chatgpt_codex_request_body(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.to_vec();
+    };
+    object.remove("max_output_tokens");
+    object.insert("store".to_string(), Value::Bool(false));
+    serde_json::to_vec(&value).expect("serializing serde_json::Value cannot fail")
+}
+
+fn apply_official_grok_cli_headers(headers: &mut HeaderMap) -> Result<(), String> {
+    // Force-set so outdated CPA exports (User-Agent: grok-cli) cannot win.
+    insert_header(headers, "x-xai-token-auth", GROK_CLI_TOKEN_AUTH_VALUE)?;
+    insert_header(headers, "x-grok-client-version", GROK_CLI_CLIENT_VERSION)?;
+    insert_header(
+        headers,
+        "user-agent",
+        &format!("xai-grok-workspace/{GROK_CLI_CLIENT_VERSION}"),
+    )?;
+    headers.remove("x-client-name");
+    Ok(())
+}
+
+fn apply_config_headers(headers: &mut HeaderMap, config: &Value) -> Result<(), String> {
+    let Some(Value::Object(extra)) = config.get("headers") else {
+        return Ok(());
+    };
+    for (name, value) in extra {
+        let Some(value) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        else {
+            continue;
+        };
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| format!("Invalid credential header name {name}: {err}"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|err| format!("Invalid credential header value for {name}: {err}"))?;
+        // Only fill missing headers so inbound request values still win when present.
+        headers.entry(header_name).or_insert(header_value);
+    }
+    Ok(())
+}
+
+pub(crate) fn credential_user_agent(config: &Value) -> Option<&str> {
+    let Some(Value::Object(extra)) = config.get("headers") else {
+        return None;
+    };
+    for (name, value) in extra {
+        if name.eq_ignore_ascii_case("user-agent") {
+            return value
+                .as_str()
+                .map(str::trim)
+                .filter(|item| !item.is_empty());
+        }
+    }
+    None
+}
+
+fn apply_credential_user_agent(headers: &mut HeaderMap, config: &Value) -> Result<(), String> {
+    let Some(user_agent) = credential_user_agent(config) else {
+        return Ok(());
+    };
+    insert_header(headers, "user-agent", user_agent)
+}
+
+fn resolve_official_access_token(
+    credential: &SelectedCredential,
+    secret: &Value,
+    _config: &Value,
+) -> Result<String, String> {
+    // Token refresh happens in maybe_refresh_official_credential before build.
+    if let Some(access_token) = string_value(secret, "access_token") {
+        return Ok(access_token.to_string());
+    }
+
+    if string_value(secret, "refresh_token").is_some() {
+        return Err("route_credential.refresh_only_unsupported".to_string());
+    }
+
+    Err(format!(
+        "Route credential {} is missing access_token",
+        credential.display_name
+    ))
+}
+
+/// The ChatGPT account (workspace) the token's traffic should be billed to.
+///
+/// Importers spell it differently depending on where the auth file came from, and
+/// some omit it entirely — so fall back to the access token's own
+/// `chatgpt_account_id` claim, which ChatGPT mints into every token under its
+/// namespaced `auth` object. Deriving it from the token beats guessing: it is by
+/// definition the account that token belongs to.
+fn codex_chatgpt_account_id<'a>(secret: &'a Value, config: &'a Value) -> Option<&'a str> {
+    const KEYS: [&str; 3] = ["account_id", "chatgpt_account_id", "workspace_id"];
+    KEYS.iter()
+        .find_map(|key| string_value(secret, key))
+        .or_else(|| KEYS.iter().find_map(|key| string_value(config, key)))
+}
+
+/// `chatgpt_account_id` read out of the access token itself.
+///
+/// Separate from [`codex_chatgpt_account_id`] because decoding yields an owned
+/// string, which cannot borrow from the caller's `secret`.
+fn codex_chatgpt_account_id_from_token(secret: &Value) -> Option<String> {
+    let access_token = string_value(secret, "access_token")?;
+    let payload = jwt_payload(access_token)?;
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn access_token_is_expired(config: &Value) -> bool {
+    access_token_is_expired_with_secret(config, None)
+}
+
+fn access_token_is_expired_with_secret(config: &Value, secret: Option<&Value>) -> bool {
+    if let Some(raw) = config.get("expired") {
+        match raw {
+            Value::String(value) => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+                        return dt.with_timezone(&Utc)
+                            <= Utc::now()
+                                + chrono::Duration::from_std(OAUTH_REFRESH_LEAD)
+                                    .unwrap_or_default();
+                    }
+                }
+            }
+            Value::Number(number) => {
+                if let Some(ts) = number.as_i64() {
+                    // Accept unix seconds.
+                    return Utc::now().timestamp() + OAUTH_REFRESH_LEAD.as_secs() as i64 >= ts;
+                }
+            }
+            Value::Bool(true) => return true,
+            _ => {}
+        }
+    }
+
+    // Fallback: parse access JWT `exp` when config.expired is missing/unusable.
+    if let Some(secret) = secret {
+        if let Some(access_token) = string_value(secret, "access_token") {
+            if let Some(exp) = jwt_claim_i64(access_token, "exp") {
+                return Utc::now().timestamp() + OAUTH_REFRESH_LEAD.as_secs() as i64 >= exp;
+            }
+        }
+    }
+
+    false
+}
+
+/// Refresh an official OAuth access token when missing/expired and a token_endpoint exists.
+/// Returns updated secret/config JSON when refresh succeeds.
+pub async fn maybe_refresh_official_credential(
+    pool: &SqlitePool,
+    credential: &SelectedCredential,
+    activity: Option<&RouteCredentialActivityRegistry>,
+) -> Result<SelectedCredential, String> {
+    if credential.kind != "official" {
+        return Ok(credential.clone());
+    }
+
+    let _authentication_guard =
+        crate::services::direct_mode_service::DirectModeService::refresh_guard(
+            &credential.platform,
+            &credential.id,
+        )
+        .await;
+    // 在同账号锁之后重读：前一请求可能刚刚轮换了 refresh token。
+    let latest: Option<(String, String)> = sqlx::query_as(
+        "SELECT secret_payload_json, config_json FROM route_credentials WHERE id = ?",
+    )
+    .bind(&credential.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| "无法读取账号最新认证".to_string())?;
+    let current = latest.map(|(secret_payload_json, config_json)| SelectedCredential {
+        secret_payload_json,
+        config_json,
+        ..credential.clone()
+    });
+    let credential = current.as_ref().unwrap_or(credential);
+    if let Some(native) =
+        crate::services::direct_mode_service::DirectModeService::official_for_proxy(
+            pool, credential,
+        )
+        .await?
+    {
+        let native_secret = parse_json_object(&native.secret_payload_json, "secret")?;
+        let native_config = parse_json_object(&native.config_json, "config")?;
+        if access_token_is_expired_with_secret(&native_config, Some(&native_secret)) {
+            return Err(
+                "官方账号处于直连模式，请启动对应原生客户端刷新登录，或切回算力池。".to_string(),
+            );
+        }
+        return Ok(native);
+    }
+    let secret = parse_json_object(&credential.secret_payload_json, "secret")?;
+    let config = parse_json_object(&credential.config_json, "config")?;
+    let has_access = string_value(&secret, "access_token").is_some()
+        && !access_token_is_expired_with_secret(&config, Some(&secret));
+    if has_access {
+        return Ok(credential.clone());
+    }
+
+    let refresh_token = match string_value(&secret, "refresh_token") {
+        Some(value) => value.to_string(),
+        None => return Ok(credential.clone()),
+    };
+    let Some(token_endpoint) = string_value(&config, "token_endpoint").map(str::to_string) else {
+        return Ok(credential.clone());
+    };
+    let client_id = resolve_oauth_client_id(&credential.platform, &config, &secret);
+
+    let refreshed =
+        match refresh_oauth_access_token(&token_endpoint, &refresh_token, client_id.as_deref())
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                if is_permanent_oauth_refresh_failure(&err) {
+                    if let Some(activity) = activity {
+                        mark_route_credential_revoked(
+                            activity,
+                            &credential.platform,
+                            pool,
+                            &credential.id,
+                        )
+                        .await;
+                    } else {
+                        let _ = RouteCredentialRepository::update_status(
+                            pool,
+                            &credential.id,
+                            "revoked",
+                        )
+                        .await;
+                    }
+                }
+                return Err(format_oauth_refresh_failure(&err));
+            }
+        };
+    let mut secret_obj = secret
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Route credential secret JSON must be an object".to_string())?;
+    let mut config_obj = config
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Route credential config JSON must be an object".to_string())?;
+
+    secret_obj.insert(
+        "access_token".to_string(),
+        Value::String(refreshed.access_token.clone()),
+    );
+    if let Some(refresh) = refreshed.refresh_token {
+        secret_obj.insert("refresh_token".to_string(), Value::String(refresh));
+    }
+    if let Some(id_token) = refreshed.id_token {
+        secret_obj.insert("id_token".to_string(), Value::String(id_token));
+    }
+    if let Some(token_type) = refreshed.token_type {
+        config_obj.insert("token_type".to_string(), Value::String(token_type));
+    }
+    if let Some(expires_in) = refreshed.expires_in {
+        config_obj.insert("expires_in".to_string(), json!(expires_in));
+        if let Some(expired_at) =
+            Utc::now().checked_add_signed(chrono::Duration::seconds(expires_in))
+        {
+            config_obj.insert(
+                "expired".to_string(),
+                Value::String(expired_at.to_rfc3339()),
+            );
+        }
+    } else if let Some(exp) = jwt_claim_i64(&refreshed.access_token, "exp") {
+        if let Some(expired_at) = chrono::DateTime::<Utc>::from_timestamp(exp, 0) {
+            config_obj.insert(
+                "expired".to_string(),
+                Value::String(expired_at.to_rfc3339()),
+            );
+        }
+    }
+    config_obj.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+
+    let secret_payload_json = Value::Object(secret_obj).to_string();
+    let config_json = Value::Object(config_obj).to_string();
+
+    // Best-effort persistence; request can still proceed with in-memory tokens.
+    let _ = RouteCredentialRepository::update_secret_and_config(
+        pool,
+        &credential.id,
+        &secret_payload_json,
+        &config_json,
+    )
+    .await;
+
+    Ok(SelectedCredential {
+        secret_payload_json,
+        config_json,
+        ..credential.clone()
+    })
+}
+
+#[derive(Debug, Clone)]
+struct OAuthRefreshResult {
+    access_token: String,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    token_type: Option<String>,
+    expires_in: Option<i64>,
+}
+
+async fn refresh_oauth_access_token(
+    token_endpoint: &str,
+    refresh_token: &str,
+    client_id: Option<&str>,
+) -> Result<OAuthRefreshResult, String> {
+    let client = build_outbound_http_client(Some(Duration::from_secs(20)))?;
+    let mut form = format!(
+        "grant_type=refresh_token&refresh_token={}",
+        urlencoding_encode(refresh_token)
+    );
+    if let Some(client_id) = client_id.map(str::trim).filter(|item| !item.is_empty()) {
+        form.push_str("&client_id=");
+        form.push_str(&urlencoding_encode(client_id));
+    }
+    let response = client
+        .post(token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .body(form)
+        .send()
+        .await
+        .map_err(|err| format!("OAuth refresh request failed: {err}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("OAuth refresh response read failed: {err}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OAuth refresh failed with status {}: {}",
+            status.as_u16(),
+            body.chars().take(240).collect::<String>()
+        ));
+    }
+
+    let value = serde_json::from_str::<Value>(&body)
+        .map_err(|err| format!("OAuth refresh JSON invalid: {err}"))?;
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .ok_or_else(|| "OAuth refresh response missing access_token".to_string())?
+        .to_string();
+
+    Ok(OAuthRefreshResult {
+        access_token,
+        refresh_token: value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string),
+        id_token: value
+            .get("id_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string),
+        token_type: value
+            .get("token_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string),
+        expires_in: value.get("expires_in").and_then(|item| {
+            item.as_i64()
+                .or_else(|| item.as_f64().map(|n| n as i64))
+                .or_else(|| item.as_str().and_then(|s| s.parse::<i64>().ok()))
+        }),
+    })
+}
+
+fn is_permanent_oauth_refresh_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid_grant")
+        || lower.contains("refresh token has been revoked")
+        || lower.contains("token has been revoked")
+        || lower.contains("invalid_client")
+        || lower.contains("unauthorized_client")
+}
+
+fn format_oauth_refresh_failure(message: &str) -> String {
+    if is_permanent_oauth_refresh_failure(message) {
+        format!("官方 OAuth 凭证已失效（revoked），请重新导入 CPA 授权文件。原始错误：{message}")
+    } else {
+        message.to_string()
+    }
+}
+
+fn resolve_oauth_client_id(platform: &str, config: &Value, secret: &Value) -> Option<String> {
+    if let Some(value) = string_value(config, "client_id").map(str::to_string) {
+        return Some(value);
+    }
+    if let Some(value) = string_value(secret, "client_id").map(str::to_string) {
+        return Some(value);
+    }
+    if let Some(access_token) = string_value(secret, "access_token") {
+        if let Some(value) = jwt_claim_string(access_token, "client_id") {
+            return Some(value);
+        }
+        if let Some(value) = jwt_claim_string(access_token, "azp") {
+            return Some(value);
+        }
+    }
+
+    let platform = platform.trim().to_ascii_lowercase();
+    let endpoint = string_value(config, "token_endpoint").unwrap_or("");
+    let endpoint_lower = endpoint.to_ascii_lowercase();
+    if platform == "grok"
+        || platform == "xai"
+        || endpoint_lower.contains("auth.x.ai")
+        || endpoint_lower.contains("x.ai")
+    {
+        return Some(XAI_OAUTH_CLIENT_ID.to_string());
+    }
+    None
+}
+
+fn jwt_claim_string(token: &str, claim: &str) -> Option<String> {
+    jwt_payload(token)?
+        .get(claim)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+}
+
+fn jwt_claim_i64(token: &str, claim: &str) -> Option<i64> {
+    let payload = jwt_payload(token)?;
+    let value = payload.get(claim)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|n| n as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    if payload.is_empty() {
+        return None;
+    }
+    let decoded = decode_base64url_nopad(payload)?;
+    serde_json::from_slice::<Value>(&decoded).ok()
+}
+
+fn decode_base64url_nopad(input: &str) -> Option<Vec<u8>> {
+    fn decode_table(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 2);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for &byte in bytes {
+        if byte == b'=' {
+            break;
+        }
+        let value = decode_table(byte)?;
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn urlencoding_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialQuotaSnapshot {
+    pub subscription_type: Option<String>,
+    pub primary_remain: Option<i64>,
+    pub weekly_remain: Option<i64>,
+    pub reset_primary: Option<String>,
+    pub reset_weekly: Option<String>,
+    // Legacy detail fields retained in config_json only.
+    pub quota_remaining: Option<i64>,
+    pub quota_limit: Option<i64>,
+    pub quota_used: Option<i64>,
+    pub credits_has_credits: Option<bool>,
+    pub credits_unlimited: Option<bool>,
+    pub credits_balance: Option<String>,
+    pub rate_limit_reset_credits_available_count: Option<i64>,
+}
+
+fn config_remain_positive(config: &Value, keys: &[&str]) -> bool {
+    for key in keys {
+        match config.get(*key) {
+            None | Some(Value::Null) => continue,
+            Some(Value::Number(value)) => {
+                return value
+                    .as_i64()
+                    .map(|remaining| remaining > 0)
+                    .unwrap_or(true);
+            }
+            Some(Value::String(value)) => {
+                return value
+                    .trim()
+                    .parse::<i64>()
+                    .map(|remaining| remaining > 0)
+                    .unwrap_or(true);
+            }
+            Some(_) => return true,
+        }
+    }
+    true
+}
+
+pub fn is_route_credential_quota_available(config_json: &str) -> bool {
+    // Unknown/missing remaining means "not known exhausted" — keep selectable.
+    let Ok(config) = parse_json_object(config_json, "config") else {
+        return true;
+    };
+    let primary_ok = config_remain_positive(&config, &["primary_remain", "quota_remaining"]);
+    let weekly_ok = config_remain_positive(&config, &["weekly_remain"]);
+    primary_ok && weekly_ok
+}
+
+pub fn parse_official_quota_snapshot(response_body: &str) -> Option<OfficialQuotaSnapshot> {
+    let lower = response_body.to_ascii_lowercase();
+    let exhausted = lower.contains("subscription:free-usage-exhausted")
+        || lower.contains("free-usage-exhausted")
+        || lower.contains("used all the included free usage");
+    if !exhausted {
+        return None;
+    }
+
+    let mut quota_used = None;
+    let mut quota_limit = None;
+    if let Some((used, limit)) = parse_tokens_actual_limit(response_body) {
+        quota_used = Some(used);
+        quota_limit = Some(limit);
+    }
+
+    Some(OfficialQuotaSnapshot {
+        subscription_type: Some("free".to_string()),
+        primary_remain: Some(0),
+        weekly_remain: None,
+        reset_primary: None,
+        reset_weekly: None,
+        quota_remaining: Some(0),
+        quota_limit,
+        quota_used,
+        credits_has_credits: None,
+        credits_unlimited: None,
+        credits_balance: None,
+        rate_limit_reset_credits_available_count: None,
+    })
+}
+
+fn parse_tokens_actual_limit(text: &str) -> Option<(i64, i64)> {
+    let marker = "tokens (actual/limit):";
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find(marker)?;
+    let tail = text[start + marker.len()..].trim_start();
+    let mut digits = String::new();
+    let mut slash_seen = false;
+    let mut left = String::new();
+    let mut right = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        if ch == '/' && !slash_seen && !digits.is_empty() {
+            left = std::mem::take(&mut digits);
+            slash_seen = true;
+            continue;
+        }
+        if !digits.is_empty() {
+            if slash_seen {
+                right = std::mem::take(&mut digits);
+            } else {
+                left = std::mem::take(&mut digits);
+            }
+            break;
+        }
+        if !left.is_empty() {
+            break;
+        }
+    }
+    if slash_seen && right.is_empty() && !digits.is_empty() {
+        right = digits;
+    }
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    let used = left.parse::<i64>().ok()?;
+    let limit = right.parse::<i64>().ok()?;
+    Some((used, limit))
+}
+
+pub fn apply_official_quota_snapshot(
+    config_json: &str,
+    snapshot: &OfficialQuotaSnapshot,
+) -> Result<String, String> {
+    let mut config = parse_json_object(config_json, "config")?;
+    let Some(object) = config.as_object_mut() else {
+        return Err("Route credential config JSON must be an object".to_string());
+    };
+    if let Some(subscription_type) = &snapshot.subscription_type {
+        object.insert("subscription_type".to_string(), json!(subscription_type));
+    }
+    if let Some(primary_remain) = snapshot.primary_remain {
+        object.insert("primary_remain".to_string(), json!(primary_remain));
+        // Keep legacy key dual-written for older readers/filters.
+        object.insert("quota_remaining".to_string(), json!(primary_remain));
+    } else if let Some(quota_remaining) = snapshot.quota_remaining {
+        object.insert("quota_remaining".to_string(), json!(quota_remaining));
+        object.insert("primary_remain".to_string(), json!(quota_remaining));
+    }
+    if let Some(weekly_remain) = snapshot.weekly_remain {
+        object.insert("weekly_remain".to_string(), json!(weekly_remain));
+    }
+    if let Some(reset_primary) = &snapshot.reset_primary {
+        object.insert("reset_primary".to_string(), json!(reset_primary));
+    }
+    if let Some(reset_weekly) = &snapshot.reset_weekly {
+        object.insert("reset_weekly".to_string(), json!(reset_weekly));
+    }
+    if let Some(quota_limit) = snapshot.quota_limit {
+        object.insert("quota_limit".to_string(), json!(quota_limit));
+    }
+    if let Some(quota_used) = snapshot.quota_used {
+        object.insert("quota_used".to_string(), json!(quota_used));
+    }
+    if let Some(has_credits) = snapshot.credits_has_credits {
+        object.insert("credits_has_credits".to_string(), json!(has_credits));
+    }
+    if let Some(unlimited) = snapshot.credits_unlimited {
+        object.insert("credits_unlimited".to_string(), json!(unlimited));
+    }
+    if let Some(balance) = &snapshot.credits_balance {
+        object.insert("credits_balance".to_string(), json!(balance));
+    }
+    if let Some(available_count) = snapshot.rate_limit_reset_credits_available_count {
+        object.insert(
+            "rate_limit_reset_credits_available_count".to_string(),
+            json!(available_count),
+        );
+    }
+    let now = Utc::now().to_rfc3339();
+    object.insert("quota_updated_at".to_string(), json!(now.clone()));
+    if snapshot.reset_primary.is_none() && snapshot.primary_remain.is_some() {
+        // Without an exact vendor reset timestamp, stamp primary reset to update time.
+        object
+            .entry("reset_primary".to_string())
+            .or_insert_with(|| json!(now));
+    }
+    Ok(config.to_string())
+}
+
+pub async fn maybe_persist_official_quota_from_response(
+    pool: &SqlitePool,
+    credential: &SelectedCredential,
+    response_body: &str,
+) -> Result<bool, AppError> {
+    if credential.kind != "official" {
+        return Ok(false);
+    }
+    let Some(snapshot) = parse_official_quota_snapshot(response_body) else {
+        return Ok(false);
+    };
+    let next_config =
+        apply_official_quota_snapshot(&credential.config_json, &snapshot).map_err(|message| {
+            AppError::Validation {
+                code: "validation.route_credential_quota",
+                message,
+                details: Some(credential.id.clone()),
+                recoverable: true,
+            }
+        })?;
+    if next_config == credential.config_json {
+        return Ok(false);
+    }
+    RouteCredentialRepository::update_secret_and_config(
+        pool,
+        &credential.id,
+        &credential.secret_payload_json,
+        &next_config,
+    )
+    .await?;
+    Ok(true)
+}
+
+fn parse_json_object(raw: &str, label: &str) -> Result<Value, String> {
+    let value = serde_json::from_str::<Value>(raw)
+        .map_err(|err| format!("Route credential {label} JSON is invalid: {err}"))?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(format!("Route credential {label} JSON must be an object"))
+    }
+}
+
+/// 从账号 `config_json`（**原始字符串**）里取一个非空字符串字段。
+fn config_string_field(config_json: &str, key: &str) -> Option<String> {
+    serde_json::from_str::<Value>(config_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn string_value<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+}
+
+/// Whether the Responses-only `custom`-tool rewrite applies to this request.
+///
+/// Gated on the inbound path alone. `custom` tools are a Responses shape, and
+/// the account dialect is not a proxy for the wire shape: an Anthropic Messages
+/// or Chat Completions body bridged to a Responses account carries tools in its
+/// own schema. Rewriting those would replace a real `input_schema` with an empty
+/// `parameters` object, silently destroying the tool definition.
+fn should_rewrite_custom_tools_for_api(path: &str) -> bool {
+    is_responses_path(path)
+}
+
+pub fn normalize_api_upstream_path(interface_format: &str, path: &str) -> String {
+    let normalized = normalize_request_path(path);
+    if !matches!(interface_format, "openai" | "openai-responses") {
+        return normalized;
+    }
+    if interface_format == "openai" && is_openai_images_path(&normalized) {
+        return ensure_v1_path(&normalized);
+    }
+    strip_leading_version_path_segments(&normalized)
+}
+
+fn is_openai_images_path(path: &str) -> bool {
+    matches!(
+        path.trim().trim_end_matches('/'),
+        "/images/generations" | "/images/edits" | "/v1/images/generations" | "/v1/images/edits"
+    )
+}
+
+fn ensure_v1_path(path: &str) -> String {
+    if path.starts_with("/v1/") {
+        path.to_string()
+    } else {
+        format!("/v1{path}")
+    }
+}
+
+fn normalize_request_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// The account opted in to cleaning replayed reasoning history.
+fn responses_encrypted_content_cleanup_enabled(config: &Value) -> bool {
+    config
+        .get("responses_encrypted_content_cleanup")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// The account additionally opted in to stripping even well-formed ciphertext.
+/// Subordinate to the main cleanup switch: without it this flag is inert.
+fn responses_encrypted_content_aggressive_strip_enabled(config: &Value) -> bool {
+    responses_encrypted_content_cleanup_enabled(config)
+        && config
+            .get("responses_encrypted_content_aggressive_strip")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+/// The account opted in to always sending `reasoning_content` on assistant
+/// turns of a Responses→Chat request, instead of waiting to be told it is
+/// missing. Trades one guaranteed field for skipping the first-request retry
+/// against thinking upstreams (DeepSeek/MiMo behind new-api) that mandate it.
+fn force_reasoning_content_enabled(config: &Value) -> bool {
+    config
+        .get("force_reasoning_content")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn responses_cleanup_mode(config: &Value) -> ReasoningCleanupMode {
+    if responses_encrypted_content_aggressive_strip_enabled(config) {
+        ReasoningCleanupMode::Aggressive
+    } else {
+        ReasoningCleanupMode::Conservative
+    }
+}
+
+fn responses_custom_tool_compat_enabled(config: &Value) -> bool {
+    config
+        .get("responses_custom_tool_compat")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The reminder this account appends to every turn, or `None` when off.
+///
+/// Two keys: `turn_reminder` switches it on, `turn_reminder_text` optionally
+/// overrides the wording. A blank or absent text falls back to the default, so
+/// ticking the box alone is enough to get a working reminder.
+fn turn_reminder_text(config: &Value) -> Option<String> {
+    if !config
+        .get("turn_reminder")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let text = config
+        .get("turn_reminder_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(turn_reminder::DEFAULT_TURN_REMINDER);
+    Some(text.to_string())
+}
+
+/// Tool `type`s only OpenAI's own Responses backend can execute. Third-party
+/// Responses-compatible gateways reject them (e.g. Xiaomi MiMo returns
+/// `responses_feature_not_supported: tool type 'web_search' is not supported`),
+/// so they are stripped from the passthrough request.
+const UNSUPPORTED_HOSTED_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "computer_use_preview",
+    "code_interpreter",
+    "image_generation",
+    "container_file_citation",
+];
+
+/// Remove OpenAI-hosted tools a limited Responses gateway can't run, recursing
+/// into `namespace` tool groups. Non-JSON / no-tools bodies pass through. When a
+/// pinned `tool_choice` targets a removed tool, it is relaxed to `"auto"`.
+fn strip_unsupported_hosted_tools(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.to_vec();
+    };
+    let changed = match object.get_mut("tools").and_then(Value::as_array_mut) {
+        Some(tools) => filter_hosted_tools(tools),
+        None => false,
+    };
+    if !changed {
+        return body.to_vec();
+    }
+    if object
+        .get("tool_choice")
+        .is_some_and(tool_choice_targets_hosted)
+    {
+        object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn filter_hosted_tools(tools: &mut Vec<Value>) -> bool {
+    let before = tools.len();
+    tools.retain(|tool| !is_unsupported_hosted_tool(tool));
+    let mut changed = tools.len() != before;
+    for tool in tools.iter_mut() {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            if let Some(nested) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                changed |= filter_hosted_tools(nested);
+            }
+        }
+    }
+    changed
+}
+
+fn is_unsupported_hosted_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| UNSUPPORTED_HOSTED_TOOL_TYPES.contains(&tool_type))
+}
+
+fn tool_choice_targets_hosted(tool_choice: &Value) -> bool {
+    tool_choice
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| UNSUPPORTED_HOSTED_TOOL_TYPES.contains(&tool_type))
+}
+
+fn is_responses_path(path: &str) -> bool {
+    let normalized = path.trim().trim_end_matches('/');
+    normalized.ends_with("/responses") || normalized == "responses"
+}
+
+fn is_chat_completions_path(path: &str) -> bool {
+    let normalized = normalize_request_path(path);
+    strip_leading_version_path_segments(&normalized).trim_end_matches('/') == "/chat/completions"
+}
+
+fn strip_leading_version_path_segments(path: &str) -> String {
+    let mut remaining = path.trim_start_matches('/');
+    while let Some(first) = remaining.split('/').next() {
+        if !is_version_path_segment(first) {
+            break;
+        }
+        remaining = remaining[first.len()..].trim_start_matches('/');
+    }
+    if remaining.is_empty() {
+        String::new()
+    } else {
+        format!("/{remaining}")
+    }
+}
+
+fn is_version_path_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix('v') else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn collect_custom_tool_names(body: &[u8]) -> std::collections::HashSet<String> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return std::collections::HashSet::new();
+    };
+    let mut names = std::collections::HashSet::new();
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            if tool_type(tool) == Some("custom") {
+                if let Some(name) = responses_tool_name(tool) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    if let Some(input) = value.get("input").and_then(Value::as_array) {
+        for item in input {
+            if tool_type(item) == Some("custom_tool_call") {
+                if let Some(name) = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn rewrite_custom_tools_in_responses_request(
+    value: &mut Value,
+) -> std::collections::HashSet<String> {
+    let mut custom_names = std::collections::HashSet::new();
+    if let Some(tools) = value.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            if tool_type(tool) != Some("custom") {
+                continue;
+            }
+            if let Some(name) = responses_tool_name(tool) {
+                custom_names.insert(name.clone());
+                *tool = custom_tool_to_function_tool(tool, &name);
+            }
+        }
+    }
+
+    if let Some(input) = value.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input.iter_mut() {
+            match tool_type(item) {
+                Some("custom_tool_call") => {
+                    if let Some(name) = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    {
+                        custom_names.insert(name);
+                    }
+                    *item = custom_tool_call_to_function_call(item);
+                }
+                Some("custom_tool_call_output") => {
+                    *item = custom_tool_call_output_to_function_call_output(item);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    custom_names
+}
+
+fn restore_custom_tools_in_responses_payload(
+    body: &[u8],
+    custom_tool_names: &std::collections::HashSet<String>,
+) -> Vec<u8> {
+    if custom_tool_names.is_empty() {
+        return body.to_vec();
+    }
+
+    if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
+        restore_custom_tools_in_value(&mut value, custom_tool_names);
+        return serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec());
+    }
+
+    // SSE Responses streams are line-delimited `data: {...}` payloads.
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec();
+    };
+    if !text.contains("data:") {
+        return body.to_vec();
+    }
+
+    let mut rewritten = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let ends_with_crlf = line.ends_with("\r\n");
+        let ends_with_lf = line.ends_with('\n');
+        if let Some(payload) = trimmed.strip_prefix("data:") {
+            let payload = payload.trim_start();
+            if payload != "[DONE]" {
+                if let Ok(mut value) = serde_json::from_str::<Value>(payload) {
+                    restore_custom_tools_in_value(&mut value, custom_tool_names);
+                    if let Ok(serialized) = serde_json::to_string(&value) {
+                        rewritten.push_str("data: ");
+                        rewritten.push_str(&serialized);
+                        if ends_with_crlf {
+                            rewritten.push_str("\r\n");
+                        } else if ends_with_lf {
+                            rewritten.push('\n');
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        rewritten.push_str(line);
+    }
+    rewritten.into_bytes()
+}
+
+fn restore_custom_tools_in_value(
+    value: &mut Value,
+    custom_tool_names: &std::collections::HashSet<String>,
+) {
+    if tool_type(value) == Some("function_call") {
+        if let Some(name) = value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToOwned::to_owned)
+        {
+            if custom_tool_names.contains(&name) {
+                *value = function_call_to_custom_tool_call(value);
+                return;
+            }
+        }
+    }
+
+    match value {
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                restore_custom_tools_in_value(child, custom_tool_names);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                restore_custom_tools_in_value(child, custom_tool_names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn custom_tool_to_function_tool(tool: &Value, name: &str) -> Value {
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{CUSTOM_TOOL_PRESERVED_METADATA_HEADING}\n```json\n{}\n```",
+                tool
+            )
+        });
+
+    json!({
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                CUSTOM_TOOL_INPUT_FIELD: {
+                    "type": "string",
+                    "description": CUSTOM_TOOL_INPUT_DESCRIPTION
+                }
+            },
+            "required": [CUSTOM_TOOL_INPUT_FIELD],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn custom_tool_call_to_function_call(item: &Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("type".to_string(), json!("function_call"));
+    if let Some(id) = item.get("id").cloned() {
+        object.insert("id".to_string(), id);
+    }
+    if let Some(call_id) = item.get("call_id").cloned() {
+        object.insert("call_id".to_string(), call_id);
+    }
+    if let Some(status) = item.get("status").cloned() {
+        object.insert("status".to_string(), status);
+    }
+    if let Some(name) = item.get("name").cloned() {
+        object.insert("name".to_string(), name);
+    }
+    let input = item.get("input").cloned().unwrap_or_else(|| json!(""));
+    let arguments = serde_json::to_string(&json!({ CUSTOM_TOOL_INPUT_FIELD: input }))
+        .unwrap_or_else(|_| format!(r#"{{"{CUSTOM_TOOL_INPUT_FIELD}":""}}"#));
+    object.insert("arguments".to_string(), json!(arguments));
+    Value::Object(object)
+}
+
+fn custom_tool_call_output_to_function_call_output(item: &Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("type".to_string(), json!("function_call_output"));
+    if let Some(call_id) = item.get("call_id").cloned() {
+        object.insert("call_id".to_string(), call_id);
+    }
+    if let Some(id) = item.get("id").cloned() {
+        object.insert("id".to_string(), id);
+    }
+    if let Some(output) = item.get("output").cloned() {
+        object.insert("output".to_string(), output);
+    } else if let Some(input) = item.get("input").cloned() {
+        // Some clients reuse `input` for custom tool outputs.
+        object.insert("output".to_string(), input);
+    }
+    Value::Object(object)
+}
+
+fn function_call_to_custom_tool_call(item: &Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("type".to_string(), json!("custom_tool_call"));
+    if let Some(id) = item.get("id").cloned() {
+        object.insert("id".to_string(), id);
+    }
+    if let Some(call_id) = item.get("call_id").cloned() {
+        object.insert("call_id".to_string(), call_id);
+    }
+    if let Some(status) = item.get("status").cloned() {
+        object.insert("status".to_string(), status);
+    }
+    if let Some(name) = item.get("name").cloned() {
+        object.insert("name".to_string(), name);
+    }
+
+    let input = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.get(CUSTOM_TOOL_INPUT_FIELD).cloned())
+        .or_else(|| item.get("arguments").cloned())
+        .unwrap_or_else(|| json!(""));
+    object.insert("input".to_string(), input);
+    Value::Object(object)
+}
+
+fn tool_type(value: &Value) -> Option<&str> {
+    value.get("type").and_then(Value::as_str)
+}
+
+fn responses_tool_name(tool: &Value) -> Option<String> {
+    tool.get("name")
+        .or_else(|| {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn is_shared_model_api_path(path: &str) -> bool {
+    let normalized = path.trim_end_matches('/');
+    is_openai_images_path(normalized)
+        || normalized == "/models"
+        || normalized == "/messages"
+        || normalized == "/responses"
+        || normalized.ends_with("/messages")
+        || normalized.ends_with("/responses")
+        // 视频端点也声明了无 `/v1` 前缀的别名（`web::video_routes` 与
+        // `is_video_generation_path` 都认它）。少了这一条，那个别名在
+        // `shared_fallback` 里根本进不来——会被静默降级成静态兜底 404，
+        // 也就是「代码声称支持、实际永远 404」。
+        //
+        // **OpenAI 原生契约（`/v1/videos`）故意不做这个别名**：OpenAI 的路径
+        // 永远是 `/v1/videos`，加一个 `/videos` 前缀会让 `/videos/generations`
+        // 这类无关路径也被顺手放进来（下面那条断言就是防这个的），而它换不到
+        // 任何真实客户端。`/v1/videos*` 已经被下面的 `/v1/` 兜住。
+        || normalized == "/video/generations"
+        || normalized.starts_with("/video/generations/")
+        || normalized == "/v1"
+        || normalized.starts_with("/v1/")
+        || normalized == "/v1beta"
+        || normalized.starts_with("/v1beta/")
+        || normalized == "/v1alpha"
+        || normalized.starts_with("/v1alpha/")
+}
+
+#[cfg(test)]
+mod image_path_tests {
+    use super::{is_shared_model_api_path, normalize_api_upstream_path};
+
+    #[test]
+    fn image_endpoints_are_shared_model_api_paths() {
+        assert!(is_shared_model_api_path("/v1/images/generations"));
+        assert!(is_shared_model_api_path("/v1/images/edits"));
+        assert!(is_shared_model_api_path("/images/generations"));
+        assert!(is_shared_model_api_path("/images/edits"));
+    }
+
+    #[test]
+    fn openai_images_paths_keep_the_v1_prefix() {
+        assert_eq!(
+            normalize_api_upstream_path("openai", "/v1/images/generations"),
+            "/v1/images/generations"
+        );
+        assert_eq!(
+            normalize_api_upstream_path("openai", "/v1/images/edits"),
+            "/v1/images/edits"
+        );
+    }
+
+    /// 视频端点的**无 `/v1` 别名**也必须是共享模型 API 路径。
+    ///
+    /// `web::video_routes::is_video_submit_path` 与
+    /// `is_video_generation_path` 都声称认这个别名，但 `shared_fallback`
+    /// 只在 `is_shared_model_api_path` 为真时才进入代理逻辑。少了这一条，
+    /// 别名会被静默降级成静态兜底 404 —— 「代码声称支持、实际永远 404」。
+    #[test]
+    fn video_paths_without_the_v1_prefix_are_shared_model_api_paths() {
+        assert!(is_shared_model_api_path("/video/generations"));
+        assert!(is_shared_model_api_path("/video/generations/"));
+        assert!(is_shared_model_api_path("/video/generations/t-1"));
+        // OpenAI 原生契约（`/v1/videos*`）由 `/v1/` 那条兜住，不需要单独的条目
+        assert!(is_shared_model_api_path("/v1/videos"));
+        assert!(is_shared_model_api_path("/v1/videos/t-1"));
+        assert!(is_shared_model_api_path("/v1/videos/t-1/content"));
+        // 前缀接近但不同的路径不能被顺手放进来
+        assert!(!is_shared_model_api_path("/video/generation"));
+        assert!(!is_shared_model_api_path("/videos/generations"));
+        assert!(!is_shared_model_api_path("/videos"));
+    }
+
+    /// 两条视频契约的端点都必须被 `shared_fallback` 认出来。
+    ///
+    /// 漏掉任何一条，那条契约就会静默降级成静态兜底 404 —— 也就是
+    /// 「代码声称支持、实际永远 404」，本项目已经为 `/video/generations`
+    /// 这个别名踩过一次。
+    #[test]
+    fn both_video_contract_families_are_video_paths() {
+        use super::is_video_generation_path;
+
+        for path in [
+            "/v1/video/generations",
+            "/v1/video/generations/t-1",
+            "/video/generations",
+            "/video/generations/t-1",
+            "/v1/videos",
+            "/v1/videos/",
+            "/v1/videos/t-1",
+            "/v1/videos/t-1/content",
+        ] {
+            assert!(is_video_generation_path(path), "{path}");
+        }
+
+        // 近似但不同的路径不能被顺手放进来
+        for path in ["/videos", "/videos/t-1", "/v1/video", "/v1/videosx", "/v2/videos"] {
+            assert!(!is_video_generation_path(path), "{path}");
+        }
+    }
+
+    /// **上游**路径不能影响能力推导 —— 这是两个不同的谓词，不能合并。
+    ///
+    /// Sora 方言的上游提交路径恰好就是 `/v1/videos`，可灵的是
+    /// `/v1/videos/text2video`，与入站的 OpenAI 原生家族同名。一旦把入站家族塞进
+    /// `requested_video_capability`，这两家的上游请求就会被 `forward_request`
+    /// 当成入站视频端点，在能力过滤那一步要求 `video.generate` 并按 `model`
+    /// 字段匹配；而可灵的上游体用的是 `model_name`、没有 `model` 字段，匹配必然
+    /// 落空，账号被全部筛掉，报出来的是
+    /// `route_pool.model_unmatched: ... model 'unknown'`。
+    ///
+    /// 这条测试就是那次回归的守卫（真实踩过：两个端到端视频测试同时挂掉）。
+    #[test]
+    fn upstream_video_paths_do_not_imply_a_capability() {
+        use super::requested_video_capability;
+
+        for path in [
+            // Sora 方言的上游提交与状态路径
+            "/v1/videos",
+            "/v1/videos/abc",
+            // 可灵方言的上游提交与状态路径
+            "/v1/videos/text2video",
+            "/v1/videos/image2video",
+            "/v1/videos/text2video/t-1",
+            // 其余三家的上游路径
+            "/api/v3/contents/generations/tasks",
+            "/api/v3/contents/generations/tasks/t-1",
+            "/v1/video_generation",
+            "/v1/query/video_generation",
+            "/v4/videos/generations",
+            "/v4/async-result/t-1",
+        ] {
+            assert_eq!(requested_video_capability(path), None, "{path}");
+        }
+
+        // 只有入站的 new-api 家族带能力（`forward_request` 靠它推导要什么能力）
+        assert_eq!(
+            requested_video_capability("/v1/video/generations"),
+            Some("video.generate")
+        );
+        assert_eq!(
+            requested_video_capability("/v1/video/generations/t-1"),
+            Some("video.generate")
+        );
+    }
+}
+
+fn is_models_list_path(path: &str) -> bool {
+    matches!(path.trim().trim_end_matches('/'), "/models" | "/v1/models")
+}
+
+fn build_models_list_payload(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+) -> Value {
+    build_models_list_payload_with_baseline(platform, credentials, mode, None)
+}
+
+/// 模型 id（展示名）→ 该模型映射声明的媒体能力并集。
+///
+/// 纯文本模型不进这张表 —— 客户端看到空 `capabilities` 即「文本模型」。
+fn declared_capabilities_by_model(credentials: &[SelectedCredential]) -> std::collections::HashMap<String, Vec<String>> {
+    let mut declared: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for credential in credentials {
+        let capability =
+            parse_model_capability_value(&serde_json::from_str::<Value>(&credential.config_json).unwrap_or(Value::Null));
+        for mapping in &capability.mappings {
+            let from = mapping.from.trim();
+            if from.is_empty() {
+                continue;
+            }
+            let entry = declared.entry(from.to_string()).or_default();
+            for capability in &mapping.capabilities {
+                let capability = capability.trim();
+                if !capability.is_empty()
+                    && !entry.iter().any(|existing| existing == capability)
+                {
+                    entry.push(capability.to_string());
+                }
+            }
+        }
+    }
+    declared
+}
+
+fn build_models_list_payload_with_baseline(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+) -> Value {
+    let created = Utc::now().timestamp();
+    let declared = declared_capabilities_by_model(credentials);
+    let inputs = credentials
+        .iter()
+        .map(|credential| CatalogMemberInput {
+            id: &credential.id,
+            display_name: &credential.display_name,
+            kind: &credential.kind,
+            config_json: &credential.config_json,
+        })
+        .collect::<Vec<_>>();
+    let members = catalog_members(&inputs);
+    let data: Vec<Value> = advertised_model_catalog_entries_with_baseline_and_capability(
+        platform,
+        &members,
+        mode,
+        baseline_models,
+        // **不再按模态过滤**。曾经「视频平台只列视频模型」成立，是因为模态就是
+        // 平台；现在一个池里同时挂着文本、生图、视频、TTS 的模型，没有「单一
+        // 正确答案」可言 —— 这与图像当初的判断一致（图像与文本共用一个平台，
+        // 所以 `/v1/models` 对它也从不做能力过滤）。
+        None,
+    )
+    .into_iter()
+    .map(|entry| {
+            let mut model = json!({
+                "id": entry.id,
+                "object": "model",
+                "created": created,
+                "owned_by": "ai-switch",
+                // 模态声明：映射里写的能力并集；空数组 = 纯文本模型。
+                "capabilities": declared
+                    .get(entry.base_id.as_str())
+                    .or_else(|| declared.get(entry.id.as_str()))
+                    .cloned()
+                    .unwrap_or_default(),
+            });
+            if platform.eq_ignore_ascii_case("codex") {
+                let (supported_reasoning_levels, default_reasoning_level) =
+                    codex_reasoning_metadata(&entry.base_id, entry.reasoning_levels.as_deref());
+                if let Some(object) = model.as_object_mut() {
+                    object.insert(
+                        "supported_reasoning_levels".to_string(),
+                        Value::Array(supported_reasoning_levels),
+                    );
+                    object.insert(
+                        "default_reasoning_level".to_string(),
+                        Value::String(default_reasoning_level),
+                    );
+                    // Always stated, declared or not: the default depends on the
+                    // upstream model this alias points at, which the client has
+                    // no way to work out on its own.
+                    object.insert(
+                        "context_window".to_string(),
+                        json!(codex_effective_context_window(
+                            entry.context_window,
+                            &entry.upstream_model
+                        )),
+                    );
+                }
+            }
+            model
+        })
+        .collect();
+
+    json!({
+        "object": "list",
+        "data": data,
+    })
+}
+
+fn build_route_models_list_payload(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+) -> Value {
+    build_route_models_list_payload_with_baseline(platform, credentials, mode, None)
+}
+
+fn build_route_models_list_payload_with_baseline(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+) -> Value {
+    build_models_list_payload_with_baseline(platform, credentials, mode, baseline_models)
+}
+
+fn json_models_list_response(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+    _query: Option<&str>,
+) -> Response {
+    json_models_list_response_with_baseline(platform, credentials, mode, _query, None)
+}
+
+/// `type` 查询参数 → 能力过滤。`text` = 无任何媒体能力声明。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ModelsTypeFilter {
+    All,
+    Text,
+    Media(&'static str),
+}
+
+fn models_type_capability(query: Option<&str>) -> Result<ModelsTypeFilter, String> {
+    let Some(query) = query else {
+        return Ok(ModelsTypeFilter::All);
+    };
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("type") {
+            continue;
+        }
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(ModelsTypeFilter::Text),
+            "image" => Ok(ModelsTypeFilter::Media("image.generate")),
+            "video" => Ok(ModelsTypeFilter::Media("video.generate")),
+            "audio" => Ok(ModelsTypeFilter::Media("audio.generate")),
+            other => Err(other.to_string()),
+        };
+    }
+    Ok(ModelsTypeFilter::All)
+}
+
+fn json_models_list_response_with_baseline(
+    platform: &str,
+    credentials: &[SelectedCredential],
+    mode: PoolModelMode,
+    query: Option<&str>,
+    baseline_models: Option<&[String]>,
+) -> Response {
+    let requested = match models_type_capability(query) {
+        Ok(requested) => requested,
+        Err(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                json!({
+                    "error": {
+                        "code": "route_proxy.unknown_model_type",
+                        "message": format!("Unknown models type '{other}'; supported: text, image, video, audio"),
+                        "type": "route_proxy_error",
+                    }
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let payload = build_route_models_list_payload_with_baseline(
+        platform,
+        credentials,
+        mode,
+        baseline_models,
+    );
+    // text 过滤需要看 capabilities 本身；其余按能力匹配。
+    let mut payload = payload;
+    if let Some(data) = payload["data"].as_array().cloned() {
+        let kept: Vec<Value> = data
+            .into_iter()
+            .filter(|entry| {
+                let empty = Vec::new();
+                let declared = entry["capabilities"].as_array().unwrap_or(&empty);
+                match requested {
+                    ModelsTypeFilter::All => true,
+                    ModelsTypeFilter::Text => declared.is_empty(),
+                    ModelsTypeFilter::Media(required) => declared
+                        .iter()
+                        .any(|item| item.as_str() == Some(required)),
+                }
+            })
+            .collect();
+        payload["data"] = json!(kept);
+    }
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        payload.to_string(),
+    )
+        .into_response()
+}
+
+fn json_count_tokens_response(body: &[u8]) -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        json!({ "input_tokens": estimate_anthropic_input_tokens(body) }).to_string(),
+    )
+        .into_response()
+}
+
+/// Rough token estimate over the text content of an Anthropic request: counts
+/// `system`, every message's text, and tool schemas at ~4 characters per token.
+fn estimate_anthropic_input_tokens(body: &[u8]) -> i64 {
+    const CHARS_PER_TOKEN: i64 = 4;
+
+    fn text_len(value: &Value) -> i64 {
+        match value {
+            Value::String(text) => text.chars().count() as i64,
+            Value::Array(items) => items.iter().map(text_len).sum(),
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, nested)| match key.as_str() {
+                    // Base64 payloads are not text; skip them rather than
+                    // inflating the estimate by megabytes of encoded bytes.
+                    "data" if nested.is_string() => 0,
+                    _ => text_len(nested),
+                })
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return 0;
+    };
+    let chars: i64 = ["system", "messages", "tools", "tool_choice"]
+        .iter()
+        .filter_map(|key| value.get(*key))
+        .map(text_len)
+        .sum();
+    // Always report at least 1 token for a non-empty request so clients do not
+    // read the estimate as "no context".
+    (chars / CHARS_PER_TOKEN).max(i64::from(chars > 0))
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> Result<(), String> {
+    let value =
+        HeaderValue::from_str(value).map_err(|err| format!("Invalid header value: {err}"))?;
+    headers.insert(HeaderName::from_static(name), value);
+    Ok(())
+}
+
+/// Insert a header only when the client did not already provide it, so a real
+/// CLI's own values still win when routing through the proxy.
+fn fill_header_if_absent(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    let Ok(value) = HeaderValue::from_str(value) else {
+        return;
+    };
+    headers
+        .entry(HeaderName::from_static(name))
+        .or_insert(value);
+}
+
+/// True when the request already carries an Anthropic SDK identity.
+///
+/// Anthropic's SDK is Stainless-generated and tags every request with
+/// `x-stainless-*`. Their presence means the caller is a genuine SDK client —
+/// Claude Code among them — already carrying a complete, self-consistent identity.
+fn has_stainless_sdk_identity(headers: &HeaderMap) -> bool {
+    headers
+        .keys()
+        .any(|name| name.as_str().starts_with("x-stainless-"))
+}
+
+/// Make an Anthropic-dialect upstream request look like Claude Code: guarantee
+/// the `claude-code-*` beta marker, and own the CLI identity headers whenever the
+/// caller does not already have an SDK identity of its own.
+///
+/// Identity is applied all-or-nothing. Filling only the gaps used to splice our
+/// hardcoded versions into a real client's set — a request would claim
+/// `x-stainless-package-version: 0.70.0` from us alongside the caller's newer
+/// runtime and `user-agent`, a combination no real client emits. A gateway that
+/// fingerprints clients (agentrouter.org rejects with `unauthorized client
+/// detected`) sees that as more suspicious than either identity alone, which is
+/// why routing through the pool failed where a direct per-account test — starting
+/// from an empty header map, so every value came from us — succeeded.
+fn apply_claude_code_identity(headers: &mut HeaderMap) {
+    // Merged either way: the beta marker is a capability signal rather than part
+    // of the identity set, and gateways gate on it. A plain SDK caller that omits
+    // it still ends up in Claude Code's shape, since Claude Code is itself an SDK
+    // client carrying this marker.
+    let existing_beta = headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok());
+    if let Some(merged) = client_identity::merge_claude_code_beta(existing_beta) {
+        if let Ok(value) = HeaderValue::from_str(&merged) {
+            headers.insert(HeaderName::from_static("anthropic-beta"), value);
+        }
+    }
+
+    // The caller brought its own coherent identity; adding ours would only
+    // contradict it.
+    if has_stainless_sdk_identity(headers) {
+        return;
+    }
+
+    for (name, value) in client_identity::claude_code_identity_headers() {
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.insert(HeaderName::from_static(name), value);
+    }
+}
+
+/// Make a *bridged* Anthropic request look like Claude Code in the body, not just
+/// in the headers.
+///
+/// Relays running sub2api's `claude_code_only` group gate score the request's
+/// `system` against [`client_identity::CLAUDE_CODE_SYSTEM_PROMPT`] and parse
+/// `metadata.user_id`; header spoofing alone does not pass. Claude Code sends
+/// both, so the passthrough path needs nothing — but a Codex or chat-only client
+/// sends its own instructions and no metadata at all, which is why such a relay
+/// answers `this group only allows Claude Code clients` for every request from
+/// the codex platform while the same account works from the claude platform.
+///
+/// The connectivity probe has seeded these two fields since the gate was found
+/// (see `route_model_test_service::codex_probe_body`), which is what makes the
+/// failure so confusing: the account tests green and then fails on real traffic.
+///
+/// Claude Code splits its own prompt into a bare signature block followed by the
+/// real instructions, so the signature goes in as its own leading block rather
+/// than being merged into the client's text. That matches the shape the gate
+/// scores and leaves the client's own instructions intact and dominant.
+fn apply_claude_code_body_identity(body: &[u8], credential_id: &str) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.to_vec();
+    };
+    prepend_claude_code_system_signature(object);
+    ensure_claude_code_metadata_user_id(object, credential_id);
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Put Claude Code's signature block at the head of `system`, unless the client
+/// already sent it.
+fn prepend_claude_code_system_signature(object: &mut serde_json::Map<String, Value>) {
+    let signature = json!({"type": "text", "text": client_identity::CLAUDE_CODE_SYSTEM_PROMPT});
+    let mut blocks = match object.remove("system") {
+        // Anthropic accepts a plain string too; promoting it to a block array is
+        // what lets the signature sit in front of it.
+        Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
+        Some(Value::Array(blocks)) => blocks,
+        _ => Vec::new(),
+    };
+    let already_signed = blocks
+        .first()
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            text.trim_start()
+                .starts_with(client_identity::CLAUDE_CODE_SYSTEM_PROMPT)
+        });
+    if !already_signed {
+        blocks.insert(0, signature);
+    }
+    object.insert("system".to_string(), Value::Array(blocks));
+}
+
+/// Fill `metadata.user_id` with a gate-parseable value, keeping whatever the
+/// client sent.
+///
+/// The device id is derived from the account id so it stays put across requests,
+/// while the session id is fresh per request — the gate only parses the shape,
+/// and no client-side session identifier survives the bridge to key it on.
+fn ensure_claude_code_metadata_user_id(
+    object: &mut serde_json::Map<String, Value>,
+    credential_id: &str,
+) {
+    let has_user_id = object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|user_id| !user_id.trim().is_empty());
+    if has_user_id {
+        return;
+    }
+    let user_id = json!(client_identity::claude_code_metadata_user_id(credential_id));
+    match object.get_mut("metadata").and_then(Value::as_object_mut) {
+        Some(metadata) => {
+            metadata.insert("user_id".to_string(), user_id);
+        }
+        None => {
+            object.insert("metadata".to_string(), json!({"user_id": user_id}));
+        }
+    }
+}
+
+/// True when the client asked for the 1M context window.
+///
+/// Claude Code signals this by appending `[1M]` to the model value it sends. The
+/// mapping lookup strips that suffix (so `claude-opus-alias[1m]` still resolves
+/// to the account's upstream model), which means the intent has to be read from
+/// the inbound body before any rewriting.
+fn client_requested_one_m_context(body: &[u8]) -> bool {
+    requested_model_from_body(body).is_some_and(|model| {
+        model
+            .trim_end()
+            .to_ascii_lowercase()
+            .ends_with(&CLAUDE_ONE_M_SUFFIX.to_ascii_lowercase())
+    })
+}
+
+/// Merge the 1M-context beta marker into `anthropic-beta`, preserving whatever
+/// the client already sent.
+fn apply_one_m_context_beta(headers: &mut HeaderMap) {
+    let existing = headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok());
+    if let Some(merged) = client_identity::merge_one_m_context_beta(existing) {
+        if let Ok(value) = HeaderValue::from_str(&merged) {
+            headers.insert(HeaderName::from_static("anthropic-beta"), value);
+        }
+    }
+}
+
+/// Whether the Codex CLI identity may be claimed on this credential's requests.
+///
+/// A credential that pins its own `User-Agent` already has an identity, and one that
+/// is not Codex-shaped cannot be talked into passing a Codex gate anyway — the gate
+/// reads the engine version out of the UA. Stamping `originator` and an engine
+/// fingerprint beside it would only build the half-Codex request that gets refused,
+/// and would break a relay-side allowlist keyed on that exact client. So a pinned
+/// foreign identity is left to stand on its own.
+fn may_impersonate_codex_cli(config: &Value) -> bool {
+    match credential_user_agent(config) {
+        Some(user_agent) => client_identity::codex_paired_originator(user_agent).is_some(),
+        None => true,
+    }
+}
+
+/// Make an OpenAI/Responses-dialect upstream request look like the Codex CLI.
+///
+/// Identity is all-or-nothing, for the same reason it is on the Anthropic side
+/// (see [`apply_claude_code_identity`]): a real Codex client already carries a
+/// coherent set, and anything else has to be replaced outright rather than topped
+/// up. Filling in only `originator` next to a foreign `user-agent` is what makes a
+/// relay answer `This account only allows Codex official clients` — sub2api
+/// accepts the request as official on the originator, then reads the engine
+/// version out of the UA, finds `claude-cli/2.1.2` or `python-requests/2.32`, and
+/// refuses.
+///
+/// The `x-codex-*` fingerprint is a separate gate: the engine stamps it on every
+/// inference request, and sub2api requires one such header by default. Nothing
+/// bridged from another protocol carries it, which is how an account can serve the
+/// claude platform happily and 403 on every codex-platform turn.
+fn apply_codex_cli_identity(headers: &mut HeaderMap, credential_id: &str) {
+    match codex_client_originator(headers) {
+        // A real Codex client: keep its own UA and version, and pair the originator
+        // it left out rather than inventing an unrelated one.
+        Some(originator) => fill_header_if_absent(headers, "originator", &originator),
+        None => replace_client_identity_with_codex_cli(headers),
+    }
+    ensure_codex_engine_fingerprint(headers, credential_id);
+}
+
+/// The originator that pairs with the caller's `user-agent`, when the caller is a
+/// real Codex client.
+fn codex_client_originator(headers: &HeaderMap) -> Option<String> {
+    let user_agent = headers.get("user-agent")?.to_str().ok()?;
+    client_identity::codex_paired_originator(user_agent)
+}
+
+/// Overwrite the caller's client identity with the Codex CLI's own.
+fn replace_client_identity_with_codex_cli(headers: &mut HeaderMap) {
+    for (name, value) in client_identity::codex_cli_identity_headers() {
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            continue;
+        };
+        headers.insert(HeaderName::from_static(name), value);
+    }
+    // One request cannot claim two clients. An Anthropic client bridged onto a
+    // Responses upstream would otherwise arrive as the Codex CLI still wearing
+    // Claude Code's SDK headers — a combination no real client emits, and the kind
+    // of contradiction that gets a request rejected as an unknown client.
+    let foreign: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            name.starts_with("x-stainless-") || name.starts_with("anthropic-") || name == "x-app"
+        })
+        .cloned()
+        .collect();
+    for name in foreign {
+        headers.remove(name);
+    }
+}
+
+/// Stamp the engine fingerprint the gate looks for, unless the caller brought one.
+///
+/// A real client's own `x-codex-*` headers are left alone: they carry its window
+/// and installation ids, and a second opinion from us would only contradict them.
+fn ensure_codex_engine_fingerprint(headers: &mut HeaderMap, credential_id: &str) {
+    if headers.keys().any(|name| {
+        name.as_str()
+            .starts_with(client_identity::CODEX_ENGINE_HEADER_PREFIX)
+    }) {
+        return;
+    }
+    let window_id = client_identity::codex_engine_window_id(credential_id);
+    if let Ok(value) = HeaderValue::from_str(&window_id) {
+        headers.insert(
+            HeaderName::from_static(client_identity::CODEX_WINDOW_ID_HEADER),
+            value,
+        );
+    }
+}
+
+/// Append `key=value` to the URL query only when the key is not already present.
+fn ensure_query_flag(url: &str, key: &str, value: &str) -> String {
+    let already_present = url.split(['?', '&']).skip(1).any(|part| {
+        let part_key = part.split_once('=').map(|(k, _)| k).unwrap_or(part);
+        part_key == key
+    });
+    if already_present {
+        url.to_string()
+    } else {
+        append_query_param(url, key, value)
+    }
+}
+
+/// Anthropic messages endpoint detection (`/v1/messages`, `/messages`).
+fn is_messages_path(path: &str) -> bool {
+    let normalized = path.trim().trim_end_matches('/');
+    normalized.ends_with("/messages") || normalized == "messages"
+}
+
+/// Where an official (subscription) credential goes when its config names no
+/// `base_url`.
+///
+/// Codex is the one that trips people up: an official Codex account is a ChatGPT
+/// subscription, and ChatGPT seats are served by `chatgpt.com/backend-api/codex`,
+/// not by the Platform API. `api.openai.com` authenticates *API keys* and judges
+/// them by scope, so it answers an OAuth token with `insufficient permissions ...
+/// Missing scopes: api.responses.write` — a verdict on a key the account does not
+/// have. That reads as a broken account, and the account looks fine in any tool
+/// that talks to the right host. Unlike Anthropic, OpenAI does not serve both
+/// auth modes from one host, so the default has to follow the credential kind.
+fn default_official_base_url(platform: PlatformId) -> Result<&'static str, String> {
+    match platform {
+        PlatformId::Codex => Ok(CODEX_CHATGPT_BACKEND_BASE_URL),
+        // Anthropic serves OAuth and API keys from the same host.
+        PlatformId::Claude => Ok("https://api.anthropic.com"),
+        // CLIProxyAPI xAI official API base for Grok.
+        PlatformId::Grok => Ok("https://api.x.ai/v1"),
+        PlatformId::Gemini => Ok("https://generativelanguage.googleapis.com"),
+        PlatformId::OpenCode | PlatformId::OpenClaw | PlatformId::Hermes => {
+            Err("capability.unavailable: official account routing is unavailable".to_string())
+        }
+    }
+}
+
+fn format_app_error(error: AppError) -> String {
+    let error = ApiError::from(error);
+    format!("{}: {}", error.code, error.message)
+}
+
+fn append_query_param(url: &str, key: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{key}={value}")
+}
+
+fn merge_query_parts(original: Option<&str>, bridge: Option<&str>) -> Option<String> {
+    match (
+        original.map(str::trim).filter(|value| !value.is_empty()),
+        bridge.map(str::trim).filter(|value| !value.is_empty()),
+    ) {
+        (Some(left), Some(right)) => Some(format!("{left}&{right}")),
+        (Some(left), None) => Some(left.to_string()),
+        (None, Some(right)) => Some(right.to_string()),
+        (None, None) => None,
+    }
+}
+
+pub fn build_target_url(base_url: &str, path: &str, query: Option<&str>) -> String {
+    let base = collapse_duplicate_terminal_version_segments(base_url.trim().trim_end_matches('/'));
+    let normalized_path = if path.is_empty() {
+        "".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let upstream_path = upstream_path_for_base(&base, &normalized_path);
+    let mut url = format!("{base}{upstream_path}");
+    if let Some(query) = query {
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(query);
+        }
+    }
+    url
+}
+
+fn collapse_duplicate_terminal_version_segments(base_url: &str) -> String {
+    let mut base = base_url.to_string();
+    loop {
+        let trimmed_len = base.trim_end_matches('/').len();
+        if trimmed_len != base.len() {
+            base.truncate(trimmed_len);
+        }
+        let Some(last_slash_index) = base.rfind('/') else {
+            return base;
+        };
+        let last_segment = &base[last_slash_index + 1..];
+        if !is_version_path_segment(last_segment) {
+            return base;
+        }
+        let prefix = &base[..last_slash_index];
+        let Some(previous_segment) = base_last_path_segment(prefix) else {
+            return base;
+        };
+        if !previous_segment.eq_ignore_ascii_case(last_segment) {
+            return base;
+        }
+        base.truncate(last_slash_index);
+    }
+}
+
+fn upstream_path_for_base(base_url: &str, path: &str) -> String {
+    let first_segment = match first_path_segment(path) {
+        Some(segment) => segment,
+        None => return String::new(),
+    };
+    let base_last_segment = base_last_path_segment(base_url);
+    let should_strip_duplicate_version =
+        base_last_segment.is_some_and(|segment| segment.eq_ignore_ascii_case(first_segment));
+    let should_strip_codex_proxy_version =
+        first_segment.eq_ignore_ascii_case("v1") && is_codex_backend_base_url(base_url);
+
+    if should_strip_duplicate_version {
+        strip_leading_matching_path_segments(path, first_segment)
+    } else if should_strip_codex_proxy_version {
+        strip_first_path_segment(path)
+    } else {
+        path.to_string()
+    }
+}
+
+fn first_path_segment(path: &str) -> Option<&str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .find(|segment| !segment.is_empty())
+}
+
+fn strip_first_path_segment(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    match trimmed.split_once('/') {
+        Some((_, rest)) if !rest.is_empty() => format!("/{rest}"),
+        _ => String::new(),
+    }
+}
+
+fn strip_leading_matching_path_segments(path: &str, segment: &str) -> String {
+    let mut remaining = path.trim_start_matches('/');
+    while let Some(first) = remaining.split('/').next() {
+        if !first.eq_ignore_ascii_case(segment) {
+            break;
+        }
+        remaining = remaining[first.len()..].trim_start_matches('/');
+    }
+    if remaining.is_empty() {
+        String::new()
+    } else {
+        format!("/{remaining}")
+    }
+}
+
+fn base_last_path_segment(base_url: &str) -> Option<&str> {
+    let after_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let path = after_scheme.split_once('/').map(|(_, path)| path)?;
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .next_back()
+}
+
+fn is_codex_backend_base_url(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("/backend-api/codex")
+}
+
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+    )
+}
+
+const PRICE_MICRO_SCALE: f64 = 1_000_000.0;
+
+pub fn extract_usage_breakdown(body: &[u8]) -> RouteUsageBreakdown {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => usage_breakdown_from_value(&value),
+        // A streaming response body is SSE text, not a single JSON document, so
+        // whole-body parsing always fails for it. Claude Code and Codex stream by
+        // default, so without this fallback the vast majority of real requests
+        // persist NULL tokens and NULL price.
+        Err(_) => usage_breakdown_from_sse(body),
+    }
+}
+
+/// Fill in a locally estimated price when the upstream returned none.
+///
+/// Anthropic, OpenAI, and Gemini all report token counts but no price, so
+/// without this the recorded amount is always zero — the "cost is always 0"
+/// symptom. The estimate is tagged `price_source = "estimated"` so it is never
+/// confused with a real upstream charge, and an unknown model is left unpriced
+/// rather than being silently treated as free.
+pub fn apply_estimated_price(usage: &mut RouteUsageBreakdown, model: Option<&str>) {
+    use crate::services::model_pricing::{self, PriceSource, TokenUsage};
+
+    if usage.price_usd_micros.is_some() || usage.price_cny_micros.is_some() {
+        usage.price_source = Some(PriceSource::Upstream.as_str().to_string());
+        return;
+    }
+
+    let Some(model) = model else {
+        return;
+    };
+    // Cache tokens are reported as a single total by most upstreams, without
+    // splitting writes from reads. Charging them at the cheaper read rate keeps
+    // the estimate a lower bound instead of inflating it.
+    let token_usage = TokenUsage {
+        input_tokens: usage.input_tokens.unwrap_or(0),
+        output_tokens: usage.output_tokens.unwrap_or(0),
+        cache_write_tokens: 0,
+        cache_read_tokens: usage.cache_tokens.unwrap_or(0),
+    };
+    if token_usage.input_tokens <= 0
+        && token_usage.output_tokens <= 0
+        && token_usage.cache_read_tokens <= 0
+    {
+        return;
+    }
+
+    if let Some(cost) = model_pricing::estimate_cost_micros(model, token_usage) {
+        usage.price_usd_micros = Some(cost);
+        usage.price_currency = Some("usd".to_string());
+        usage.price_source = Some(PriceSource::Estimated.as_str().to_string());
+    }
+}
+
+/// The model name a response reports, checked across the JSON body and, for a
+/// streaming reply, its SSE frames.
+///
+/// Used to price a request when the caller has no model in scope. The upstream's
+/// own value is also the right one to bill against, since a gateway may serve a
+/// different model than the one requested.
+pub fn extract_response_model(body: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return response_model_from_value(&value);
+    }
+    crate::services::route_protocol_bridge::sse::parse_sse_data_records_lossy(body)
+        .iter()
+        .find_map(response_model_from_value)
+}
+
+pub(crate) fn response_model_from_value(value: &Value) -> Option<String> {
+    [
+        value.get("model"),
+        value.pointer("/message/model"),
+        value.pointer("/response/model"),
+        value.pointer("/modelVersion"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::trim)
+    .filter(|model| !model.is_empty())
+    .map(str::to_string)
+}
+
+/// Merge per-frame usage from an SSE body.
+///
+/// Providers spread usage across frames differently: OpenAI reports it only in
+/// the final chunk, while Anthropic splits it between `message_start` (input and
+/// cache tokens) and `message_delta` (output tokens). Taking the last non-empty
+/// value per field — rather than summing — covers both without double counting
+/// the cumulative totals that Anthropic and Gemini resend on every frame.
+fn usage_breakdown_from_sse(body: &[u8]) -> RouteUsageBreakdown {
+    let mut merged = RouteUsageBreakdown::default();
+    for frame in crate::services::route_protocol_bridge::sse::parse_sse_data_records_lossy(body) {
+        merged.merge_from(usage_breakdown_from_value(&frame));
+    }
+    merged
+}
+
+pub(crate) fn usage_breakdown_from_value(value: &Value) -> RouteUsageBreakdown {
+    // Anthropic's `message_start` nests usage under `message`, and the OpenAI
+    // Responses API nests it under `response`, so accept either alongside the
+    // top-level field used by non-streaming replies.
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/message/usage"))
+        .or_else(|| value.pointer("/response/usage"));
+    let usage_metadata = value
+        .get("usageMetadata")
+        .or_else(|| value.pointer("/response/usageMetadata"));
+
+    let input_tokens = first_non_negative_i64(&[
+        usage.and_then(|item| item.get("input_tokens")),
+        usage.and_then(|item| item.get("prompt_tokens")),
+        usage_metadata.and_then(|item| item.get("promptTokenCount")),
+    ]);
+    let output_tokens = first_non_negative_i64(&[
+        usage.and_then(|item| item.get("output_tokens")),
+        usage.and_then(|item| item.get("completion_tokens")),
+        usage_metadata.and_then(|item| item.get("candidatesTokenCount")),
+    ]);
+    let cache_tokens = first_non_negative_i64(&[
+        usage.and_then(|item| item.pointer("/input_tokens_details/cached_tokens")),
+        usage.and_then(|item| item.pointer("/prompt_tokens_details/cached_tokens")),
+        usage.and_then(|item| item.get("prompt_cache_hit_tokens")),
+    ])
+    .or_else(|| {
+        sum_non_negative_i64(
+            usage.and_then(|item| item.get("cache_read_input_tokens")),
+            usage.and_then(|item| item.get("cache_creation_input_tokens")),
+        )
+    })
+    .or_else(|| {
+        first_non_negative_i64(&[
+            usage_metadata.and_then(|item| item.get("cachedContentTokenCount"))
+        ])
+    });
+
+    let (price_usd_micros, price_cny_micros, price_currency) = extract_prices(value, usage);
+
+    RouteUsageBreakdown {
+        input_tokens,
+        output_tokens,
+        cache_tokens,
+        price_usd_micros,
+        price_cny_micros,
+        price_currency,
+        // Set later by `apply_estimated_price`, which is the only place that can
+        // tell an upstream price from a locally computed one.
+        price_source: None,
+    }
+}
+
+pub fn extract_token_count(body: &[u8]) -> Option<i64> {
+    let usage = extract_usage_breakdown(body);
+    let total = match (usage.input_tokens, usage.output_tokens) {
+        (Some(input), Some(output)) => Some(input.saturating_add(output)),
+        (Some(input), None) => Some(input),
+        (None, Some(output)) => Some(output),
+        (None, None) => total_tokens_fallback(body),
+    };
+
+    total.filter(|value| *value > 0)
+}
+
+/// Last-resort total: some gateways report only `usage.total_tokens`.
+/// Checks the whole body first, then each SSE frame for streaming replies.
+fn total_tokens_fallback(body: &[u8]) -> Option<i64> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return total_tokens_from_value(&value);
+    }
+    crate::services::route_protocol_bridge::sse::parse_sse_data_records_lossy(body)
+        .iter()
+        .rev()
+        .find_map(total_tokens_from_value)
+}
+
+fn total_tokens_from_value(value: &Value) -> Option<i64> {
+    first_non_negative_i64(&[
+        value.pointer("/usage/total_tokens"),
+        value.pointer("/message/usage/total_tokens"),
+        value.pointer("/response/usage/total_tokens"),
+    ])
+}
+
+pub fn extract_cost_micros(body: &[u8]) -> Option<i64> {
+    extract_usage_breakdown(body).price_usd_micros
+}
+
+fn first_non_negative_i64(values: &[Option<&Value>]) -> Option<i64> {
+    values.iter().find_map(|value| value.and_then(json_i64))
+}
+
+fn sum_non_negative_i64(first: Option<&Value>, second: Option<&Value>) -> Option<i64> {
+    match (first.and_then(json_i64), second.and_then(json_i64)) {
+        (Some(first), Some(second)) => Some(first.saturating_add(second)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
+    let parsed = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+        })?;
+    (parsed >= 0).then_some(parsed)
+}
+
+fn extract_prices(
+    value: &Value,
+    usage: Option<&Value>,
+) -> (Option<i64>, Option<i64>, Option<String>) {
+    let explicit_currency = first_present(&[
+        usage.and_then(|item| item.get("price_currency")),
+        usage.and_then(|item| item.get("currency")),
+        usage.and_then(|item| item.get("unit")),
+        value.get("price_currency"),
+        value.get("currency"),
+        value.get("unit"),
+    ])
+    .and_then(normalize_price_currency);
+
+    let usd_micros = first_present(&[
+        usage.and_then(|item| item.get("price_usd_micros")),
+        usage.and_then(|item| item.get("cost_usd_micros")),
+        usage.and_then(|item| item.get("cost_micros")),
+        value.get("price_usd_micros"),
+        value.get("cost_usd_micros"),
+        value.get("cost_micros"),
+    ])
+    .and_then(|item| price_micros(item, true))
+    .or_else(|| {
+        first_present(&[
+            usage.and_then(|item| item.get("price_usd")),
+            usage.and_then(|item| item.get("cost_usd")),
+            value.get("price_usd"),
+            value.get("cost_usd"),
+        ])
+        .and_then(|item| price_micros(item, false))
+    });
+    let cny_micros = first_present(&[
+        usage.and_then(|item| item.get("price_cny_micros")),
+        usage.and_then(|item| item.get("cost_cny_micros")),
+        value.get("price_cny_micros"),
+        value.get("cost_cny_micros"),
+    ])
+    .and_then(|item| price_micros(item, true))
+    .or_else(|| {
+        first_present(&[
+            usage.and_then(|item| item.get("price_cny")),
+            usage.and_then(|item| item.get("cost_cny")),
+            value.get("price_cny"),
+            value.get("cost_cny"),
+        ])
+        .and_then(|item| price_micros(item, false))
+    });
+
+    let generic_price = first_present(&[
+        usage.and_then(|item| item.get("price")),
+        usage.and_then(|item| item.get("cost")),
+        value.get("price"),
+        value.get("cost"),
+    ]);
+    let generic_currency = generic_price
+        .and_then(price_object_currency)
+        .or(explicit_currency);
+    let generic_unit = generic_price.and_then(price_object_unit).or_else(|| {
+        first_present(&[
+            usage.and_then(|item| item.get("price_unit")),
+            usage.and_then(|item| item.get("unit")),
+            value.get("price_unit"),
+            value.get("unit"),
+        ])
+        .and_then(|item| item.as_str())
+    });
+    let generic_micros = generic_price.and_then(|item| {
+        price_micros(
+            item,
+            generic_unit.is_some_and(|unit| unit.contains("micro")),
+        )
+    });
+
+    let mut price_usd_micros = usd_micros;
+    let mut price_cny_micros = cny_micros;
+    if price_usd_micros.is_none() && generic_currency == Some("usd") {
+        price_usd_micros = generic_micros;
+    }
+    if price_cny_micros.is_none() && generic_currency == Some("cny") {
+        price_cny_micros = generic_micros;
+    }
+
+    let price_currency = explicit_currency
+        .or(generic_currency)
+        .or_else(
+            || match (price_usd_micros.is_some(), price_cny_micros.is_some()) {
+                (true, false) => Some("usd"),
+                (false, true) => Some("cny"),
+                _ => None,
+            },
+        )
+        .map(str::to_string);
+
+    (price_usd_micros, price_cny_micros, price_currency)
+}
+
+fn first_present<'a>(values: &[Option<&'a Value>]) -> Option<&'a Value> {
+    values.iter().copied().flatten().next()
+}
+
+fn price_micros(value: &Value, already_micros: bool) -> Option<i64> {
+    let raw = value
+        .as_f64()
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+        })
+        .or_else(|| {
+            value.as_object().and_then(|object| {
+                ["amount", "value", "number"]
+                    .iter()
+                    .find_map(|key| object.get(*key))
+                    .and_then(|item| {
+                        item.as_f64().or_else(|| {
+                            item.as_str()
+                                .and_then(|text| text.trim().parse::<f64>().ok())
+                        })
+                    })
+            })
+        })?;
+    if !raw.is_finite() || raw < 0.0 {
+        return None;
+    }
+    let scaled = if already_micros {
+        raw
+    } else {
+        raw * PRICE_MICRO_SCALE
+    };
+    if !scaled.is_finite() || scaled > i64::MAX as f64 {
+        return None;
+    }
+    Some(scaled.round() as i64)
+}
+
+fn price_object_currency(value: &Value) -> Option<&'static str> {
+    value
+        .as_object()
+        .and_then(|object| object.get("currency").or_else(|| object.get("unit")))
+        .and_then(normalize_price_currency)
+}
+
+fn price_object_unit(value: &Value) -> Option<&str> {
+    value.as_object().and_then(|object| {
+        object
+            .get("unit")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("currency").and_then(Value::as_str))
+    })
+}
+
+fn normalize_price_currency(value: &Value) -> Option<&'static str> {
+    let text = value.as_str()?.trim().to_ascii_lowercase();
+    if text.contains("usd") || text.contains("dollar") || text == "$" {
+        Some("usd")
+    } else if text.contains("cny") || text.contains("rmb") || text.contains("yuan") || text == "¥"
+    {
+        Some("cny")
+    } else {
+        None
+    }
+}
+
+fn restrict_candidates(
+    state: &ProxyAppState,
+    mut candidates: Vec<PoolCandidate>,
+) -> Vec<PoolCandidate> {
+    if let Some(scope) = &state.access_scope {
+        if let Some(allowed) = &scope.credential_ids {
+            candidates.retain(|candidate| allowed.contains(&candidate.credential.id));
+        }
+    }
+    candidates
+}
+
+async fn insert_route_credential_request_event(
+    state: &ProxyAppState,
+    route_credential_id: &str,
+    metadata_json: &str,
+    usage: &RouteUsageBreakdown,
+    upstream_response_id: Option<&str>,
+) -> Result<(), AppError> {
+    RoutePoolRepository::insert_request_event(
+        &state.pool,
+        route_credential_id,
+        "route_proxy",
+        metadata_json,
+        usage,
+        upstream_response_id,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[path = "route_proxy_service/live_responses_test.rs"]
+mod live_responses_test;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod continuation_safety {
+        include!("route_proxy_service/continuation_safety_tests.rs");
+    }
+
+    mod quota_errors {
+        include!("route_proxy_service/quota_error_tests.rs");
+    }
+
+    mod official_codex_bridge {
+        include!("route_proxy_service/official_codex_bridge_tests.rs");
+    }
+
+    mod reasoning_missing_selfheal {
+        include!("route_proxy_service/reasoning_missing_selfheal_tests.rs");
+    }
+
+    mod request_limits {
+        include!("route_proxy_service/request_limit_tests.rs");
+    }
+
+    mod audio_stream {
+        include!("route_proxy_service/audio_stream_tests.rs");
+    }
+
+    // The pre-mode signatures: these assertions are about the aggregated list.
+    fn build_models_list_payload(platform: &str, credentials: &[SelectedCredential]) -> Value {
+        super::build_models_list_payload(platform, credentials, PoolModelMode::Aggregate)
+    }
+
+    fn build_route_models_list_payload(
+        platform: &str,
+        credentials: &[SelectedCredential],
+    ) -> Value {
+        super::build_route_models_list_payload(platform, credentials, PoolModelMode::Aggregate)
+    }
+
+    #[tokio::test]
+    async fn models_payload_declares_capabilities_and_type_query_filters() {
+        // 注：ids 闭包改为 async 块调用（见下）。
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let text = api_credential_with_config(
+            "text-account",
+            r#"{"base_url":"https://api.example.com/v1","interface_format":"openai","model_mappings":[{"from":"gpt-5","to":"up-gpt"}]}"#,
+        );
+        let video = api_credential_with_config(
+            "video-account",
+            r#"{"base_url":"https://api.example.com/v1","interface_format":"kling","model_mappings":[{"from":"kling-v1","to":"kling-v1","capabilities":["video.generate"]}]}"#,
+        );
+        let payload = super::build_models_list_payload_with_baseline(
+            "codex",
+            &[text, video],
+            PoolModelMode::Aggregate,
+            None,
+        );
+        let entries = payload["data"].as_array().expect("data");
+        let find = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .unwrap_or_else(|| panic!("missing {id} in {entries:?}"))
+                .clone()
+        };
+        // 纯文本模型：capabilities 为空数组（文本是默认能力，不用媒体词表伪装）。
+        assert_eq!(find("gpt-5")["capabilities"], json!([]));
+        assert_eq!(find("kling-v1")["capabilities"], json!(["video.generate"]));
+
+        // type 过滤只保留声明了对应能力的模型；text = 无媒体能力。
+        let filter = |query: &str| {
+            super::json_models_list_response_with_baseline(
+                "codex",
+                &[
+                    api_credential_with_config(
+                        "text-account",
+                        r#"{"base_url":"https://api.example.com/v1","interface_format":"openai","model_mappings":[{"from":"gpt-5","to":"up-gpt"}]}"#,
+                    ),
+                    api_credential_with_config(
+                        "video-account",
+                        r#"{"base_url":"https://api.example.com/v1","interface_format":"kling","model_mappings":[{"from":"kling-v1","to":"kling-v1","capabilities":["video.generate"]}]}"#,
+                    ),
+                ],
+                PoolModelMode::Aggregate,
+                Some(query),
+                None,
+            )
+        };
+        async fn ids(response: axum::response::Response) -> Vec<String> {
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            value["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+        let video_only = ids(filter("type=video")).await;
+        assert_eq!(video_only, vec!["kling-v1".to_string()]);
+        let text_only = ids(filter("type=text")).await;
+        assert_eq!(text_only, vec!["gpt-5".to_string()]);
+        let response = filter("type=bogus");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn saved_baseline_models_change_the_models_payload_without_restart() {
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential = api_credential_with_config(
+            "wildcard",
+            r#"{"base_url":"https://api.example.com/v1","interface_format":"openai","model_mappings":[]}"#,
+        );
+
+        RoutePoolRepository::save_baseline_models(
+            &pool,
+            "codex",
+            &["custom-z".to_string(), "custom-a".to_string()],
+        )
+        .await
+        .expect("save baseline models");
+        let baseline_models = RoutePoolRepository::baseline_models(&pool, "codex")
+            .await
+            .expect("load baseline models");
+        let payload = super::build_models_list_payload_with_baseline(
+            "codex",
+            &[credential],
+            PoolModelMode::Aggregate,
+            Some(&baseline_models),
+        );
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["custom-z", "custom-a"]);
+    }
+    use crate::database::{create_memory_pool, run_migrations};
+    use crate::models::route_credential::{
+        DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT, FALLBACK_MODEL_ALIAS,
+    };
+    use crate::models::route_credential_model::{
+        RouteCredentialModelState, MODEL_STATUS_ERROR, MODEL_STATUS_OK, MODEL_STATUS_PAUSED,
+    };
+    use crate::services::route_protocol_bridge::transform_response_with_tool_namespaces;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn flags_bridged_turn_without_tool_call() {
+        let request = br#"{"model":"x","tools":[{"type":"function"}],"input":"hi"}"#;
+        let response =
+            br#"data: {"type":"response.completed","response":{"output":[{"type":"message"}]}}"#;
+        let notes = diagnostic_notes(
+            true,
+            Some("codex"),
+            Some(std::str::from_utf8(request).unwrap()),
+            Some(response),
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("未发起工具调用"));
+    }
+
+    /// A bridged response that DID produce output is streamed as Responses SSE,
+    /// whose `response.created` / `response.in_progress` scaffolding always
+    /// carries `"output":[]`. The empty-output note must key off the terminal
+    /// completed event, not a naive substring that the scaffolding also matches.
+    #[test]
+    fn does_not_flag_bridged_output_when_only_the_scaffolding_is_empty() {
+        let response = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.in_progress\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\"}]}}\n\n",
+        );
+        let notes = diagnostic_notes(
+            true,
+            Some("codex"),
+            Some("{\"input\":\"hi\"}"),
+            Some(response.as_bytes()),
+        );
+        assert!(
+            notes.is_empty(),
+            "a bridged answer with real output must not be flagged as empty: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn flags_bridged_empty_output() {
+        let response = br#"data: {"type":"response.completed","response":{"output":[]}}"#;
+        let notes = diagnostic_notes(true, Some("codex"), Some("{\"tools\":[]}"), Some(response));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("空输出"));
+    }
+
+    /// A buffered (non-SSE) Responses answer carrying real output_text must not
+    /// be flagged, even though nothing streamed.
+    #[test]
+    fn does_not_flag_buffered_json_answer_with_output_text() {
+        let response =
+            br#"{"status":"completed","output":[{"type":"message"}],"output_text":"hi"}"#;
+        let notes = diagnostic_notes(
+            true,
+            Some("codex"),
+            Some("{\"input\":\"x\"}"),
+            Some(response),
+        );
+        assert!(notes.is_empty(), "notes={notes:?}");
+    }
+
+    /// A buffered Responses answer whose output is genuinely empty is flagged.
+    #[test]
+    fn flags_buffered_json_empty_output() {
+        let response = br#"{"status":"completed","output":[],"output_text":""}"#;
+        let notes = diagnostic_notes(
+            true,
+            Some("codex"),
+            Some("{\"input\":\"x\"}"),
+            Some(response),
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("空输出"));
+    }
+
+    /// The empty-output detector understands the Anthropic and Chat shapes the
+    /// Claude and Chat bridges emit, not only the Responses shape.
+    #[test]
+    fn detects_empty_output_across_bridge_shapes() {
+        let anthropic_empty = br#"{"stop_reason":"end_turn","content":[]}"#;
+        assert!(
+            diagnostic_notes(true, Some("claude"), Some("{}"), Some(anthropic_empty))
+                .iter()
+                .any(|note| note.contains("空输出"))
+        );
+
+        let anthropic_answer =
+            br#"{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}"#;
+        assert!(
+            diagnostic_notes(true, Some("claude"), Some("{}"), Some(anthropic_answer)).is_empty()
+        );
+
+        let chat_empty = br#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#;
+        assert!(
+            diagnostic_notes(true, Some("codex"), Some("{}"), Some(chat_empty))
+                .iter()
+                .any(|note| note.contains("空输出"))
+        );
+
+        let chat_answer = br#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        assert!(diagnostic_notes(true, Some("codex"), Some("{}"), Some(chat_answer)).is_empty());
+    }
+
+    #[test]
+    fn redacts_long_instructions_but_keeps_small_tools_and_messages() {
+        let long = "x".repeat(VERBOSE_REQUEST_FIELD_LIMIT + 50);
+        let body = serde_json::to_vec(&json!({
+            "model": "mimo-v2.5-pro",
+            "instructions": long,
+            "tools": [{"type": "function", "name": "lookup"}],
+            "input": "hi"
+        }))
+        .unwrap();
+        let redacted = redact_verbose_request_fields(Some(&body)).expect("redacted");
+        let value: Value = serde_json::from_slice(&redacted).unwrap();
+
+        assert!(value["instructions"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<instructions omitted:")));
+        assert_eq!(value["tools"][0]["name"], "lookup");
+        assert_eq!(value["input"], "hi");
+    }
+
+    #[test]
+    fn redacts_long_system_message_and_short_instructions_kept() {
+        let long = "y".repeat(VERBOSE_REQUEST_FIELD_LIMIT + 1);
+        let body = serde_json::to_vec(&json!({
+            "instructions": "short",
+            "messages": [
+                {"role": "system", "content": long},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let redacted = redact_verbose_request_fields(Some(&body)).expect("redacted");
+        let value: Value = serde_json::from_slice(&redacted).unwrap();
+
+        assert_eq!(value["instructions"], "short");
+        assert!(value["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<system omitted:")));
+        assert_eq!(value["messages"][1]["content"], "hello");
+    }
+
+    #[test]
+    fn leaves_non_json_request_untouched() {
+        let body = b"data: {not json";
+        let out = redact_verbose_request_fields(Some(body)).expect("passthrough");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn a_large_tool_catalogue_is_only_stripped_from_the_echo() {
+        let tools: Vec<Value> = (0..20)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("tool_{index}"),
+                    "description": "d".repeat(80)
+                })
+            })
+            .collect();
+
+        // Request stage: the catalogue is the payload, so it is kept.
+        let request = serde_json::to_vec(&json!({"model": "m", "tools": tools, "input": "hi"}))
+            .expect("json");
+        let redacted = redact_verbose_request_fields(Some(&request)).expect("kept");
+        let value: Value = serde_json::from_slice(&redacted).expect("json");
+        assert_eq!(value["tools"][0]["name"], "tool_0");
+
+        // Response stage: the same catalogue is a verbatim echo, so it goes.
+        let event = serde_json::to_vec(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "tools": tools}
+        }))
+        .expect("json");
+        let redacted = redact_response_event_payload(&event).expect("redacted");
+        let value: Value = serde_json::from_slice(&redacted).expect("json");
+        assert!(value["response"]["tools"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<tools omitted:")));
+        assert_eq!(value["response"]["id"], "resp_1");
+    }
+
+    #[test]
+    fn a_small_tool_catalogue_survives_the_echo_too() {
+        let event = serde_json::to_vec(&json!({
+            "response": {"tools": [{"name": "lookup"}]}
+        }))
+        .expect("json");
+        assert!(redact_response_event_payload(&event).is_none());
+    }
+
+    /// Gemini carries the system prompt as an object of parts, not a string, so
+    /// the `redact_long_string` path cannot see it. Four bridges emit this key.
+    #[test]
+    fn redacts_a_gemini_system_instruction_even_though_it_is_an_object() {
+        let parts = || -> Vec<Value> {
+            (0..4)
+                .map(|index| json!({"text": format!("part {index} ").repeat(80)}))
+                .collect()
+        };
+        let body = serde_json::to_vec(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "systemInstruction": {"parts": parts()}
+        }))
+        .expect("json");
+
+        let redacted = redact_verbose_request_fields(Some(&body)).expect("redacted");
+        let value: Value = serde_json::from_slice(&redacted).expect("json");
+        assert!(value["systemInstruction"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<systemInstruction omitted:")));
+        // 对话本身是载荷，要留着。
+        assert_eq!(value["contents"][0]["parts"][0]["text"], "hi");
+
+        // 回显里同样要剔掉。
+        let event = serde_json::to_vec(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "systemInstruction": {"parts": parts()}}
+        }))
+        .expect("json");
+        let value: Value =
+            serde_json::from_slice(&redact_response_event_payload(&event).expect("redacted"))
+                .expect("json");
+        assert!(value["response"]["systemInstruction"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<systemInstruction omitted:")));
+
+        // 短的 systemInstruction 不值得替换成标记。
+        let small =
+            serde_json::to_vec(&json!({"systemInstruction": {"parts": [{"text": "be terse"}]}}))
+                .expect("json");
+        let redacted = redact_verbose_request_fields(Some(&small)).expect("kept");
+        let value: Value = serde_json::from_slice(&redacted).expect("json");
+        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "be terse");
+    }
+
+    /// The bug this guards: a gateway echoes the whole request inside its
+    /// opening `response.created` event, that one event exceeds the 64 KB stage
+    /// budget, and the plain byte cut then hides every event after it — so the
+    /// upstream looks like it never sent any reasoning.
+    #[test]
+    fn a_response_echo_is_redacted_so_the_events_after_it_survive() {
+        let instructions = "s".repeat(70 * 1024);
+        let tools: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("tool_{index}"),
+                    "description": "d".repeat(200)
+                })
+            })
+            .collect();
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "instructions": instructions, "tools": tools, "output": []}
+        });
+        let reasoning = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "thinking about it"
+        });
+        let body = format!(
+            "event: response.created\ndata: {created}\n\n\
+             event: response.reasoning_summary_text.delta\ndata: {reasoning}\n\n"
+        );
+        let body = body.as_bytes();
+        assert!(
+            body.len() > LIVE_LOG_STAGE_LIMIT,
+            "样本必须先超过单阶段上限才有意义"
+        );
+
+        // What the old code did: cut at 64 KB, which lands inside the echo.
+        let naive = String::from_utf8_lossy(&body[..LIVE_LOG_STAGE_LIMIT]).to_string();
+        assert!(
+            !naive.contains("response.reasoning_summary_text.delta"),
+            "样本要能复现原 bug：直接截断看不到思考事件"
+        );
+
+        let redacted = redact_verbose_response_fields(Some(body)).expect("preview");
+        let text = String::from_utf8_lossy(&redacted);
+        assert!(text.contains("<instructions omitted:"));
+        assert!(text.contains("<tools omitted:"));
+        assert!(
+            text.contains("response.reasoning_summary_text.delta")
+                && text.contains("thinking about it"),
+            "剔除回显后，思考事件必须留在预览里"
+        );
+        assert!(redacted.len() < body.len());
+        assert!(redacted.len() <= LIVE_LOG_STAGE_LIMIT);
+    }
+
+    /// The two mechanisms working together, which is the realistic worst case:
+    /// the echo is redacted away, yet a long answer still pushes the body past
+    /// the stage limit. The reasoning delta arrives early enough that the head
+    /// keeps it.
+    #[test]
+    fn a_long_answer_keeps_its_reasoning_after_the_echo_is_redacted() {
+        let instructions = "s".repeat(60 * 1024);
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "instructions": instructions, "output": []}
+        });
+        let reasoning = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "thinking about it"
+        });
+        let answer = json!({
+            "type": "response.output_text.delta",
+            "delta": "a".repeat(100 * 1024)
+        });
+        let body = format!(
+            "event: response.created\ndata: {created}\n\n\
+             event: response.reasoning_summary_text.delta\ndata: {reasoning}\n\n\
+             event: response.output_text.delta\ndata: {answer}\n\n"
+        );
+        let body = body.as_bytes();
+
+        let redacted = redact_verbose_response_fields(Some(body)).expect("preview");
+        assert!(
+            redacted.len() > LIVE_LOG_STAGE_LIMIT,
+            "剔除回显后仍要超上限，才是在测两者协同"
+        );
+
+        let (preview, truncated) = stage_preview(Some(redacted.as_ref()));
+        let preview = preview.expect("preview");
+        assert!(truncated);
+        assert!(preview.contains(LIVE_LOG_ELISION_MARKER));
+        assert!(preview.contains("<instructions omitted:"));
+        assert!(
+            preview.contains("response.reasoning_summary_text.delta")
+                && preview.contains("thinking about it"),
+            "剔除回显 + 头尾截断之后，思考事件仍必须可见"
+        );
+    }
+
+    /// The regression the two tests above structurally could not catch: in
+    /// production the streaming path never hands `redact_verbose_response_fields`
+    /// the raw body. It hands it `StreamObserver::preview()`, which stopped at
+    /// `LIVE_LOG_STAGE_LIMIT` — so a capped body measured exactly 64 KB, failed
+    /// the "would be truncated anyway" guard, and the redaction was skipped
+    /// outright. The echo it exists to strip stayed in, and the reasoning events
+    /// behind it had already been discarded by the observer, so no amount of
+    /// stripping could have brought them back.
+    ///
+    /// The sizes are the ones measured against a real gateway: `instructions`
+    /// at ~55 KB and `tools` at ~8 KB, both inside the opening event.
+    #[test]
+    fn the_streaming_path_retains_enough_bytes_for_the_echo_to_be_stripped() {
+        let instructions = "s".repeat(55 * 1024);
+        let tools: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({
+                    "type": "function",
+                    "name": format!("tool_{index}"),
+                    "description": "d".repeat(200)
+                })
+            })
+            .collect();
+        let created = json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "instructions": instructions, "tools": tools, "output": []}
+        });
+        let reasoning = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "thinking about it"
+        });
+        let body = format!(
+            "event: response.created\ndata: {created}\n\n\
+             event: response.reasoning_summary_text.delta\ndata: {reasoning}\n\n"
+        );
+
+        // Drive the real observer in chunks, the way the proxy does.
+        let observe_all = |limit: usize| {
+            let mut observer = StreamObserver::new(limit, true);
+            for chunk in body.as_bytes().chunks(8 * 1024) {
+                observer.observe(chunk);
+            }
+            observer.preview().to_vec()
+        };
+
+        // The old cap: the reasoning event is gone before redaction ever runs.
+        let capped = observe_all(LIVE_LOG_STAGE_LIMIT);
+        assert_eq!(capped.len(), LIVE_LOG_STAGE_LIMIT, "旧上限下正好顶到 64 KB");
+        assert!(
+            !String::from_utf8_lossy(&capped).contains("reasoning_summary_text"),
+            "复现原 bug：observer 在 64 KB 处就把思考事件丢了，剔除回显也救不回来"
+        );
+
+        // The current cap: the echo is still there to strip, and the events
+        // behind it survived being retained.
+        let raw = observe_all(LIVE_LOG_RAW_PREVIEW_LIMIT);
+        assert!(
+            raw.len() > LIVE_LOG_STAGE_LIMIT,
+            "守卫要能认出「反正也要截断」"
+        );
+
+        let redacted = redact_verbose_response_fields(Some(&raw)).expect("preview");
+        let text = String::from_utf8_lossy(&redacted);
+        assert!(text.contains("<instructions omitted:"), "回显必须被剔掉");
+        assert!(text.contains("<tools omitted:"));
+        assert!(
+            text.contains("response.reasoning_summary_text.delta")
+                && text.contains("thinking about it"),
+            "剔除回显后，思考事件必须在预览里"
+        );
+
+        let (preview, _) = stage_preview(Some(redacted.as_ref()));
+        let preview = preview.expect("preview");
+        assert!(
+            preview.contains("response.reasoning_summary_text.delta"),
+            "走完整条链路之后，思考事件仍必须可见"
+        );
+    }
+
+    #[test]
+    fn a_response_body_below_the_stage_limit_is_left_byte_identical() {
+        let instructions = "s".repeat(500);
+        let body = format!(
+            "event: response.created\ndata: {{\"response\":{{\"instructions\":\"{instructions}\"}}}}\n\n"
+        );
+        let bytes = body.as_bytes();
+        assert!(bytes.len() < LIVE_LOG_STAGE_LIMIT);
+
+        let out = redact_verbose_response_fields(Some(bytes)).expect("preview");
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "不会截断的报文不应被改写 —— 两阶段逐字节比对依赖这一点"
+        );
+        assert_eq!(out.as_ref(), bytes);
+    }
+
+    #[test]
+    fn a_json_body_with_blank_lines_is_not_mistaken_for_a_stream() {
+        // JSON 字符串里满是 \n\n，但它不是 SSE，不能按事件改写。
+        let padding = "p\n\nq".repeat(30 * 1024);
+        let body = serde_json::to_vec(&json!({"model": "m", "input": padding})).expect("json");
+        assert!(body.len() > LIVE_LOG_STAGE_LIMIT);
+
+        let out = redact_verbose_response_fields(Some(&body)).expect("preview");
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn only_sse_and_json_shaped_bodies_are_recognized() {
+        assert!(looks_like_sse(b"event: response.created\ndata: {}"));
+        assert!(looks_like_sse(b"data: {}\n\n"));
+        assert!(looks_like_sse(b": keep-alive\n\n"));
+        assert!(looks_like_sse(b"id: 1\ndata: {}"));
+        assert!(!looks_like_sse(b"{\"model\":\"m\"}"));
+        assert!(!looks_like_sse(b"[1,2,3]"));
+    }
+
+    #[test]
+    fn stays_quiet_when_tool_call_present_or_not_bridged() {
+        let request = "{\"tools\":[{}]}";
+        let with_tool = br#"data: {"type":"response.completed","response":{"output":[{"type":"function_call"}]}}"#;
+        assert!(diagnostic_notes(true, Some("codex"), Some(request), Some(with_tool)).is_empty());
+        // No bridge applied -> no diagnostics.
+        let text_only =
+            br#"data: {"type":"response.completed","response":{"output":[{"type":"message"}]}}"#;
+        assert!(diagnostic_notes(true, None, Some(request), Some(text_only)).is_empty());
+        // Request offered no tools -> a plain text answer is expected, not flagged.
+        assert!(diagnostic_notes(
+            true,
+            Some("codex"),
+            Some("{\"input\":\"hi\"}"),
+            Some(text_only)
+        )
+        .is_empty());
+    }
+
+    #[derive(Debug)]
+    struct CapturedChatRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        body: Value,
+    }
+
+    #[derive(Clone)]
+    struct ChatUpstreamState {
+        requests: tokio::sync::mpsc::UnboundedSender<CapturedChatRequest>,
+    }
+
+    async fn recording_chat_upstream_handler(
+        AxumState(state): AxumState<ChatUpstreamState>,
+        method: Method,
+        headers: HeaderMap,
+        uri: axum::http::Uri,
+        body: Body,
+    ) -> Response {
+        let body = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("upstream request body");
+        let value = serde_json::from_slice::<Value>(&body).expect("upstream request json");
+        let streaming = value.get("stream").and_then(Value::as_bool) == Some(true);
+        let _ = state.requests.send(CapturedChatRequest {
+            method: method.to_string(),
+            path: uri.path().to_string(),
+            authorization: headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            body: value,
+        });
+
+        let (content_type, response_body) = if streaming {
+            (
+                "text/event-stream",
+                concat!(
+                    "data: {\"id\":\"chatcmpl-route\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-route\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-route\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        } else {
+            (
+                "application/json",
+                r#"{"id":"chatcmpl-route","object":"chat.completion","model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#,
+            )
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(response_body))
+            .expect("upstream response")
+    }
+
+    /// An SSE upstream that emits chunks on demand, with a deliberate split
+    /// inside one frame.
+    ///
+    /// The single-`Body::from` fixtures above hand the whole payload over at
+    /// once, so they never exercise a chunk boundary. Real upstreams split
+    /// wherever the network does, including mid-frame, which is exactly what the
+    /// framer has to survive.
+    ///
+    /// `gap` is awaited after the first chunk, so a test can prove the client
+    /// received the opening bytes before the upstream finished.
+    async fn start_chunked_sse_upstream(
+        chunks: Vec<&'static str>,
+        gap: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = Router::new().fallback(move || {
+            let chunks = chunks.clone();
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let stream = futures_util::stream::unfold(
+                    chunks.into_iter().enumerate(),
+                    move |mut iter| async move {
+                        let (index, chunk) = iter.next()?;
+                        if index > 0 {
+                            tokio::time::sleep(gap).await;
+                        }
+                        Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                chunk.as_bytes(),
+                            )),
+                            iter,
+                        ))
+                    },
+                );
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .expect("chunked sse response")
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind chunked sse upstream");
+        let address = listener.local_addr().expect("chunked sse address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve chunked sse");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    /// An upstream that serves a different script per call, so a retry is
+    /// distinguishable from the attempt that triggered it.
+    ///
+    /// The last script is reused once the list runs out, so a test that expects
+    /// exactly N calls still has a defined answer if the proxy over-retries.
+    async fn start_scripted_sse_upstream(
+        scripts: Vec<Vec<&'static str>>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = Router::new().fallback(move || {
+            let scripts = scripts.clone();
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = scripts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| scripts.last().cloned().unwrap_or_default());
+                let stream = futures_util::stream::iter(chunks.into_iter().map(|chunk| {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(chunk.as_bytes()))
+                }));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .expect("scripted sse response")
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind scripted sse upstream");
+        let address = listener.local_addr().expect("scripted sse address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve scripted sse");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    /// An upstream that returns 200 with SSE headers and then closes without
+    /// sending a single byte of body.
+    async fn start_empty_stream_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = Router::new().fallback(move || {
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::empty())
+                    .expect("empty stream response")
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind empty stream upstream");
+        let address = listener.local_addr().expect("empty stream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve empty stream");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    async fn start_recording_chat_upstream() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<CapturedChatRequest>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .fallback(recording_chat_upstream_handler)
+            .with_state(ChatUpstreamState { requests: sender });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind recording upstream");
+        let address = listener.local_addr().expect("recording upstream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording upstream");
+        });
+        (format!("http://{address}/v1"), receiver)
+    }
+
+    async fn start_fixed_upstream(status: StatusCode, body: &'static str) -> String {
+        let app = Router::new().fallback(move || async move { (status, body) });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind upstream");
+        let address = listener.local_addr().expect("upstream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve upstream");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// An upstream that fails one model and serves another, i.e. exactly the
+    /// relay behaviour that makes account-wide cooldown wrong.
+    async fn start_per_model_upstream(failing_model: &'static str) -> String {
+        let app = Router::new().fallback(move |body: axum::body::Bytes| async move {
+            let model = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if model == failing_model {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"rate limited"}}"#,
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+                )
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind per-model upstream");
+        let address = listener.local_addr().expect("per-model address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve per-model");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// An upstream running sub2api's `codex_cli_only` gate on its shipped default
+    /// policy, which is two independent checks:
+    ///
+    /// 1. the request names an official Codex client in `user-agent` or
+    ///    `originator`, and the engine version is parseable *out of the UA* even
+    ///    when it was the originator that matched;
+    /// 2. it carries an `x-codex-*` engine-fingerprint header.
+    ///
+    /// Anything else gets the one generic message the gate uses for every reason it
+    /// refuses, which is why the 403 never says which half was missing.
+    async fn start_codex_cli_only_upstream() -> String {
+        let app = Router::new().fallback(|headers: HeaderMap| async move {
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let user_agent = header("user-agent");
+            let official_client = ["codex_cli_rs/", "codex-tui/"]
+                .iter()
+                .any(|prefix| user_agent.starts_with(prefix))
+                || matches!(header("originator").as_str(), "codex_cli_rs" | "codex-tui");
+            let version = user_agent
+                .split_once('/')
+                .map(|(_, rest)| rest.split([' ', '(']).next().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            let mut segments = version.splitn(3, '.');
+            let engine_version_parseable = matches!(
+                (segments.next(), segments.next(), segments.next()),
+                (Some(major), Some(minor), Some(patch))
+                    if !major.is_empty()
+                        && major.bytes().all(|byte| byte.is_ascii_digit())
+                        && !minor.is_empty()
+                        && minor.bytes().all(|byte| byte.is_ascii_digit())
+                        && patch.starts_with(|char: char| char.is_ascii_digit())
+            );
+            let fingerprinted = headers
+                .keys()
+                .any(|name| name.as_str().starts_with("x-codex-"));
+
+            if official_client && engine_version_parseable && fingerprinted {
+                (
+                    StatusCode::OK,
+                    r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+                )
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":{"message":"This account only allows Codex official clients","type":"forbidden_error"}}"#,
+                )
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind codex-only upstream");
+        let address = listener.local_addr().expect("codex-only address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve codex-only");
+        });
+        format!("http://{address}/v1")
+    }
+
+    /// An upstream that accepts the connection and then goes silent forever.
+    ///
+    /// This is the failure the proxy could not see before it had deadlines: no
+    /// RST, no EOF, no status line — just a live socket with nothing on it. It
+    /// holds every accepted stream so the peer never observes a close, and
+    /// returns the number of connections it has swallowed.
+    async fn start_stalled_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stalled upstream");
+        let address = listener.local_addr().expect("stalled upstream address");
+        let accepted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Never read or write; keep the socket open so the
+                        // client waits on bytes that will never come.
+                        held.push(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), connections)
+    }
+
+    #[derive(Clone)]
+    struct SequenceUpstreamState {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        overload_attempts: usize,
+        success_body: &'static str,
+    }
+
+    async fn sequence_upstream_handler(
+        AxumState(state): AxumState<SequenceUpstreamState>,
+    ) -> Response {
+        let attempt = state
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let body = if attempt <= state.overload_attempts {
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}"#
+        } else {
+            state.success_body
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("sequence response")
+    }
+
+    async fn start_sequence_upstream(
+        overload_attempts: usize,
+        success_body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(sequence_upstream_handler)
+            .with_state(SequenceUpstreamState {
+                calls: Arc::clone(&calls),
+                overload_attempts,
+                success_body,
+            });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind sequence upstream");
+        let address = listener.local_addr().expect("sequence upstream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sequence upstream");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    #[derive(Clone)]
+    struct StatusSequenceUpstreamState {
+        calls: Arc<AtomicUsize>,
+        failed_attempts: usize,
+        failure_status: StatusCode,
+        failure_body: &'static str,
+        success_body: &'static str,
+    }
+
+    async fn status_sequence_upstream_handler(
+        AxumState(state): AxumState<StatusSequenceUpstreamState>,
+    ) -> Response {
+        let attempt = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let (status, body) = if attempt <= state.failed_attempts {
+            (state.failure_status, state.failure_body)
+        } else {
+            (StatusCode::OK, state.success_body)
+        };
+        Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("status sequence response")
+    }
+
+    async fn start_status_sequence_upstream(
+        failed_attempts: usize,
+        failure_status: StatusCode,
+        failure_body: &'static str,
+        success_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(status_sequence_upstream_handler)
+            .with_state(StatusSequenceUpstreamState {
+                calls: Arc::clone(&calls),
+                failed_attempts,
+                failure_status,
+                failure_body,
+                success_body,
+            });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind status sequence upstream");
+        let address = listener
+            .local_addr()
+            .expect("status sequence upstream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve status sequence upstream");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    /// How a Bedrock-backed relay refuses a replayed reasoning block: a 400 whose
+    /// real message is buried in the gateway's own prose, with `error.type` a
+    /// formatted Go nil. Verbatim from a user report.
+    const THINKING_SIGNATURE_REJECTION: &str = r#"{"error":{"message":"Anthropic Claude bad request: InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, , ValidationException: messages.1.content.0: Invalid `signature` in `thinking` block (request id: cf669ff644885c3d88c0febf9d08bc37)","type":"<nil>"},"type":"error"}"#;
+
+    const ANTHROPIC_MESSAGE_BODY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#;
+
+    #[derive(Clone)]
+    struct ThinkingSignatureUpstreamState {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    async fn thinking_signature_upstream_handler(
+        AxumState(state): AxumState<ThinkingSignatureUpstreamState>,
+        body: axum::body::Bytes,
+    ) -> Response {
+        let attempt = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        state
+            .bodies
+            .lock()
+            .expect("record upstream body")
+            .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+        let (status, response_body) = if attempt == 1 {
+            (StatusCode::BAD_REQUEST, THINKING_SIGNATURE_REJECTION)
+        } else {
+            (StatusCode::OK, ANTHROPIC_MESSAGE_BODY)
+        };
+        Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(response_body))
+            .expect("thinking signature response")
+    }
+
+    /// An upstream that refuses the first request the way a relay refuses a
+    /// foreign reasoning signature, then serves anything asked afterwards, while
+    /// recording every request body it saw.
+    #[allow(clippy::type_complexity)]
+    async fn start_thinking_signature_upstream(
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(thinking_signature_upstream_handler)
+            .with_state(ThinkingSignatureUpstreamState {
+                calls: Arc::clone(&calls),
+                bodies: Arc::clone(&bodies),
+            });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind thinking signature upstream");
+        let address = listener.local_addr().expect("upstream address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve thinking signature upstream");
+        });
+        (format!("http://{address}/v1"), calls, bodies)
+    }
+
+    #[derive(Clone)]
+    struct EncryptedContentUpstreamState {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    async fn encrypted_content_upstream_handler(
+        AxumState(state): AxumState<EncryptedContentUpstreamState>,
+        body: axum::body::Bytes,
+    ) -> Response {
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        let body: Value = serde_json::from_slice(&body).expect("request JSON");
+        state
+            .bodies
+            .lock()
+            .expect("record Responses upstream body")
+            .push(body.clone());
+        // This fake checks the actual contract: clean reasoning and paired tool
+        // outputs. It does not start accepting malformed input on attempt two.
+        let input = body["input"].as_array().expect("input array");
+        let invalid_ciphertext = input
+            .iter()
+            .any(|item| item["type"] == "reasoning" && item.get("encrypted_content").is_some());
+        let orphan_output = input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && !input.iter().any(|call| {
+                    call["type"] == "function_call" && call["call_id"] == item["call_id"]
+                })
+        });
+        let (status, response_body) = if invalid_ciphertext {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}"#,
+            )
+        } else if orphan_output {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"invalid_request_error","message":"No tool call found for function call output"}}"#,
+            )
+        } else {
+            (
+                StatusCode::OK,
+                r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#,
+            )
+        };
+        Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(response_body))
+            .expect("encrypted content response")
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn start_encrypted_content_upstream(
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(encrypted_content_upstream_handler)
+            .with_state(EncryptedContentUpstreamState {
+                calls: Arc::clone(&calls),
+                bodies: Arc::clone(&bodies),
+            });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind encrypted content upstream");
+        let address = listener.local_addr().expect("encrypted content address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve encrypted content upstream");
+        });
+        (format!("http://{address}/v1"), calls, bodies)
+    }
+
+    #[derive(Clone)]
+    struct MissingReasoningUpstreamState {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    /// A thinking Chat upstream (DeepSeek/MiMo behind new-api): it rejects any
+    /// request whose assistant messages do not all carry a non-empty
+    /// `reasoning_content`, with the exact 11155 body the user reported. Once the
+    /// proxy supplies the field it answers 200.
+    async fn missing_reasoning_upstream_handler(
+        AxumState(state): AxumState<MissingReasoningUpstreamState>,
+        body: axum::body::Bytes,
+    ) -> Response {
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        let body: Value = serde_json::from_slice(&body).expect("request JSON");
+        state
+            .bodies
+            .lock()
+            .expect("record chat upstream body")
+            .push(body.clone());
+        let assistant_missing_reasoning =
+            body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|message| {
+                    message["role"] == "assistant"
+                        && !message
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                });
+        let (status, response_body) = if assistant_missing_reasoning {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"code":11155,"msg":"the reasoning content from the previous turn must be passed back in thinking mode","requestId":"3d756099a4f609f734f62c52d5f9ae90","extError":{"code":"reasoning_content_missing","message":"the reasoning content from the previous turn must be passed back in thinking mode","param":"","type":"invalid_request_error","StatusCode":400}}"#,
+            )
+        } else {
+            (
+                StatusCode::OK,
+                r#"{"id":"chatcmpl_1","object":"chat.completion","model":"deepseek-reasoner","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"done"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            )
+        };
+        Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(response_body))
+            .expect("missing reasoning response")
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn start_missing_reasoning_upstream(
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(missing_reasoning_upstream_handler)
+            .with_state(MissingReasoningUpstreamState {
+                calls: Arc::clone(&calls),
+                bodies: Arc::clone(&bodies),
+            });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind missing reasoning upstream");
+        let address = listener.local_addr().expect("missing reasoning address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve missing reasoning upstream");
+        });
+        (format!("http://{address}/v1"), calls, bodies)
+    }
+
+    /// A Claude-platform account speaking Anthropic natively, so `/v1/messages`
+    /// reaches the upstream as a passthrough and carries the client's own
+    /// `thinking` blocks.
+    async fn create_proxy_anthropic_credential(
+        pool: &SqlitePool,
+        name: &str,
+        base_url: &str,
+    ) -> String {
+        let config = json!({
+            "base_url": base_url,
+            "interface_format": "anthropic",
+            "model_mappings": [{"from": "claude-sonnet-4", "to": "claude-sonnet-4"}]
+        });
+        let credential = RouteCredentialRepository::create(
+            pool,
+            "claude",
+            "api",
+            name,
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"sk-upstream"}"#,
+            &config.to_string(),
+            "{}",
+        )
+        .await
+        .expect("create credential");
+        credential.id
+    }
+
+    async fn start_flaky_body_upstream(
+        failed_attempts: usize,
+        success_body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind flaky body upstream");
+        let address = listener.local_addr().expect("flaky upstream address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempt = server_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = if attempt <= failed_attempts {
+                    r#"{"choices":"#
+                } else {
+                    success_body
+                };
+                let content_length = if attempt <= failed_attempts {
+                    body.len() + 64
+                } else {
+                    body.len()
+                };
+                let mut request_buffer = [0u8; 1024];
+                let _ = socket.read(&mut request_buffer).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    #[tokio::test]
+    async fn request_compression_manual_on_reaches_the_proxy_upstream() {
+        let mut peer = crate::services::request_compression::test_support::start_brotli_peer().await;
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let id = create_proxy_api_credential_with_config(&pool, "Brotli fixture", &peer.base_url,
+            json!({"request_brotli_compression":"on","failure_policy":{"retry_count":0},"model_mappings":[{"from":"gpt-5","to":"up-gpt"}]})).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-local-brotli-fixture")
+                .await
+                .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool, &runtime);
+        let log = state.live_log.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
+        );
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(
+                json!({"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}).to_string(),
+            ),
+        )
+        .await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let captured = tokio::time::timeout(Duration::from_secs(5), peer.requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured["model"], "up-gpt");
+        assert_eq!(captured["messages"][0]["content"], "hello");
+        let entries = log.snapshot();
+        let entry = entries.last().expect("proxy log");
+        assert!(entry.success);
+        assert_eq!(entry.upstream_model.as_deref(), Some("up-gpt"));
+        serde_json::from_str::<Value>(entry.upstream_request.as_deref().unwrap())
+            .expect("decoded request log");
+    }
+
+    async fn create_proxy_api_credential(pool: &SqlitePool, name: &str, base_url: &str) -> String {
+        create_proxy_api_credential_with_config(pool, name, base_url, json!({})).await
+    }
+
+    async fn create_proxy_api_credential_with_config(
+        pool: &SqlitePool,
+        name: &str,
+        base_url: &str,
+        extra_config: Value,
+    ) -> String {
+        let mut config = json!({
+            "base_url": base_url,
+            "interface_format": "openai",
+            "model_mappings": []
+        });
+        if let (Some(config), Some(extra_config)) =
+            (config.as_object_mut(), extra_config.as_object())
+        {
+            config.extend(extra_config.clone());
+        }
+        let credential = RouteCredentialRepository::create(
+            pool,
+            "codex",
+            "api",
+            name,
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"sk-upstream"}"#,
+            &config.to_string(),
+            "{}",
+        )
+        .await
+        .expect("create credential");
+        credential.id
+    }
+
+    async fn create_proxy_api_credential_with_mappings(
+        pool: &SqlitePool,
+        name: &str,
+        base_url: &str,
+        model_mappings: Value,
+    ) -> String {
+        let credential = RouteCredentialRepository::create(
+            pool,
+            "codex",
+            "api",
+            name,
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"sk-upstream"}"#,
+            &json!({
+                "base_url": base_url,
+                "interface_format": "openai",
+                "model_mappings": model_mappings
+            })
+            .to_string(),
+            "{}",
+        )
+        .await
+        .expect("create credential");
+        credential.id
+    }
+
+    #[tokio::test]
+    async fn route_proxy_listener_reports_occupied_port_without_falling_forward() {
+        let occupied = TcpListener::bind((BIND_HOST, 0))
+            .await
+            .expect("bind occupied port");
+        let occupied_port = occupied.local_addr().expect("occupied address").port();
+        let error = bind_route_proxy_listener_from(occupied_port)
+            .await
+            .expect_err("an occupied port must fail instead of selecting another port");
+        match error {
+            AppError::Filesystem { code, message, details, .. } => {
+                assert_eq!(code, "filesystem.route_proxy_bind");
+                assert!(message.contains(&format!("127.0.0.1:{occupied_port}")));
+                assert!(details.is_some());
+            }
+            other => panic!("unexpected bind error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_fails_when_default_route_proxy_port_is_unavailable() {
+        // If another listener already owns the default port, it is the conflict
+        // fixture; otherwise keep our own socket alive until start returns.
+        let _default_port_guard = TcpListener::bind((BIND_HOST, 10888)).await.ok();
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = RouteProxyRuntimeState::default();
+        let result = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly).await;
+        // Release an accidentally started listener before asserting the regression.
+        RouteProxyService::stop(&runtime).await.expect("stop");
+        let error = result.expect_err("default port conflicts must fail");
+        assert!(error.to_string().contains("127.0.0.1:10888"));
+        assert!(!RouteProxyService::status(&runtime).await.running);
+    }
+
+    #[tokio::test]
+    async fn force_stop_releases_listener_with_an_inflight_request() {
+        let pool = create_memory_pool().await.unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let router = Router::new().route("/v1/models", axum::routing::get(move || {
+            let signal = signal.clone();
+            async move {
+                signal.notify_one();
+                std::future::pending::<StatusCode>().await
+            }
+        }));
+        let status = RouteProxyService::start_with_router(
+            &runtime, pool, RouteProxyTransport::HttpOnly, router,
+        ).await.unwrap();
+        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:10888"));
+        let request = tokio::spawn(async move {
+            reqwest::Client::new().get("http://127.0.0.1:10888/v1/models").send().await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_millis(500), RouteProxyService::force_stop(&runtime),
+        ).await.expect("plugin shutdown must not wait for request completion").unwrap();
+        assert!(!status.running);
+        let rebound = TcpListener::bind((BIND_HOST, 10888)).await.expect("listener released");
+        request.abort();
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn https_serves_on_its_own_port_beside_a_still_working_http_listener() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+        use crate::paths::AppPaths;
+        use crate::services::route_proxy_https_service::RouteProxyHttpsService;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = AppPaths::from_data_dir(temp.path().to_path_buf());
+        let material = RouteProxyHttpsService::ensure_material(&paths)
+            .await
+            .expect("material");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+            .await
+            .expect("proxy key");
+        let runtime = RouteProxyRuntimeState::default();
+
+        let status = RouteProxyService::start(
+            &runtime,
+            pool,
+            RouteProxyTransport::HttpAndHttps {
+                certificate_pem_path: material.server_certificate_pem.clone(),
+                private_key_pem_path: material.server_private_key_pem.clone(),
+            },
+        )
+        .await
+        .expect("start http and tls");
+        let root = reqwest::Certificate::from_pem(
+            &tokio::fs::read(&material.root_certificate_pem)
+                .await
+                .expect("root pem"),
+        )
+        .expect("root certificate");
+        let client = reqwest::Client::builder()
+            .add_root_certificate(root)
+            .build()
+            .expect("client");
+
+        // Two endpoints, two ports. `base_url` stays the HTTP one because that is
+        // what gets written into client configs.
+        assert_eq!(
+            status
+                .base_url
+                .as_deref()
+                .map(|value| value.starts_with("http://")),
+            Some(true)
+        );
+        assert_eq!(
+            status
+                .https_base_url
+                .as_deref()
+                .map(|value| value.starts_with("https://")),
+            Some(true)
+        );
+        assert_eq!(status.https_error, None);
+        assert_ne!(status.port, status.https_port);
+
+        let tls_response = client
+            .get(format!(
+                "{}/v1/models",
+                status.https_base_url.as_deref().expect("https base url")
+            ))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .expect("tls request");
+        assert_eq!(tls_response.status(), reqwest::StatusCode::OK);
+
+        // The whole point of the split: HTTP keeps answering, so a client that
+        // cannot read the local root CA is unaffected by the HTTPS switch.
+        let plain_response = client
+            .get(format!(
+                "{}/v1/models",
+                status.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .expect("plain request");
+        assert_eq!(plain_response.status(), reqwest::StatusCode::OK);
+
+        // Only the TLS port refuses plain HTTP.
+        let plain_error = reqwest::get(format!(
+            "http://127.0.0.1:{}/v1/models",
+            status.https_port.expect("https port")
+        ))
+        .await
+        .expect_err("plain HTTP must not be served by the TLS listener");
+        assert!(plain_error.is_request() || plain_error.is_connect() || plain_error.is_decode());
+
+        RouteProxyService::stop(&runtime).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn a_broken_certificate_leaves_http_serving() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = RouteProxyRuntimeState::default();
+
+        // Certificate material that cannot be loaded must not take down the one
+        // endpoint every client can use.
+        let status = RouteProxyService::start(
+            &runtime,
+            pool,
+            RouteProxyTransport::HttpAndHttps {
+                certificate_pem_path: temp.path().join("missing-cert.pem"),
+                private_key_pem_path: temp.path().join("missing-key.pem"),
+            },
+        )
+        .await
+        .expect("a certificate problem must not fail the start");
+
+        assert!(status.running);
+        assert_eq!(
+            status
+                .base_url
+                .as_deref()
+                .map(|value| value.starts_with("http://")),
+            Some(true)
+        );
+        assert_eq!(status.https_base_url, None);
+        // The reason has to name the file, not just say "certificate": the panel
+        // shows this string verbatim and it is the user's only clue.
+        let reason = status
+            .https_error
+            .expect("a reason for the missing listener");
+        assert!(
+            reason.contains("missing-cert.pem"),
+            "the failure has to keep its detail: {reason}"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn http_transport_retains_the_existing_http_base_url() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = RouteProxyRuntimeState::default();
+
+        let status = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start http");
+
+        assert_eq!(
+            status
+                .base_url
+                .as_deref()
+                .map(|value| value.starts_with("http://")),
+            Some(true)
+        );
+        RouteProxyService::stop(&runtime).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn route_proxy_falls_back_to_next_priority_when_first_account_is_at_limit() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let first_upstream =
+            start_fixed_upstream(StatusCode::OK, r#"{"route":"priority-one"}"#).await;
+        let second_upstream =
+            start_fixed_upstream(StatusCode::OK, r#"{"route":"priority-two"}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential(&pool, "priority-one", &first_upstream).await;
+        let second_id = create_proxy_api_credential(&pool, "priority-two", &second_upstream).await;
+        sqlx::query(
+            "UPDATE route_credentials
+             SET route_priority = CASE id WHEN ? THEN 1 ELSE 2 END,
+                 max_concurrency = 1
+             WHERE id IN (?, ?)",
+        )
+        .bind(&first_id)
+        .bind(&first_id)
+        .bind(&second_id)
+        .execute(&pool)
+        .await
+        .expect("routing settings");
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[first_id.clone(), second_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-priority",
+        )
+        .await
+        .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let held_lease = runtime
+            .activity()
+            .try_acquire("codex", &first_id, 1)
+            .await
+            .expect("hold first account concurrency slot");
+        let proxy = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let client = reqwest::Client::new();
+        let endpoint = format!(
+            "{}/v1/chat/completions",
+            proxy.base_url.as_deref().expect("base url")
+        );
+
+        let fallback_response = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("fallback response");
+        assert_eq!(fallback_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            fallback_response.text().await.expect("fallback body"),
+            r#"{"route":"priority-two"}"#
+        );
+
+        drop(held_lease);
+        let primary_response = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("primary response");
+        assert_eq!(primary_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            primary_response.text().await.expect("primary body"),
+            r#"{"route":"priority-one"}"#
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The reported failure, end to end: a client that is not Codex routes through
+    /// the pool to a relay whose account has `codex_cli_only` on. Before the
+    /// identity was repaired here, every such turn came back as
+    /// `This account only allows Codex official clients`.
+    #[tokio::test]
+    async fn route_proxy_passes_a_relays_codex_only_gate_for_a_foreign_client() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let upstream = start_codex_cli_only_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "codex-only-relay", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[credential_id])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-codex-only")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            // A client with an identity of its own, and none of it Codex: the shape
+            // every bridged turn and every non-Codex tool arrives in.
+            .header("user-agent", "claude-cli/2.1.2 (external, cli)")
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("gated response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("body"),
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn route_proxy_answers_cors_preflight_without_platform_authentication() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = RouteProxyRuntimeState::default();
+        let status = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .request(
+                reqwest::Method::OPTIONS,
+                format!(
+                    "{}/v1/responses",
+                    status.base_url.as_deref().expect("base url")
+                ),
+            )
+            .header("Origin", "https://fastview.lingyun.net")
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization,content-type,x-ai-switch-platform",
+            )
+            .header("Access-Control-Request-Private-Network", "true")
+            .send()
+            .await
+            .expect("preflight response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://fastview.lingyun.net")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn request_body_limit_default_forwards_more_than_32_mib() {
+        let (upstream, mut requests) = start_recording_chat_upstream().await;
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let id = create_proxy_api_credential_with_mappings(
+            &pool,
+            "large-request",
+            &upstream,
+            json!([{"from": "gpt-5", "to": "deepseek-chat"}]),
+        )
+        .await;
+        let runtime = RouteProxyRuntimeState::default();
+        let state =
+            build_proxy_state(pool, &runtime).with_access_scope(PlatformId::Codex, HashSet::from([id]));
+        let mut payload =
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}"#.to_vec();
+        payload.resize(33 * 1024 * 1024, b' ');
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            HeaderMap::new(),
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(payload),
+        )
+        .await;
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&response_body));
+        let captured = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.body["messages"][0]["content"], "hello");
+        assert_eq!(captured.path, "/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn route_proxy_bridges_codex_responses_to_chat_json_and_sse() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let (upstream_url, mut requests) = start_recording_chat_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_mappings(
+            &pool,
+            "chat-bridge",
+            &upstream_url,
+            json!([{"from":"gpt-5","to":"deepseek-chat"}]),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-bridge",
+        )
+        .await
+        .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let client = reqwest::Client::new();
+        let endpoint = format!(
+            "{}/v1/responses",
+            proxy.base_url.as_deref().expect("base url")
+        );
+
+        let json_response = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .json(&json!({"model":"gpt-5","input":"hello"}))
+            .send()
+            .await
+            .expect("json proxy response");
+        assert_eq!(json_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            json_response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value)),
+            Some("application/json")
+        );
+        let json_body: Value = json_response.json().await.expect("responses json");
+        assert_eq!(json_body["object"], "response");
+        assert_eq!(json_body["output_text"], "hello");
+        assert_eq!(json_body["usage"]["input_tokens"], 3);
+        assert_eq!(json_body["usage"]["output_tokens"], 1);
+
+        let captured_json = requests.recv().await.expect("captured json request");
+        assert_eq!(captured_json.method, "POST");
+        assert_eq!(captured_json.path, "/v1/chat/completions");
+        assert_eq!(
+            captured_json.authorization.as_deref(),
+            Some("Bearer sk-upstream")
+        );
+        assert_eq!(
+            captured_json.body["messages"][0],
+            json!({"role":"user","content":"hello"})
+        );
+        assert_eq!(captured_json.body["model"], "deepseek-chat");
+        assert!(captured_json.body.get("input").is_none());
+        let stats = RoutePoolRepository::stats(&pool, "codex", None, 1, 20)
+            .await
+            .expect("route stats");
+        assert_eq!(stats.requests.len(), 1);
+        let metadata: Value =
+            serde_json::from_str(&stats.requests[0].metadata_json).expect("request metadata");
+        assert_eq!(
+            metadata.pointer("/requested_model").and_then(Value::as_str),
+            Some("gpt-5")
+        );
+        assert_eq!(
+            metadata.pointer("/upstream_model").and_then(Value::as_str),
+            Some("deepseek-chat")
+        );
+
+        // Live log must capture all four stages, and the protocol conversion
+        // must make the inbound request (stage 1) differ from the upstream
+        // request (stage 2).
+        let live_entries = runtime.live_log().subscribe("codex");
+        assert_eq!(live_entries.len(), 1);
+        let live_entry = &live_entries[0];
+        assert!(live_entry.success);
+        assert!(
+            live_entry.bridge.is_some(),
+            "protocol conversion should record a bridge kind"
+        );
+        let client_request = live_entry.client_request.as_deref().unwrap_or_default();
+        let upstream_request = live_entry.upstream_request.as_deref().unwrap_or_default();
+        assert!(client_request.contains("\"input\""));
+        assert!(upstream_request.contains("\"messages\""));
+        assert!(upstream_request.contains("deepseek-chat"));
+        assert_ne!(
+            client_request, upstream_request,
+            "stage 1 and stage 2 must differ after protocol conversion"
+        );
+        assert!(live_entry.upstream_response.is_some());
+        assert!(live_entry.final_response.is_some());
+        runtime.live_log().unsubscribe();
+
+        let sse_response = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .json(&json!({"model":"gpt-5","input":"hello","stream":true}))
+            .send()
+            .await
+            .expect("sse proxy response");
+        assert_eq!(sse_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            sse_response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value)),
+            Some("text/event-stream")
+        );
+        let sse_body = sse_response.text().await.expect("responses sse");
+        assert!(sse_body.contains("event: response.created"));
+        assert!(sse_body.contains("response.output_text.delta"));
+        assert!(sse_body.contains("\"delta\":\"hello\""));
+        assert!(sse_body.contains("event: response.completed"));
+
+        let captured_sse = requests.recv().await.expect("captured sse request");
+        assert_eq!(captured_sse.path, "/v1/chat/completions");
+        assert_eq!(captured_sse.body["stream"], true);
+        assert!(captured_sse.body["stream_options"]["include_usage"] == true);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn precise_mode_serves_a_prefixed_model_end_to_end() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (first_upstream, mut first_requests) = start_recording_chat_upstream().await;
+        let (second_upstream, mut second_requests) = start_recording_chat_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let grox = create_proxy_api_credential_with_mappings(
+            &pool,
+            "Grox",
+            &first_upstream,
+            json!([{"from":"gpt-5.6-sol","to":"grox-sol"}]),
+        )
+        .await;
+        let kan = create_proxy_api_credential_with_mappings(
+            &pool,
+            "247 Kan",
+            &second_upstream,
+            json!([{"from":"gpt-5.6-sol","to":"kan-sol"}]),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[grox, kan])
+            .await
+            .expect("pool members");
+        RoutePoolRepository::save_model_mode(&pool, "codex", PoolModelMode::Precise)
+            .await
+            .expect("precise mode");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let base_url = proxy.base_url.as_deref().expect("base url").to_string();
+        let client = reqwest::Client::new();
+
+        let listed: Value = client
+            .get(format!("{base_url}/v1/models"))
+            .bearer_auth(&route_key)
+            .send()
+            .await
+            .expect("models response")
+            .json()
+            .await
+            .expect("models json");
+        let ids: Vec<&str> = listed["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["Grox/gpt-5.6-sol", "247-Kan/gpt-5.6-sol"]);
+
+        // Ask for the second account by name, twice. Aggregate mode would have
+        // rotated to the first one on one of these turns.
+        for _ in 0..2 {
+            let response = client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .bearer_auth(&route_key)
+                .json(&json!({"model":"247-Kan/gpt-5.6-sol","messages":[]}))
+                .send()
+                .await
+                .expect("proxy response");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+
+        let first = second_requests.recv().await.expect("first captured");
+        let second = second_requests.recv().await.expect("second captured");
+        // The prefix is gone and the account's own mapping applied, so the relay
+        // sees a model it knows.
+        assert_eq!(first.body["model"], "kan-sol");
+        assert_eq!(second.body["model"], "kan-sol");
+        assert!(
+            first_requests.try_recv().is_err(),
+            "the unnamed account must never be reached"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_next_pool_account_after_unauthorized_response() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let failed_response_body = r#"{"error":{"message":"expired"}}"#;
+        let failed_upstream =
+            start_fixed_upstream(StatusCode::UNAUTHORIZED, failed_response_body).await;
+        let healthy_upstream = start_fixed_upstream(
+            StatusCode::OK,
+            r#"{"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_cache_hit_tokens":80,"price_cny":7.1}}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let failed_id = create_proxy_api_credential(&pool, "failed", &failed_upstream).await;
+        let healthy_id = create_proxy_api_credential(&pool, "healthy", &healthy_upstream).await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[failed_id.clone(), healthy_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("body"),
+            r#"{"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_cache_hit_tokens":80,"price_cny":7.1}}"#
+        );
+        let failed = RouteCredentialRepository::get(&pool, &failed_id)
+            .await
+            .expect("failed account");
+        assert_eq!(failed.status, "ok");
+        assert_eq!(failed.transient_failure_count, 1);
+        // Cooldown is opt-in, so the failure counts but schedules no backoff.
+        assert!(failed.next_retry_at.is_none());
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &healthy_id)
+                .await
+                .expect("healthy account")
+                .status,
+            "ok"
+        );
+        assert_eq!(
+            RoutePoolRepository::next_cursor_index(&pool, "codex")
+                .await
+                .expect("next cursor"),
+            0
+        );
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_events WHERE source_label = 'route_proxy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage count");
+        assert_eq!(usage_count, 2);
+        let stats = RoutePoolRepository::stats(&pool, "codex", None, 1, 20)
+            .await
+            .expect("usage stats");
+        assert_eq!(stats.requests.len(), 2);
+        let healthy_request = stats
+            .requests
+            .iter()
+            .find(|request| request.account_id.as_deref() == Some(healthy_id.as_str()))
+            .expect("healthy request row");
+        let failed_request = stats
+            .requests
+            .iter()
+            .find(|request| request.account_id.as_deref() == Some(failed_id.as_str()))
+            .expect("failed request row");
+        let healthy_metadata: Value =
+            serde_json::from_str(&healthy_request.metadata_json).expect("healthy metadata");
+        let failed_metadata: Value =
+            serde_json::from_str(&failed_request.metadata_json).expect("failed metadata");
+        assert_eq!(
+            failed_metadata
+                .pointer("/response_body")
+                .and_then(Value::as_str),
+            Some(failed_response_body)
+        );
+        assert_eq!(
+            healthy_metadata
+                .pointer("/response_body")
+                .and_then(Value::as_str),
+            Some(
+                r#"{"usage":{"prompt_tokens":120,"completion_tokens":30,"prompt_cache_hit_tokens":80,"price_cny":7.1}}"#
+            )
+        );
+        assert_eq!(healthy_request.input_tokens, Some(120));
+        assert_eq!(healthy_request.output_tokens, Some(30));
+        assert_eq!(healthy_request.cache_tokens, Some(80));
+        assert_eq!(healthy_request.price_cny_micros, Some(7_100_000));
+        assert_eq!(healthy_request.price_currency.as_deref(), Some("cny"));
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_fails_over_to_next_pool_account() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (stalled_upstream, stalled_connections) = start_stalled_upstream().await;
+        let healthy_upstream = start_fixed_upstream(StatusCode::OK, r#"{"ok":true}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        // retry_count 0 keeps the assertion about failover (not same-account
+        // retries) unambiguous; the retry budget is covered by its own test.
+        let stalled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "stalled",
+            &stalled_upstream,
+            json!({"failure_policy": {"retry_count": 0}}),
+        )
+        .await;
+        let healthy_id = create_proxy_api_credential(&pool, "healthy", &healthy_upstream).await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[stalled_id.clone(), healthy_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start_with_test_upstream_timeouts(
+            &runtime,
+            pool.clone(),
+            RouteProxyTransport::HttpOnly,
+            OutboundTimeouts {
+                connect: Some(Duration::from_millis(500)),
+                read: Some(Duration::from_millis(300)),
+                ..OutboundTimeouts::default()
+            },
+        )
+        .await
+        .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // Without a read deadline this request never returns at all.
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.expect("body"), r#"{"ok":true}"#);
+        assert_eq!(
+            stalled_connections.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let stalled = RouteCredentialRepository::get(&pool, &stalled_id)
+            .await
+            .expect("stalled account");
+        assert_eq!(stalled.transient_failure_count, 1);
+        assert_eq!(stalled.last_failure_kind.as_deref(), Some("transport"));
+        // Cooldown is opt-in, so the failure counts but schedules no backoff.
+        assert!(stalled.next_retry_at.is_none());
+        assert!(stalled
+            .last_failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("stalled connection")));
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &healthy_id)
+                .await
+                .expect("healthy account")
+                .status,
+            "ok"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_exhausts_same_account_retries_before_failing_over() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (stalled_upstream, stalled_connections) = start_stalled_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let stalled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "stalled",
+            &stalled_upstream,
+            json!({"failure_policy": {"retry_count": 2, "retry_interval_ms": 0}}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&stalled_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start_with_test_upstream_timeouts(
+            &runtime,
+            pool.clone(),
+            RouteProxyTransport::HttpOnly,
+            OutboundTimeouts {
+                connect: Some(Duration::from_millis(500)),
+                read: Some(Duration::from_millis(200)),
+                ..OutboundTimeouts::default()
+            },
+        )
+        .await
+        .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // Only candidate in the pool, so the request ends in an error rather
+        // than hanging — but not before the retry budget is spent.
+        assert_ne!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            stalled_connections.load(std::sync::atomic::Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &stalled_id)
+                .await
+                .expect("stalled account")
+                .transient_failure_count,
+            1
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The payload for the streaming tests, split so that chunk 2 ends in the
+    /// middle of a JSON payload and chunk 3 completes it.
+    const CHUNKED_SSE_PARTS: [&str; 4] = [
+        "data: {\"id\":\"chatcmpl-1\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_to",
+        "kens\":11,\"completion_tokens\":4}}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    ];
+
+    /// The core promise of streaming: the client sees the opening bytes while the
+    /// upstream is still generating.
+    ///
+    /// The upstream pauses between chunks, so if the proxy were buffering, the
+    /// first byte could not arrive before the whole generation finished.
+    #[tokio::test]
+    async fn streams_first_bytes_to_the_client_before_the_upstream_finishes() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let gap = Duration::from_millis(250);
+        let (upstream, _calls) = start_chunked_sse_upstream(CHUNKED_SSE_PARTS.to_vec(), gap).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "streaming", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let started = Instant::now();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stream = Box::pin(response.bytes_stream());
+        let first = futures_util::StreamExt::next(&mut stream)
+            .await
+            .expect("first chunk")
+            .expect("first chunk bytes");
+        let first_byte_at = started.elapsed();
+        assert!(!first.is_empty());
+
+        // Three gaps remain after the first chunk, so a buffering proxy could not
+        // have answered before 3 * gap.
+        let total_upstream_time = gap * (CHUNKED_SSE_PARTS.len() as u32 - 1);
+        assert!(
+            first_byte_at < total_upstream_time,
+            "first byte took {first_byte_at:?}, which is not sooner than the \
+             upstream's own {total_upstream_time:?} — the response was buffered"
+        );
+
+        let mut body = first.to_vec();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            body.extend_from_slice(&chunk.expect("chunk bytes"));
+        }
+        assert_eq!(body, CHUNKED_SSE_PARTS.concat().as_bytes());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// Usage has to survive the switch to streaming, including when the frame
+    /// carrying it was split across chunks.
+    #[tokio::test]
+    async fn streamed_response_still_records_usage_and_clears_failures() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, _calls) =
+            start_chunked_sse_upstream(CHUNKED_SSE_PARTS.to_vec(), Duration::from_millis(0)).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "streaming", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // Drain fully so the completion hook runs.
+        let _ = response.bytes().await.expect("proxy body");
+
+        let request = wait_for_single_request_event(&pool).await;
+        assert_eq!(request.input_tokens, Some(11));
+        assert_eq!(request.output_tokens, Some(4));
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("credential")
+                .status,
+            "ok"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The account screen answers `route-credential-status` by refetching the
+    /// account page, the whole account list and the pool, and by re-rendering
+    /// every managed client config to diff it against disk. A request that left
+    /// the account exactly as healthy as it found it must therefore stay quiet —
+    /// announcing each one made the list reload once per proxied request.
+    #[tokio::test]
+    async fn a_success_that_clears_nothing_announces_no_status_change() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+        use crate::services::route_credential_activity::{
+            ROUTE_CREDENTIAL_ACTIVITY_EVENT, ROUTE_CREDENTIAL_STATUS_EVENT,
+        };
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let (upstream, _calls) =
+            start_chunked_sse_upstream(CHUNKED_SSE_PARTS.to_vec(), Duration::from_millis(0)).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "quiet", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        // Native events are queued even before the host starts polling.
+        runtime
+            .activity()
+            .set_emitter(EventEmitter::Web(Arc::clone(&broadcaster)));
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // Drain fully so the completion hook — which is what decides whether to
+        // announce anything — actually runs.
+        let _ = response.bytes().await.expect("proxy body");
+        let _ = wait_for_single_request_event(&pool).await;
+
+        let mut activity_seen = false;
+        let status_event = tokio::time::timeout(Duration::from_millis(1_500), async {
+            loop {
+                for event in broadcaster.drain() {
+                    if event["topic"] == ROUTE_CREDENTIAL_STATUS_EVENT {
+                        return event;
+                    }
+                    activity_seen |= event["topic"] == ROUTE_CREDENTIAL_ACTIVITY_EVENT;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            status_event.is_err(),
+            "a healthy account's success must not be announced as a status change"
+        );
+        // The concurrency counters ride a different channel and must keep flowing:
+        // this is what proves the emitter was wired up at all.
+        assert!(
+            activity_seen,
+            "expected the per-request activity events to still be emitted"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A buffered (non-streaming) "request too large" reply must be returned to
+    /// the client verbatim, without retrying and without charging any account:
+    /// every pool member would reject the same bytes, so a walk can only produce
+    /// the aggregated "all route credentials failed" error and cool down healthy
+    /// accounts. Verbatim from a live gateway (HTTP 502).
+    #[tokio::test]
+    async fn context_length_overflow_is_returned_without_retrying_or_penalizing() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const OVERFLOW: &str = r#"{"error":{"message":"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.","type":"server_error","param":null,"code":null}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_GATEWAY,
+            OVERFLOW,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let overflow =
+            create_proxy_api_credential_with_config(&pool, "overflow", &upstream, mapping.clone())
+                .await;
+        let backup =
+            create_proxy_api_credential_with_config(&pool, "overflow-backup", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[overflow.clone(), backup.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "Codex 必须收到能识别的结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "只有结构化 code 才能触发后续自动压缩: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "上游可操作的原文也必须保留: {body}"
+        );
+        assert!(
+            !body.contains("All route credentials failed"),
+            "不得把请求过大当成账号失败: {body}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "请求过大重试多少次都不会变好，只能打上游一次"
+        );
+        for credential_id in [overflow, backup] {
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.next_retry_at.is_none());
+            assert!(account.last_failure_message.is_none());
+        }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The chat entry point has a second shape: the upstream accepts the
+    /// streaming request with a 200 and reports the context rejection as an SSE
+    /// error frame. Nothing reached the client yet, so it must still be answered
+    /// as a Chat error document instead of a Responses event.
+    #[tokio::test]
+    async fn streamed_chat_context_length_overflow_is_returned_as_a_chat_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\",\"code\":null}}\n\n",
+            ],
+            Duration::from_millis(0),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "chat-stream-overflow",
+            &upstream,
+            mapping,
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "messages": [{"role":"user","content":"0"}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.expect("chat error json");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("maximum context length")),
+            "上游可操作的原文也必须保留: {body}"
+        );
+        assert!(
+            body.get("type").is_none(),
+            "Chat 客户端不能收到 Responses 事件: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// Only Codex compacts from `context_length_exceeded`; only Chat speaks the
+    /// OpenAI error document. Every other inbound protocol must keep receiving
+    /// the upstream's own bytes and status, unchanged by this rule.
+    #[tokio::test]
+    async fn a_context_rejection_on_another_protocol_is_passed_through_verbatim() {
+        const UPSTREAM_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let failure = crate::services::response_failure_service::SemanticResponseFailure {
+            code: None,
+            error_type: Some("invalid_request_error".to_string()),
+            message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+        };
+
+        let response = context_length_failure_response(
+            "claude",
+            "/v1/messages",
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            UPSTREAM_BODY.as_bytes(),
+            &failure,
+        )
+        .expect("passthrough response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8"),
+            UPSTREAM_BODY,
+            "other protocols must not be rewritten into a Responses or Chat error"
+        );
+    }
+
+    /// Chat Completions clients do not have Codex's compaction path, but they
+    /// still need the upstream's null-code context rejection normalized into the
+    /// standard Chat error shape. A Responses `response.failed` event here would
+    /// be unparsable to them.
+    #[tokio::test]
+    async fn chat_context_length_overflow_is_returned_as_a_chat_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const OVERFLOW: &str = r#"{"error":{"message":"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.","type":"server_error","param":null,"code":null}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_GATEWAY,
+            OVERFLOW,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "chat-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "messages": [{"role":"user","content":"0"}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body: Value = response.json().await.expect("chat error json");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("maximum context length")),
+            "上游可操作的原文也必须保留: {body}"
+        );
+        assert!(
+            body.get("type").is_none(),
+            "Chat 客户端不能收到 Responses 事件: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A streamed "request too large" reply whose error frame arrives in the
+    /// opening read. The prime loop is still inside the retry window, so this is
+    /// where a failover walk would burn the whole pool on a request none of them
+    /// can serve. It must instead surface the upstream's own message once.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_in_the_opening_frame_is_returned_once() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // One read: the opening role frame followed by the gateway's error frame —
+        // the shape captured in the live request log.
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n",
+        ]])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let overflow = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-overflow",
+            &upstream,
+            mapping.clone(),
+        )
+        .await;
+        let backup = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-overflow-backup",
+            &upstream,
+            mapping,
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[overflow.clone(), backup.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "流式请求的首帧也必须改成结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "结构化 code 缺失时 Codex 不会自动压缩: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "客户端必须看到上游原文: {body}"
+        );
+        assert!(
+            !body.contains("All route credentials failed"),
+            "不得把请求过大当成账号失败: {body}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "首帧即请求过大，重试多少次都不会变好"
+        );
+        for credential_id in [overflow, backup] {
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.next_retry_at.is_none());
+            assert!(account.last_failure_message.is_none());
+        }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A streamed "request too large" reply whose error frame arrives *after* the
+    /// first frame already reached the client. The bytes are gone, so this cannot
+    /// become a retry — but it must not be booked as an account-harming
+    /// `stream disconnected`: the upstream said exactly what was wrong, and that
+    /// message has to survive into the request log.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_after_output_is_not_charged_as_a_disconnect() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\"}}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            Duration::from_millis(20),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "late-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("proxy body");
+        // The user-visible failure is the whole point: the bridged event has to
+        // carry the code Codex compacts on, not the upstream's null.
+        assert!(
+            body.contains("\"type\":\"response.failed\""),
+            "首帧之后到达的错误也必须改写成结构化失败事件: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "桥接层必须补上 Codex 能识别的结构化 code: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "改写不能丢掉上游原文: {body}"
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "已经下发的字节无法重放，请求过大也不该再打同一个账号"
+        );
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert!(
+            !account
+                .last_failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stream disconnected")),
+            "上游已明确说明请求过大，不得记成断流: {:?}",
+            account.last_failure_message
+        );
+    }
+
+    /// A Responses-shaped opening frame followed by the gateway's null-code
+    /// context error in the same read is already past the prime loop. Codex
+    /// must still see the recognized structured code, not the raw error frame.
+    #[tokio::test]
+    async fn streamed_context_length_overflow_after_opening_responses_frame_is_rewritten() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\ndata: {\"error\":{\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\",\"type\":\"server_error\",\"code\":null}}\n\n",
+            ],
+            Duration::from_millis(0),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "deepseek-v4.1-flash-free", "to": "deepseek-v4.1-flash-free"}],
+            "failure_policy": {"retry_count": 3, "retry_interval_ms": 0}});
+        let credential_id =
+            create_proxy_api_credential_with_config(&pool, "opening-overflow", &upstream, mapping)
+                .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "deepseek-v4.1-flash-free",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"0"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("proxy body");
+        assert!(
+            body.contains("\"code\":\"context_length_exceeded\""),
+            "上游 code 为 null 时也必须改写成 Codex 能识别的结构: {body}"
+        );
+        assert!(
+            body.contains("maximum context length"),
+            "改写不能丢掉上游原文: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "请求过大不得重试");
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A stream that carried data but never terminated is still charged against
+    /// the account, even though the bytes are already gone and cannot be retried.
+    #[tokio::test]
+    async fn truncated_stream_is_recorded_without_retrying() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // Data frames, but no `finish_reason`, no `[DONE]`, no `message_stop`.
+        let (upstream, calls) = start_chunked_sse_upstream(
+            vec![
+                "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            ],
+            Duration::from_millis(0),
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "truncating", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        // The client keeps its 200 and its bytes: they were already delivered.
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.bytes().await.expect("proxy body");
+
+        // Exactly one upstream call — a truncated stream must not be retried.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let credential = wait_for_transient_failure(&pool, &credential_id).await;
+        assert!(
+            credential
+                .last_failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stream disconnected")),
+            "expected a stream-disconnect failure, got {:?}",
+            credential.last_failure_message
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The shape that actually produced `stream disconnected before completion`
+    /// for OpenRouter-routed models: the gateway parks the client on keepalive
+    /// comments, then reports `provider_unavailable` instead of answering.
+    ///
+    /// Not one payload byte reached the client, so the attempt is still
+    /// retryable — and before this rule it was not, because the comments were
+    /// forwarded the moment they arrived and spent the only window a retry has.
+    #[tokio::test]
+    async fn stream_failing_after_keepalive_padding_is_retried() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const PADDING: [&str; 3] = [
+            ": OPENROUTER PROCESSING\n\n",
+            ": OPENROUTER PROCESSING\n\n",
+            ": OPENROUTER PROCESSING\n\n",
+        ];
+        const PROVIDER_UNAVAILABLE: &str = "data: {\"id\":\"gen-1\",\"choices\":[],\"error\":{\"code\":502,\"message\":\"Provider returned an empty response\",\"metadata\":{\"error_type\":\"provider_unavailable\"}}}\n\n";
+
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            [PADDING[0], PADDING[1], PADDING[2], PROVIDER_UNAVAILABLE].to_vec(),
+            CHUNKED_SSE_PARTS.to_vec(),
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        // retry_interval_ms is set far above the delay this failure kind uses, so
+        // a regression that falls back to the policy backoff shows up as a slow
+        // test rather than a silent one.
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "queued-then-empty",
+            &upstream,
+            json!({"failure_policy": {"retry_count": 2, "retry_interval_ms": 30_000}}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let started = Instant::now();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.expect("proxy body");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the attempt that reported provider_unavailable must be retried"
+        );
+        assert_eq!(
+            body,
+            CHUNKED_SSE_PARTS.concat().as_bytes(),
+            "the client gets the retried stream, never the failure frame"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the retry must wait the stream-disconnect delay, not the credential's \
+             30s policy backoff; took {elapsed:?}"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// Holding the comments back must not cost a healthy stream anything: the
+    /// padding is still forwarded verbatim, ahead of the payload.
+    #[tokio::test]
+    async fn keepalive_padding_on_a_healthy_stream_is_forwarded_unchanged() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const PADDING: &str = ": OPENROUTER PROCESSING\n\n";
+        let mut script = vec![PADDING];
+        script.extend(CHUNKED_SSE_PARTS.iter().copied());
+        let (upstream, calls) = start_scripted_sse_upstream(vec![script]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "padded", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        let body = response.bytes().await.expect("proxy body");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a healthy stream must not be retried"
+        );
+        let mut expected = PADDING.to_string();
+        expected.push_str(&CHUNKED_SSE_PARTS.concat());
+        assert_eq!(body, expected.as_bytes(), "padding is forwarded verbatim");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// Padding must not become an unbounded stall: once the hold-back passes its
+    /// cap the stream is forwarded as it stands, whatever it contains.
+    #[tokio::test]
+    async fn endless_keepalive_padding_stops_holding_the_request() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // Comfortably past STREAM_PRIME_HOLDBACK_LIMIT, so the hold-back has
+        // to give up rather than wait for a payload frame that never comes.
+        let filler = ": OPENROUTER PROCESSING\n\n".repeat(4096);
+        assert!(
+            filler.len() > STREAM_PRIME_HOLDBACK_LIMIT,
+            "前提：这段填充必须超过 hold-back 上限，否则测的就不是上限而是转发"
+        );
+        let filler: &'static str = Box::leak(filler.into_boxed_str());
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![filler]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "endless-padding", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        let body = response.bytes().await.expect("proxy body");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            body,
+            filler.as_bytes(),
+            "the padding is released once capped"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A stream that dies before its first byte has touched nothing on the
+    /// client, so it must still fail over to the next account.
+    #[tokio::test]
+    async fn stream_failing_before_first_byte_fails_over_to_next_account() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (empty_upstream, empty_calls) = start_empty_stream_upstream().await;
+        let (healthy_upstream, healthy_calls) =
+            start_chunked_sse_upstream(CHUNKED_SSE_PARTS.to_vec(), Duration::from_millis(0)).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        // retry_count 0 so the empty upstream is abandoned immediately rather
+        // than retried on the same account.
+        let empty_id = create_proxy_api_credential_with_config(
+            &pool,
+            "empty",
+            &empty_upstream,
+            json!({"failure_policy": {"retry_count": 0}}),
+        )
+        .await;
+        let healthy_id = create_proxy_api_credential(&pool, "healthy", &healthy_upstream).await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[empty_id.clone(), healthy_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[],"stream":true}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.expect("proxy body");
+        assert_eq!(body, CHUNKED_SSE_PARTS.concat().as_bytes());
+
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A bridge that has to aggregate the whole stream before it can re-emit
+    /// anything must stay on the buffered path — streaming it would hand the
+    /// client a body the transform cannot produce yet.
+    #[tokio::test]
+    async fn a_bridge_without_an_incremental_form_stays_buffered() {
+        let empty = std::collections::HashSet::new();
+        let namespaces = std::collections::BTreeMap::new();
+        let api = streaming_gate_credential("api");
+
+        for kind in [
+            ProtocolBridgeKind::ClaudeToChat,
+            ProtocolBridgeKind::ClaudeToResponses,
+            ProtocolBridgeKind::ClaudeToGemini,
+            ProtocolBridgeKind::ChatToResponses,
+            ProtocolBridgeKind::ChatToAnthropic,
+            ProtocolBridgeKind::ChatToGemini,
+            ProtocolBridgeKind::ResponsesToAnthropic,
+            ProtocolBridgeKind::ResponsesToGemini,
+        ] {
+            assert!(
+                !should_stream_upstream_response(
+                    Some(kind),
+                    true,
+                    StatusCode::OK,
+                    &empty,
+                    &api,
+                    &namespaces
+                ),
+                "{kind:?} aggregates the stream and must stay buffered"
+            );
+        }
+
+        let passthrough =
+            should_stream_upstream_response(None, true, StatusCode::OK, &empty, &api, &namespaces);
+        assert!(passthrough, "an unbridged streaming 2xx should stream");
+    }
+
+    /// The two record-by-record bridges stream, custom tools and all: the
+    /// transform is applied per frame, so neither the bridge nor a custom tool
+    /// forces the client to wait for the whole generation.
+    #[tokio::test]
+    async fn record_by_record_bridges_stream_even_with_custom_tools() {
+        let namespaces = std::collections::BTreeMap::new();
+        let api = streaming_gate_credential("api");
+        let custom_tools = std::collections::HashSet::from(["apply_patch".to_string()]);
+
+        for kind in [
+            ProtocolBridgeKind::ResponsesToResponses,
+            ProtocolBridgeKind::ResponsesToChat,
+        ] {
+            assert!(
+                should_stream_upstream_response(
+                    Some(kind),
+                    true,
+                    StatusCode::OK,
+                    &custom_tools,
+                    &api,
+                    &namespaces
+                ),
+                "{kind:?} rewrites record by record and must stream"
+            );
+        }
+
+        // The unbridged path still needs the whole body for that rewrite: it
+        // forwards bytes verbatim and has nowhere to hook a per-record pass.
+        assert!(
+            !should_stream_upstream_response(
+                None,
+                true,
+                StatusCode::OK,
+                &custom_tools,
+                &api,
+                &namespaces
+            ),
+            "the unbridged path still buffers to restore custom tools"
+        );
+    }
+
+    /// The streamed transform and the buffered one must emit the same bytes.
+    ///
+    /// Whether a turn goes through `StreamResponseTransform` or
+    /// `transform_response_with_tool_namespaces` is decided by `stream: true`
+    /// and by which bridge the upstream needed — never by anything the user can
+    /// see. So the two paths are one contract expressed twice, and the only
+    /// proof they still agree is comparing their output on the same body.
+    ///
+    /// Chunk boundaries land mid-record on purpose: one byte at a time is the
+    /// worst case a slow upstream can produce, and it is exactly where a naive
+    /// framer drops a `data:` line or duplicates a `\n\n`.
+    #[test]
+    fn the_streamed_transform_matches_the_buffered_one_byte_for_byte() {
+        // Reasoning, text, a usage tail and the `[DONE]` sentinel: the shapes a
+        // Chat upstream actually sends.
+        //
+        // Every chunk carries an explicit `created`, the way a real Chat
+        // upstream sends it. Without it both paths fall back to the clock on
+        // their own, and the two readings land in different seconds whenever
+        // this test happens to straddle one — a diff that is about the test's
+        // wall-clock luck and not about the transform.
+        let chat_sse = concat!(
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":null},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Let me think.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"apply_patch\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"cc-1\",\"model\":\"deepseek-chat\",\"created\":1700000000,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        // `event:` lines next to the payload, a namespaced tool call and an
+        // `apply_patch` call — so the namespace rewrite and the custom-tool
+        // restore both have something to do instead of passing vacuously.
+        let responses_sse = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc1\",\"type\":\"function_call\",\"name\":\"mcp__browser__open\",\"call_id\":\"call_1\",\"arguments\":\"\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"fc2\",\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"call_2\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc2\",\"output_index\":1,\"delta\":\"{}\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc1\",\"type\":\"function_call\",\"name\":\"mcp__browser__open\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"fc2\",\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"call_2\",\"arguments\":\"{}\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        );
+        let cases = [
+            (
+                ProtocolBridgeKind::ResponsesToChat,
+                "text/event-stream",
+                chat_sse,
+            ),
+            (
+                ProtocolBridgeKind::ResponsesToResponses,
+                "text/event-stream",
+                responses_sse,
+            ),
+        ];
+
+        for (kind, content_type, body) in cases {
+            for namespaces in [
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::from([(
+                    "mcp__browser__open".to_string(),
+                    "mcp__browser__".to_string(),
+                )]),
+            ] {
+                for custom_tools in [
+                    std::collections::HashSet::new(),
+                    std::collections::HashSet::from(["apply_patch".to_string()]),
+                ] {
+                    // Exactly what the buffered branch of the proxy does: the
+                    // whole-body transform, then the custom-tool restore.
+                    let buffered = transform_response_with_tool_namespaces(
+                        kind,
+                        200,
+                        Some(content_type),
+                        body.as_bytes(),
+                        &namespaces,
+                    )
+                    .expect("buffered transform");
+                    let pre_restore = String::from_utf8_lossy(&buffered.body).into_owned();
+                    let expected =
+                        restore_custom_tools_in_responses_payload(&buffered.body, &custom_tools);
+                    let expected_text = String::from_utf8_lossy(&expected).into_owned();
+
+                    // Responses → Responses has nothing to rewrite without a
+                    // namespace or a custom tool, and its documented behaviour
+                    // is a byte-for-byte passthrough. Everywhere else the
+                    // comparison would be vacuous if nothing changed.
+                    let pure_passthrough = kind == ProtocolBridgeKind::ResponsesToResponses
+                        && namespaces.is_empty()
+                        && custom_tools.is_empty();
+                    if pure_passthrough {
+                        assert_eq!(
+                            expected_text, body,
+                            "{kind:?} must stay a byte-for-byte passthrough"
+                        );
+                    } else {
+                        assert_ne!(
+                            expected_text, body,
+                            "{kind:?} left the body untouched, so equality proves nothing"
+                        );
+                    }
+                    if !custom_tools.is_empty() && pre_restore.contains("\"apply_patch\"") {
+                        assert!(
+                            expected_text.contains("custom_tool_call"),
+                            "{kind:?} did not restore the custom tool: {expected_text}"
+                        );
+                    }
+                    if !namespaces.is_empty() && kind == ProtocolBridgeKind::ResponsesToResponses {
+                        assert!(
+                            expected_text.contains("\"namespace\":\"mcp__browser__\""),
+                            "the namespace rewrite never ran: {expected_text}"
+                        );
+                    }
+
+                    for chunk_size in [1usize, 7, body.len()] {
+                        let mut transform = StreamResponseTransform::new(
+                            kind,
+                            IncrementalResponseBridge::new(kind, &namespaces)
+                                .expect("both bridges have an incremental form"),
+                            StatusCode::OK,
+                            Some(content_type.to_string()),
+                            namespaces.clone(),
+                            custom_tools.clone(),
+                        );
+                        let mut streamed = Vec::new();
+                        for chunk in body.as_bytes().chunks(chunk_size) {
+                            streamed.extend_from_slice(
+                                transform.push(chunk).expect("incremental push").as_bytes(),
+                            );
+                        }
+                        streamed.extend_from_slice(
+                            transform.finish().expect("incremental finish").as_bytes(),
+                        );
+                        assert!(
+                            !streamed.is_empty(),
+                            "{kind:?} emitted nothing at chunk size {chunk_size}"
+                        );
+
+                        assert_eq!(
+                            String::from_utf8_lossy(&streamed),
+                            String::from_utf8_lossy(&expected),
+                            "{kind:?} diverged at chunk size {chunk_size} \
+                             (namespaces {}, custom tools {})",
+                            namespaces.len(),
+                            custom_tools.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each remaining gate condition, so a future change cannot quietly widen
+    /// the streaming path past what has an incremental equivalent.
+    #[tokio::test]
+    async fn streaming_gate_rejects_every_case_needing_the_whole_body() {
+        let empty = std::collections::HashSet::new();
+        let namespaces = std::collections::BTreeMap::new();
+        let api = streaming_gate_credential("api");
+
+        assert!(
+            !should_stream_upstream_response(
+                None,
+                false,
+                StatusCode::OK,
+                &empty,
+                &api,
+                &namespaces
+            ),
+            "a non-streaming reply has nothing to stream"
+        );
+        assert!(
+            !should_stream_upstream_response(
+                None,
+                true,
+                StatusCode::TOO_MANY_REQUESTS,
+                &empty,
+                &api,
+                &namespaces
+            ),
+            "a non-2xx body decides retry classification and must be buffered"
+        );
+        assert!(
+            !should_stream_upstream_response(
+                None,
+                true,
+                StatusCode::OK,
+                &std::collections::HashSet::from(["my_tool".to_string()]),
+                &api,
+                &namespaces
+            ),
+            "the unbridged path buffers to restore custom tools"
+        );
+        assert!(
+            !should_stream_upstream_response(
+                None,
+                true,
+                StatusCode::OK,
+                &empty,
+                &streaming_gate_credential("official"),
+                &namespaces
+            ),
+            "official credentials parse the body for quota signals"
+        );
+    }
+
+    /// `entry_path` is the client's path and says nothing about the upstream
+    /// dialect. Grouping a week of Codex traffic by it once produced the wrong
+    /// conclusion — "only Anthropic upstreams lose reasoning" — because every
+    /// Codex turn is recorded as `/v1/responses` whichever upstream it reached.
+    /// `upstream_path` is derived from `target_url`, so that question is
+    /// answerable from the request log alone.
+    #[test]
+    fn request_metadata_records_the_upstream_path_beside_the_client_one() {
+        let credential = streaming_gate_credential("api");
+        let metadata: Value = serde_json::from_str(&route_proxy_request_metadata(
+            1,
+            "codex",
+            &credential,
+            "/v1/responses",
+            Some("https://api.example.com/v1/chat/completions"),
+            Some(200),
+            true,
+            None,
+            Instant::now(),
+            None,
+            Some("gpt-5"),
+            Some("gpt-5"),
+            None,
+        ))
+        .expect("metadata json");
+
+        assert_eq!(metadata["entry_path"], "/v1/responses");
+        assert_eq!(
+            metadata["path"], "/v1/responses",
+            "the legacy key keeps its old meaning for older readers"
+        );
+        assert_eq!(metadata["upstream_path"], "/v1/chat/completions");
+    }
+
+    /// "Is the proxy retrying, or is the upstream failing?" is not answerable
+    /// from a request log that records only success/failure: every row of a
+    /// retried request looks identical to every other.
+    #[test]
+    fn request_metadata_records_the_attempt_and_its_retry_count() {
+        let credential = streaming_gate_credential("api");
+        let parse = |attempt: usize| -> Value {
+            serde_json::from_str(&route_proxy_request_metadata(
+                attempt,
+                "codex",
+                &credential,
+                "/v1/responses",
+                None,
+                Some(200),
+                true,
+                None,
+                Instant::now(),
+                None,
+                Some("gpt-5"),
+                Some("gpt-5"),
+                None,
+            ))
+            .expect("metadata json")
+        };
+
+        let first = parse(1);
+        assert_eq!(first["attempt"], 1);
+        assert_eq!(first["retry_count"], 0, "the first send is not a retry");
+
+        let third = parse(3);
+        assert_eq!(third["attempt"], 3);
+        assert_eq!(third["retry_count"], 2);
+    }
+
+    #[test]
+    fn upstream_path_keeps_a_base_url_prefix_and_drops_the_query() {
+        assert_eq!(
+            upstream_path_from_target_url(Some(
+                "https://api.example.com/openai/v1/messages?beta=true"
+            ))
+            .as_deref(),
+            Some("/openai/v1/messages")
+        );
+        assert_eq!(
+            upstream_path_from_target_url(Some("https://api.example.com/v1/responses")).as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            upstream_path_from_target_url(Some("https://api.example.com/")).as_deref(),
+            None,
+            "a bare host is not an endpoint"
+        );
+        assert_eq!(upstream_path_from_target_url(None), None);
+    }
+
+    fn streaming_gate_credential(kind: &str) -> SelectedCredential {
+        SelectedCredential {
+            id: "credential".to_string(),
+            platform: "codex".to_string(),
+            kind: kind.to_string(),
+            display_name: "Credential".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"api_key":"sk-upstream"}"#.to_string(),
+            config_json: "{}".to_string(),
+        }
+    }
+
+    /// A streamed response is booked by the completion hook once the stream
+    /// ends, which can land just after the client's last chunk. Poll rather than
+    /// assume the row is already there.
+    async fn wait_for_single_request_event(
+        pool: &SqlitePool,
+    ) -> crate::models::route_pool::RoutePoolUsageLog {
+        for _ in 0..100 {
+            let stats = RoutePoolRepository::stats(pool, "codex", None, 1, 20)
+                .await
+                .expect("usage stats");
+            if let Some(request) = stats.requests.into_iter().next() {
+                return request;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no route_proxy request event was recorded");
+    }
+
+    async fn wait_for_transient_failure(
+        pool: &SqlitePool,
+        credential_id: &str,
+    ) -> crate::models::route_credential::RouteCredential {
+        for _ in 0..100 {
+            let credential = RouteCredentialRepository::get(pool, credential_id)
+                .await
+                .expect("credential");
+            if credential.transient_failure_count > 0 {
+                return credential;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("credential never recorded a transient failure");
+    }
+
+    #[tokio::test]
+    async fn retries_overloaded_account_until_success() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_sequence_upstream(2, r#"{"ok":true}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "overloaded", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.expect("proxy body")["ok"],
+            true
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("credential")
+                .status,
+            "ok"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A replayed `thinking` block only verifies against the account that minted
+    /// it, and the pool rotates accounts between turns, so the first turn to reuse
+    /// the reasoning lands somewhere that refuses it. The proxy has to recover the
+    /// turn by rewriting the body — no other account can accept this history — and
+    /// must not charge the account for history it did not write.
+    #[tokio::test]
+    async fn rejected_thinking_signature_is_retried_without_the_replayed_reasoning() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls, bodies) = start_thinking_signature_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_anthropic_credential(&pool, "relay", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "claude", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "claude", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/messages",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 64,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "read a.txt"}]},
+                    {"role": "assistant", "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Let me read it.",
+                            "signature": "minted-by-another-account"
+                        },
+                        {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "hi"}
+                    ]}
+                ]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // The client never sees the rejection.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.expect("body")["id"], "msg_1");
+        // One rejection, one rewritten retry — not the failure policy's three
+        // identical attempts, which could never have been accepted.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let recorded = bodies.lock().expect("recorded bodies").clone();
+        let first = serde_json::to_string(&recorded[0]).expect("first body");
+        assert!(
+            first.contains("minted-by-another-account"),
+            "the first attempt must be the client's own body: {first}"
+        );
+        let retry = &recorded[1];
+        let retried_turn = retry["messages"][1]["content"]
+            .as_array()
+            .expect("assistant content");
+        assert_eq!(retried_turn.len(), 1, "reasoning must be gone: {retry}");
+        assert_eq!(retried_turn[0]["type"], "tool_use");
+        // The stripped turn calls a tool, so thinking has to be off or the upstream
+        // would refuse it again for want of a leading thinking block.
+        assert_eq!(retry["thinking"], json!({"type": "disabled"}));
+        // The user's own words survive.
+        assert_eq!(retry["messages"][0]["content"][0]["text"], "read a.txt");
+        assert_eq!(retry["messages"][2]["content"][0]["type"], "tool_result");
+
+        // Neither the account nor the model is at fault, so neither is parked.
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 0);
+        assert!(credential.next_retry_at.is_none());
+        assert!(
+            credential.last_failure_message.is_none(),
+            "blamed the account: {:?}",
+            credential.last_failure_message
+        );
+        let parked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM route_credential_models \
+             WHERE status <> 'ok' OR transient_failure_count > 0 OR last_failure_message IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("model rows");
+        assert_eq!(parked, 0, "a working model must not be parked");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn conservative_cleanup_retries_invalid_reasoning_without_losing_history() {
+        for proactive in [false, true] {
+            let (upstream, calls, bodies) = start_encrypted_content_upstream().await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let credential_id = create_proxy_api_credential_with_config(
+                &pool, "responses relay", &upstream,
+                json!({
+                    "interface_format": "openai-responses", "responses_encrypted_content_cleanup": proactive,
+                    "failure_policy": {"retry_count": 0},
+                    "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+                }),
+            ).await;
+            RoutePoolRepository::replace_members(
+                &pool,
+                "codex",
+                std::slice::from_ref(&credential_id),
+            )
+            .await
+            .expect("members");
+            let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+                .await
+                .expect("key");
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .expect("proxy");
+            let request = json!({
+                "model": "gpt-6-astra", "store": false, "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": "codex-cli-key",
+                "input": [
+                    {"type": "reasoning", "id": "rs_bad", "encrypted_content": "bad", "summary": [{"type": "summary_text", "text": "keep plan"}]},
+                    {"type": "message", "id": "msg_1", "role": "user", "content": "continue"},
+                    {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+                    {"type": "compaction", "id": "cc_1", "encrypted_content": "keep compaction"}
+                ],
+                "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+            });
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1/responses",
+                    proxy.base_url.as_deref().unwrap()
+                ))
+                .bearer_auth(key)
+                .json(&request)
+                .send()
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<Value>().await.unwrap()["id"], "resp_1");
+            let expected_calls = if proactive { 1 } else { 2 };
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            let recorded = bodies.lock().unwrap().clone();
+            if !proactive {
+                assert_eq!(recorded[0], request);
+            }
+            let mut expected = request;
+            expected["input"][0].as_object_mut().unwrap().remove("id");
+            expected["input"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("encrypted_content");
+            assert_eq!(
+                recorded.last().unwrap(),
+                &expected,
+                "all actual history must survive cleanup"
+            );
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .unwrap();
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.last_failure_message.is_none());
+            RouteProxyService::stop(&runtime).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_resource_item_failure_preserves_references_and_does_not_penalize_accounts() {
+        const REJECTION: &str = r#"{"error":{"message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."}}"#;
+        for proactive in [false, true] {
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let recorded = Arc::clone(&bodies);
+            let app = Router::new().fallback(move |body: axum::body::Bytes| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        REJECTION,
+                    )
+                }
+            });
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let pool = create_memory_pool().await.unwrap();
+            run_migrations(&pool).await.unwrap();
+            let config = json!({
+                "interface_format": "openai-responses", "responses_encrypted_content_cleanup": proactive,
+                "failure_policy": {"retry_count": 3, "retry_interval_ms": 0},
+                "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+            });
+            let first =
+                create_proxy_api_credential_with_config(&pool, "first", &upstream, config.clone())
+                    .await;
+            let second =
+                create_proxy_api_credential_with_config(&pool, "second", &upstream, config).await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
+                .await
+                .unwrap();
+            let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+                .await
+                .unwrap();
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .unwrap();
+            let request = json!({
+                "model": "gpt-6-astra",
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": "codex-cli-key",
+                "input": [
+                    {"type": "item_reference", "id": "fc_foreign"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+                    {"id": "msg_implicit"}, {"type": null, "id": "rs_implicit"}
+                ]
+            });
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1/responses",
+                    proxy.base_url.as_deref().unwrap()
+                ))
+                .bearer_auth(key)
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.text().await.unwrap(), REJECTION);
+            assert_eq!(
+                *bodies.lock().unwrap(),
+                vec![request],
+                "preserve the real history; neither rewrite nor walk the pool"
+            );
+            for id in [first, second] {
+                let account = RouteCredentialRepository::get(&pool, &id).await.unwrap();
+                assert_eq!(account.status, "ok");
+                assert_eq!(account.transient_failure_count, 0);
+                assert!(account.last_failure_message.is_none());
+                assert!(account.next_retry_at.is_none());
+            }
+            let affected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM route_credential_models WHERE status <> 'ok' OR transient_failure_count > 0 OR cooldown_until IS NOT NULL OR last_failure_message IS NOT NULL")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(affected, 0);
+            RouteProxyService::stop(&runtime).await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn conservative_cleanup_does_not_retry_when_bridge_already_cleared_the_only_orphan_id() {
+        const REJECTION: &str = r#"{"error":{"code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}"#;
+        let (upstream, calls) =
+            start_status_sequence_upstream(usize::MAX, StatusCode::BAD_REQUEST, REJECTION, "{}")
+                .await;
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let id = create_proxy_api_credential_with_config(&pool, "relay", &upstream, json!({
+            "interface_format": "openai-responses", "failure_policy": {"retry_count": 3, "retry_interval_ms": 0},
+            "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+        })).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+            .await
+            .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().unwrap()
+            ))
+            .bearer_auth(key)
+            .json(&json!({
+                "model": "gpt-6-astra", "store": false,
+                "input": [{"type": "reasoning", "id": "rs_orphan", "summary": []},
+                          {"type": "compaction", "encrypted_content": "foreign-compaction"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.text().await.unwrap(), REJECTION);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a retry would resend the exact same upstream body"
+        );
+        let account = RouteCredentialRepository::get(&pool, &id).await.unwrap();
+        assert_eq!(account.transient_failure_count, 0);
+        assert!(account.last_failure_message.is_none());
+        RouteProxyService::stop(&runtime).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conservative_cleanup_preserves_unrecoverable_ciphertext_without_retry_or_penalty() {
+        const VALID: &str = "gAAAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQICAgICAgICAgICAgICAgIDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==";
+        const REJECTION: &str = r#"{"error":{"code":"invalid_encrypted_content","message":"encrypted content could not be verified"}}"#;
+        for proactive in [false, true] {
+            for item in [
+                json!({"type": "reasoning", "id": "rs_foreign", "summary": [], "encrypted_content": VALID}),
+                json!({"type": "compaction", "id": "cc_foreign", "encrypted_content": "compacted-history"}),
+            ] {
+                let bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+                let recorded = Arc::clone(&bodies);
+                let app = Router::new().fallback(move |body: axum::body::Bytes| {
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap());
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            REJECTION,
+                        )
+                    }
+                });
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let pool = create_memory_pool().await.unwrap();
+                run_migrations(&pool).await.unwrap();
+                let id = create_proxy_api_credential_with_config(&pool, "relay", &upstream, json!({
+                    "interface_format": "openai-responses", "responses_encrypted_content_cleanup": proactive,
+                    "failure_policy": {"retry_count": 3, "retry_interval_ms": 0},
+                    "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+                })).await;
+                RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+                    .await
+                    .unwrap();
+                let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+                    .await
+                    .unwrap();
+                let runtime = RouteProxyRuntimeState::default();
+                let proxy =
+                    RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                        .await
+                        .unwrap();
+                let request = json!({
+                    "model": "gpt-6-astra", "store": false,
+                    "include": ["reasoning.encrypted_content"],
+                    "prompt_cache_key": "codex-cli-key",
+                    "input": [item]
+                });
+                let response = reqwest::Client::new()
+                    .post(format!(
+                        "{}/v1/responses",
+                        proxy.base_url.as_deref().unwrap()
+                    ))
+                    .bearer_auth(key)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.text().await.unwrap(), REJECTION);
+                assert_eq!(*bodies.lock().unwrap(), vec![request]);
+                let account = RouteCredentialRepository::get(&pool, &id).await.unwrap();
+                assert_eq!(account.status, "ok");
+                assert_eq!(account.transient_failure_count, 0);
+                assert!(account.last_failure_message.is_none());
+                RouteProxyService::stop(&runtime).await.unwrap();
+                server.abort();
+            }
+        }
+    }
+
+    /// When the stripped body is refused too, the pool walk is pointless: every
+    /// Default behaviour (no opt-in switch): a Codex Responses client hits a Chat
+    /// upstream that mandates `reasoning_content`. The first turn is missing it and
+    /// the upstream returns 11155. The proxy must self-heal by supplying the field
+    /// and re-asking the *same* account once, so the client never sees the 400.
+    #[tokio::test]
+    async fn missing_reasoning_is_self_healed_by_one_forced_retry() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls, bodies) = start_missing_reasoning_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "deepseek-relay",
+            &upstream,
+            json!({"model_mappings": [{"from": "gpt-5", "to": "deepseek-reasoner"}]}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-mr")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        // Responses history whose assistant turn carries no reasoning — the 11155
+        // trigger. No tool calls, so the tool-call reasoning guarantee never fires.
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({
+                "model": "gpt-5",
+                "input": [
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "hi"}]},
+                    {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "earlier answer"}]},
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "continue"}]}
+                ]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // Client never sees the 400.
+        assert_eq!(response.status(), StatusCode::OK);
+        // Exactly one rejection then one healed retry — not a pool walk.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let recorded = bodies.lock().expect("recorded bodies").clone();
+        let first_assistant_has_reasoning = recorded[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m.get("reasoning_content").is_some());
+        assert!(
+            !first_assistant_has_reasoning,
+            "first attempt is the bare body"
+        );
+        let second_assistant_has_reasoning =
+            recorded[1]["messages"].as_array().unwrap().iter().any(|m| {
+                m["role"] == "assistant"
+                    && m.get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| !t.trim().is_empty())
+            });
+        assert!(
+            second_assistant_has_reasoning,
+            "retry supplies reasoning_content"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// With the opt-in switch on, the very first request already carries
+    /// `reasoning_content`, so the upstream accepts it without a retry round trip.
+    #[tokio::test]
+    async fn force_reasoning_switch_sends_reasoning_on_the_first_request() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls, _bodies) = start_missing_reasoning_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "deepseek-relay",
+            &upstream,
+            json!({
+                "force_reasoning_content": true,
+                "model_mappings": [{"from": "gpt-5", "to": "deepseek-reasoner"}]
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-fr")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({
+                "model": "gpt-5",
+                "input": [
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "hi"}]},
+                    {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "earlier answer"}]},
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "continue"}]}
+                ]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // No retry: the field was there on attempt one.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// remaining account refuses the same history for the same reason, and each
+    /// one would be parked for it. The upstream's own answer goes back instead.
+    #[tokio::test]
+    async fn responses_encrypted_content_failure_stops_without_polling_or_penalties() {
+        const REJECTION: &str = r#"{"error":{"message":"bad response status code 400 (request id: test-request)","type":"invalid_request_error","param":"","code":"invalid_encrypted_content"}}"#;
+        for replayed_state in [false, true] {
+            let (upstream, calls) = start_status_sequence_upstream(
+                usize::MAX,
+                StatusCode::BAD_REQUEST,
+                REJECTION,
+                "{}",
+            )
+            .await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let config = json!({
+                "interface_format": "openai-responses",
+                "failure_policy": {"retry_count": 3, "retry_interval_ms": 0},
+                "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+            });
+            let first =
+                create_proxy_api_credential_with_config(&pool, "first", &upstream, config.clone())
+                    .await;
+            let second =
+                create_proxy_api_credential_with_config(&pool, "second", &upstream, config).await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
+                .await
+                .expect("pool members");
+            let route_key =
+                RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                    .await
+                    .expect("route key");
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .expect("start proxy");
+            let mut request = json!({
+                "model": "gpt-6-astra", "input": [{"type": "message", "role": "user", "content": "hello"}]
+            });
+            if replayed_state {
+                request["input"].as_array_mut().unwrap().insert(
+                    0,
+                    json!({
+                        "type": "reasoning", "summary": [], "encrypted_content": "foreign-state"
+                    }),
+                );
+            }
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1/responses",
+                    proxy.base_url.as_deref().unwrap()
+                ))
+                .bearer_auth(route_key)
+                .json(&request)
+                .send()
+                .await
+                .expect("proxy response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.text().await.expect("body"), REJECTION);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if replayed_state { 2 } else { 1 }
+            );
+            for credential_id in [first, second] {
+                let account = RouteCredentialRepository::get(&pool, &credential_id)
+                    .await
+                    .expect("account");
+                assert_eq!(account.status, "ok");
+                assert_eq!(account.transient_failure_count, 0);
+                assert!(account.next_retry_at.is_none());
+                assert!(account.last_failure_message.is_none());
+            }
+            let affected: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM route_credential_models WHERE status <> 'ok' OR transient_failure_count > 0 OR cooldown_until IS NOT NULL OR last_failure_message IS NOT NULL",
+            ).fetch_one(&pool).await.expect("model health");
+            assert_eq!(affected, 0);
+            RouteProxyService::stop(&runtime).await.expect("stop proxy");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrecoverable_thinking_signature_rejection_stops_at_one_account() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_REQUEST,
+            THINKING_SIGNATURE_REJECTION,
+            ANTHROPIC_MESSAGE_BODY,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_anthropic_credential(&pool, "relay-a", &upstream).await;
+        let second = create_proxy_anthropic_credential(&pool, "relay-b", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "claude", &[first.clone(), second.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "claude", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/messages",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "…", "signature": "minted-elsewhere"},
+                        {"type": "text", "text": "done"}
+                    ]},
+                    {"role": "user", "content": [{"type": "text", "text": "again"}]}
+                ]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // The upstream's own words, not the pool's aggregated "all credentials
+        // failed" 502 — they name the real problem.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.text().await.expect("proxy body");
+        assert!(body.contains("Invalid `signature`"), "body: {body}");
+        // The client's body, then the stripped one. The second account is never
+        // asked, because it would refuse the same history.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        for credential_id in [first, second] {
+            let credential = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("credential");
+            assert_eq!(credential.status, "ok", "{} was parked", credential_id);
+            assert_eq!(credential.transient_failure_count, 0);
+            assert!(credential.last_failure_message.is_none());
+        }
+        let parked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM route_credential_models \
+             WHERE status <> 'ok' OR transient_failure_count > 0 OR last_failure_message IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("model rows");
+        assert_eq!(parked, 0, "a working model must not be parked");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_transient_body_read_errors_on_same_account_before_marking_failure() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_flaky_body_upstream(
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "flaky", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("proxy body"), r#"{"ok":true}"#);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 0);
+        assert!(credential.next_retry_at.is_none());
+
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_events WHERE source_label = 'route_proxy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage count");
+        assert_eq!(
+            usage_count,
+            i64::from(DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT + 1)
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_retryable_http_statuses_on_the_same_account() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_status_sequence_upstream(
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize,
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"temporarily unavailable"}}"#,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "retryable status", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("proxy body"), r#"{"ok":true}"#);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 0);
+        assert!(credential.next_retry_at.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_retryable_http_statuses_before_recording_semantic_failures() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_status_sequence_upstream(
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize,
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"temporarily unavailable"}}}"#,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id =
+            create_proxy_api_credential(&pool, "semantic retryable status", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("proxy body"), r#"{"ok":true}"#);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 0);
+        assert!(credential.next_retry_at.is_none());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn exhausted_retryable_semantic_status_records_one_transient_failure() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_status_sequence_upstream(
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1,
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"temporarily unavailable"}}}"#,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id =
+            create_proxy_api_credential(&pool, "semantic retry exhausted", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 1);
+        assert_eq!(
+            credential.last_failure_kind.as_deref(),
+            Some("semantic_response_transient")
+        );
+        let streak_count: i64 = sqlx::query_scalar(
+            "SELECT semantic_failure_streak_count FROM route_credentials WHERE id = ?",
+        )
+        .bind(&credential_id)
+        .fetch_one(&pool)
+        .await
+        .expect("semantic streak");
+        assert_eq!(streak_count, 0);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn text_only_chat_rejection_returns_a_multimodal_hint_without_retrying() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"***.***.type 参数非法，取值范围 ['text'] [trace_id=6bd754407a538295f96be0c99106c25c]","type":"invalid_request_error","param":"","code":null}}"#,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mapping = json!({"model_mappings": [{"from": "glm-5.3", "to": "glm-5.3"}]});
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "glm-text-only",
+            &upstream,
+            mapping.clone(),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "glm-text-only-backup",
+            &upstream,
+            mapping,
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "glm-5.3",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "continue"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGk="}
+                    ]
+                }]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.json::<Value>().await.expect("proxy body");
+        let message = body["error"]["message"].as_str().expect("friendly message");
+        assert!(message.contains("多模态"), "message: {message}");
+        assert!(message.contains("纯文本"), "message: {message}");
+        assert!(message.contains("新会话"), "message: {message}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for credential_id in [first, second] {
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            assert!(account.next_retry_at.is_none());
+            assert!(account.last_failure_message.is_none());
+        }
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn overloaded_response_does_not_mark_account_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let overloaded_body = r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"Our servers are currently overloaded. Please try again later."}}}"#;
+        let upstream = start_fixed_upstream(StatusCode::OK, overloaded_body).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential(&pool, "overloaded", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+        let _ = response.bytes().await.expect("proxy body");
+
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "ok");
+        assert_eq!(credential.transient_failure_count, 1);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn new_api_insufficient_balance_response_marks_account_error() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // new-api gateways answer an exhausted balance with 403 and their own
+        // error envelope, which carries no `code` — only `type`.
+        let insufficient_balance_body = r#"{"error":{"type":"new_api_error","message":"用户额度不足, 剩余额度: ＄-0.398052 (request id: 202609020218166141364498268d9d6A3V7Qkt0)"},"type":"error"}"#;
+        let upstream = start_fixed_upstream(StatusCode::FORBIDDEN, insufficient_balance_body).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id =
+            create_proxy_api_credential(&pool, "insufficient balance", &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+        let _ = response.bytes().await.expect("proxy body");
+
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "error");
+        assert_eq!(
+            credential.last_failure_kind.as_deref(),
+            Some("semantic_response_failed")
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// OpenAI answers a restricted key that was never granted the Responses API
+    /// with 401 and this envelope. Every model on the key is refused identically,
+    /// so the account has to settle in one go instead of being charged a model at a
+    /// time — and the sentence, which is the only place the missing scope is named,
+    /// has to survive into what the user reads.
+    #[tokio::test]
+    async fn missing_scope_response_marks_account_error_and_keeps_the_upstream_sentence() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let missing_scope_body = r#"{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write. Check that you have the correct role in your organization (Reader, Writer, Owner) and project (Member, Owner), and if you're using a restricted API key, that it has the necessary scopes.","type":"invalid_request_error","param":null,"code":"insufficient_permissions"}}"#;
+        let upstream = start_fixed_upstream(StatusCode::UNAUTHORIZED, missing_scope_body).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "restricted key",
+            &upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","input":"hi"}))
+            .send()
+            .await
+            .expect("proxy response");
+        let body = response.text().await.expect("proxy body");
+        assert!(body.contains("api.responses.write"), "body: {body}");
+
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(credential.status, "error");
+        assert_eq!(
+            credential.last_failure_kind.as_deref(),
+            Some("semantic_response_failed")
+        );
+        // The stored body is what the account row's hint reads to explain the fix.
+        assert!(credential
+            .last_failure_response_json
+            .as_deref()
+            .is_some_and(|stored| stored.contains("api.responses.write")));
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn switches_accounts_after_overload_retries_are_exhausted() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (first_upstream, first_calls) = start_sequence_upstream(3, r#"{"ok":"first"}"#).await;
+        let (second_upstream, second_calls) =
+            start_sequence_upstream(0, r#"{"ok":"second"}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential(&pool, "first", &first_upstream).await;
+        let second_id = create_proxy_api_credential(&pool, "second", &second_upstream).await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[first_id.clone(), second_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.expect("proxy body")["ok"],
+            "second"
+        );
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT as usize + 1
+        );
+        assert_eq!(second_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &first_id)
+                .await
+                .expect("first credential")
+                .status,
+            "ok"
+        );
+        assert_eq!(
+            RouteCredentialRepository::get(&pool, &second_id)
+                .await
+                .expect("second credential")
+                .status,
+            "ok"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_account_specific_retry_count_for_overload_responses() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let (upstream, calls) = start_sequence_upstream(4, r#"{"ok":true}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "custom retries",
+            &upstream,
+            json!({
+                "failure_policy": {
+                    "retry_count": 4,
+                    "retry_interval_ms": 0,
+                    "semantic_error_threshold": 10
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn pool_selection_probes_cooling_account_until_cleared() {
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id =
+            create_proxy_api_credential(&pool, "cooling", "http://127.0.0.1:1/v1").await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+
+        for _ in 0..3 {
+            RouteCredentialRepository::record_transient_failure(
+                &pool,
+                &credential_id,
+                "transport",
+                "temporary",
+                None,
+                FailureScope::Account,
+            )
+            .await
+            .expect("record failure");
+        }
+        assert_eq!(
+            select_pool_credentials(&pool, "codex")
+                .await
+                .expect("cooldown pool")
+                .into_iter()
+                .map(|credential| credential.id)
+                .collect::<Vec<_>>(),
+            vec![credential_id.clone()]
+        );
+
+        RouteCredentialRepository::clear_transient_failure(&pool, &credential_id, None)
+            .await
+            .expect("clear retry state");
+        assert_eq!(
+            select_pool_credentials(&pool, "codex")
+                .await
+                .expect("eligible pool")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_selection_excludes_non_ok_members_until_they_recover() {
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let recovering_id =
+            create_proxy_api_credential(&pool, "recovering", "http://127.0.0.1:1/v1").await;
+        let healthy_id =
+            create_proxy_api_credential(&pool, "healthy", "http://127.0.0.1:1/v1").await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[recovering_id.clone(), healthy_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        RouteCredentialRepository::update_status(&pool, &recovering_id, "error")
+            .await
+            .expect("error status");
+
+        let selected = select_pool_credentials(&pool, "codex")
+            .await
+            .expect("healthy selection");
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![healthy_id.clone()]
+        );
+
+        RouteCredentialRepository::update_status(&pool, &recovering_id, "ok")
+            .await
+            .expect("recovered status");
+        let selected = select_pool_credentials(&pool, "codex")
+            .await
+            .expect("recovered selection");
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![recovering_id, healthy_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_selection_uses_earliest_cooling_account_and_pool_order_tie_breaker() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential(&pool, "first", "http://127.0.0.1:1/v1").await;
+        let second_id = create_proxy_api_credential(&pool, "second", "http://127.0.0.1:1/v1").await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[first_id.clone(), second_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        sqlx::query(
+            "UPDATE route_credentials SET next_retry_at = ?, cooldown_until = ? WHERE id = ?",
+        )
+        .bind("2999-01-01T00:00:00Z")
+        .bind("2999-01-01T00:00:00Z")
+        .bind(&first_id)
+        .execute(&pool)
+        .await
+        .expect("first cooldown");
+        sqlx::query(
+            "UPDATE route_credentials SET next_retry_at = ?, cooldown_until = ? WHERE id = ?",
+        )
+        .bind("2999-01-01T00:00:00Z")
+        .bind("2999-01-01T00:00:00Z")
+        .bind(&second_id)
+        .execute(&pool)
+        .await
+        .expect("second cooldown");
+
+        let selected = select_pool_credentials(&pool, "codex")
+            .await
+            .expect("selection");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, first_id);
+    }
+
+    #[tokio::test]
+    async fn pool_selection_prefers_eligible_accounts_over_cooling_fallback() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let cooling_id =
+            create_proxy_api_credential(&pool, "cooling", "http://127.0.0.1:1/v1").await;
+        let ready_id = create_proxy_api_credential(&pool, "ready", "http://127.0.0.1:1/v1").await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[cooling_id.clone(), ready_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        sqlx::query(
+            "UPDATE route_credentials SET next_retry_at = ?, cooldown_until = ? WHERE id = ?",
+        )
+        .bind("2999-01-01T00:00:00Z")
+        .bind("2999-01-01T00:00:00Z")
+        .bind(&cooling_id)
+        .execute(&pool)
+        .await
+        .expect("cooldown");
+
+        let selected = select_pool_credentials(&pool, "codex")
+            .await
+            .expect("selection");
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![ready_id]
+        );
+    }
+
+    fn api_credential(name: &str, interface_format: &str) -> SelectedCredential {
+        SelectedCredential {
+            id: name.to_string(),
+            platform: "codex".to_string(),
+            kind: "api".to_string(),
+            display_name: name.to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"api_key":"sk-test"}"#.to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://api.example.com/v1",
+                "interface_format": interface_format,
+                "model_mappings": [{"from":"gpt-5","to":"up-gpt"}]
+            })
+            .to_string(),
+        }
+    }
+
+    fn api_credential_with_config(name: &str, config_json: &str) -> SelectedCredential {
+        let mut credential = api_credential(name, "openai");
+        credential.config_json = config_json.to_string();
+        credential
+    }
+
+    #[test]
+    fn builds_minimax_speech_request_after_model_mapping() {
+        let credential = api_credential("minimax-audio", "minimax");
+        let built = build_upstream_request_with_bridge(
+            &credential,
+            "codex",
+            "/v1/audio/speech",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","input":"hello","voice":"male-qn-qingse","response_format":"wav"}"#,
+            TurnReminderMode::Apply,
+        )
+        .expect("MiniMax speech request");
+        let body: Value = serde_json::from_slice(&built.body).expect("native body");
+
+        assert_eq!(built.target_url, "https://api.example.com/v1/t2a_v2");
+        assert_eq!(body["model"], "up-gpt");
+        assert_eq!(body["text"], "hello");
+        assert_eq!(body["voice_setting"]["voice_id"], "male-qn-qingse");
+        assert_eq!(body["audio_setting"]["format"], "wav");
+        assert_eq!(body["output_format"], "hex");
+        assert_eq!(body["stream"], false);
+        assert_eq!(
+            built.audio_response_adapter,
+            Some(AudioResponseAdapter {
+                dialect: crate::audiogen::protocol::AudioDialect::MiniMax,
+                response_format: crate::audiogen::protocol::SpeechAudioFormat::Wav,
+            })
+        );
+    }
+
+    #[test]
+    fn transforms_minimax_success_and_rejects_http_200_provider_errors() {
+        let adapter = AudioResponseAdapter {
+            dialect: crate::audiogen::protocol::AudioDialect::MiniMax,
+            response_format: crate::audiogen::protocol::SpeechAudioFormat::Wav,
+        };
+        let transformed = transform_audio_upstream_response(
+            adapter,
+            br#"{"data":{"audio":"52494646"},"base_resp":{"status_code":0}}"#,
+        )
+        .expect("decoded audio");
+
+        assert_eq!(transformed.body, b"RIFF");
+        assert_eq!(transformed.content_type.as_deref(), Some("audio/wav"));
+
+        let error = transform_audio_upstream_response(
+            adapter,
+            br#"{"base_resp":{"status_code":1004,"status_msg":"insufficient balance"}}"#,
+        )
+        .expect_err("HTTP 200 provider failures must enter failover");
+        assert!(error.contains("1004") && error.contains("insufficient balance"));
+    }
+
+    #[test]
+    fn rejects_minimax_for_transcription_routes() {
+        let credential = api_credential("minimax-audio", "minimax");
+        let error = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/audio/transcriptions",
+            None,
+            HeaderMap::new(),
+            b"not multipart",
+        )
+        .expect_err("MiniMax has no transcription dialect");
+
+        assert!(error.contains("does not support transcription"), "{error}");
+    }
+
+    #[test]
+    fn credential_priority_order_prefers_lower_priority_and_round_robins_within_group() {
+        let mut first = api_credential("priority-one-first", "openai");
+        first.route_priority = 1;
+        let mut second = api_credential("priority-one-second", "openai");
+        second.route_priority = 1;
+        let mut fallback = api_credential("priority-two", "openai");
+        fallback.route_priority = 2;
+        let credentials = vec![first, second, fallback];
+
+        assert_eq!(
+            credential_indexes_by_priority(&credentials, 0),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            credential_indexes_by_priority(&credentials, 1),
+            vec![1, 0, 2]
+        );
+        assert_eq!(
+            credential_indexes_by_priority(&credentials, 2),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn partial_platform_api_requires_explicit_dialect() {
+        let credential = SelectedCredential {
+            id: "hermes-api".to_string(),
+            platform: "hermes".to_string(),
+            kind: "api".to_string(),
+            display_name: "Hermes API".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"api_key":"sk-test"}"#.to_string(),
+            config_json: json!({
+                "base_url": "https://api.example.com/v1",
+                "model_mappings": []
+            })
+            .to_string(),
+        };
+
+        let error = build_upstream_request(
+            &credential,
+            "hermes",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5"}"#,
+        )
+        .expect_err("partial platforms require an explicit API dialect");
+
+        assert!(error.contains("validation.api_dialect_required"));
+    }
+
+    #[test]
+    fn gemini_bridge_query_merges_with_original_query_and_key() {
+        let credential = api_credential("gemini-upstream", "gemini");
+        let (url, _, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            Some("trace=1"),
+            HeaderMap::new(),
+            br#"{"model":"gemini-2.5-flash","stream":true,"input":"hello"}"#,
+        )
+        .unwrap();
+
+        assert!(url.contains("/v1beta/models/gemini-2.5-flash:streamGenerateContent?"));
+        assert!(url.contains("trace=1"));
+        assert!(url.contains("alt=sse"));
+        assert!(url.contains("key="));
+    }
+
+    #[test]
+    fn partial_platform_official_routing_is_unavailable() {
+        let credential = SelectedCredential {
+            id: "hermes-official".to_string(),
+            platform: "hermes".to_string(),
+            kind: "official".to_string(),
+            display_name: "Hermes Official".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"access_token":"at"}"#.to_string(),
+            config_json: "{}".to_string(),
+        };
+
+        let error = build_upstream_request(
+            &credential,
+            "hermes",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5"}"#,
+        )
+        .expect_err("partial platforms do not support official routing");
+
+        assert!(error.contains("capability.unavailable"));
+    }
+
+    #[test]
+    fn build_target_url_joins_base_path_and_query() {
+        assert_eq!(
+            build_target_url(
+                "https://api.example.com/v1/",
+                "/chat/completions",
+                Some("beta=1")
+            ),
+            "https://api.example.com/v1/chat/completions?beta=1"
+        );
+    }
+
+    #[test]
+    fn build_target_url_avoids_duplicate_local_v1_prefix() {
+        assert_eq!(
+            build_target_url("https://api.example.com/v1", "/v1/responses", None),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            build_target_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "/v1beta/models/gemini:generateContent",
+                None
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent"
+        );
+    }
+
+    #[test]
+    fn build_target_url_collapses_repeated_base_version_segments() {
+        assert_eq!(
+            build_target_url("https://vsllm.com/v1/v1/", "/v1/chat/completions", None),
+            "https://vsllm.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_target_url("https://vsllm.com/v1", "/v1/v1/chat/completions", None),
+            "https://vsllm.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_target_url(
+                "https://generativelanguage.googleapis.com/v1beta/v1beta",
+                "/v1beta/models/gemini:generateContent",
+                None
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent"
+        );
+    }
+
+    #[test]
+    fn build_target_url_keeps_v1_prefix_when_upstream_base_is_unversioned() {
+        assert_eq!(
+            build_target_url(
+                "https://api.example.com",
+                "/v1/responses",
+                Some("stream=true")
+            ),
+            "https://api.example.com/v1/responses?stream=true"
+        );
+    }
+
+    #[test]
+    fn is_messages_path_matches_anthropic_messages_endpoint() {
+        assert!(is_messages_path("/v1/messages"));
+        assert!(is_messages_path("/messages/"));
+        assert!(is_messages_path("messages"));
+        assert!(!is_messages_path("/v1/chat/completions"));
+        assert!(!is_messages_path("/v1/models"));
+    }
+
+    #[test]
+    fn redacted_url_masks_the_gemini_key_but_keeps_other_query_parts() {
+        // Gemini carries its credential in the URL, so the target URL is itself
+        // secret-bearing and cannot be logged verbatim.
+        assert_eq!(
+            redact_sensitive_url(
+                "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?alt=sse&key=AIzaSyVerySecret123"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?alt=sse&key=***t123"
+        );
+        // `?beta=true` must survive: it is the proxy-only query flag we need to
+        // see when comparing an accepted request against a rejected one.
+        assert_eq!(
+            redact_sensitive_url("https://api.example.com/v1/messages?beta=true"),
+            "https://api.example.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            redact_sensitive_url("https://api.example.com/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn formatted_headers_mask_credentials_and_keep_client_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-ant-super-secret-value"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("sk-short"),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"),
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-os"),
+            HeaderValue::from_static("Windows"),
+        );
+
+        let rendered = format_upstream_headers(&headers);
+
+        // Credentials never reach the log.
+        assert!(!rendered.contains("super-secret-value"));
+        assert!(!rendered.contains("sk-short"));
+        assert!(rendered.contains("authorization: ***alue"));
+        // A short secret is masked whole rather than leaking half of itself.
+        assert!(rendered.contains("x-api-key: ***"));
+        // The identity headers a gateway fingerprints on must be fully visible —
+        // masking them would defeat the purpose of logging headers.
+        assert!(rendered.contains("user-agent: claude-cli/2.1.2 (external, cli)"));
+        assert!(rendered.contains("anthropic-beta: claude-code-20250219"));
+        assert!(rendered.contains("x-stainless-os: Windows"));
+        // Sorted so two requests can be diffed by eye.
+        let names: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.split(':').next())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn ensure_query_flag_appends_only_when_absent() {
+        assert_eq!(
+            ensure_query_flag("https://api.example.com/v1/messages", "beta", "true"),
+            "https://api.example.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            ensure_query_flag(
+                "https://api.example.com/v1/messages?stream=true",
+                "beta",
+                "true"
+            ),
+            "https://api.example.com/v1/messages?stream=true&beta=true"
+        );
+        assert_eq!(
+            ensure_query_flag(
+                "https://api.example.com/v1/messages?beta=true",
+                "beta",
+                "true"
+            ),
+            "https://api.example.com/v1/messages?beta=true"
+        );
+    }
+
+    #[test]
+    fn identity_is_left_alone_when_the_caller_is_already_an_sdk_client() {
+        // Claude Code's own request: a complete Stainless SDK identity. Splicing
+        // our hardcoded versions into it produced a combination no real client
+        // emits, which is what agentrouter.org rejected as `unauthorized client
+        // detected`.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("claude-cli/2.5.0 (external, cli)"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-package-version"),
+            HeaderValue::from_static("0.99.0"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-runtime-version"),
+            HeaderValue::from_static("v24.0.0"),
+        );
+        apply_claude_code_identity(&mut headers);
+
+        // Every value the caller sent survives untouched.
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("claude-cli/2.5.0 (external, cli)")
+        );
+        assert_eq!(
+            headers
+                .get("x-stainless-package-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("0.99.0")
+        );
+        assert_eq!(
+            headers
+                .get("x-stainless-runtime-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("v24.0.0")
+        );
+        // We do not graft on the headers it chose to omit.
+        assert!(!headers.contains_key("x-app"));
+        assert!(!headers.contains_key("x-stainless-os"));
+        // The beta marker is a capability signal, not identity, so it still merges.
+        assert_eq!(
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("claude-code-20250219,interleaved-thinking-2025-05-14")
+        );
+    }
+
+    #[test]
+    fn identity_is_applied_whole_when_the_caller_has_none() {
+        // A plain client (curl, a script, a non-SDK bridge) gets the full
+        // impersonation so it can pass a fingerprinting gateway at all.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("curl/8.18.0"),
+        );
+        apply_claude_code_identity(&mut headers);
+
+        // Our set wins outright — a half-curl half-CLI identity is exactly the
+        // contradiction that gets rejected.
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CLAUDE_CODE_USER_AGENT)
+        );
+        assert_eq!(
+            headers.get("x-app").and_then(|v| v.to_str().ok()),
+            Some("cli")
+        );
+        assert!(headers.contains_key("x-stainless-package-version"));
+        assert!(headers.contains_key("x-stainless-os"));
+    }
+
+    /// Relays running sub2api's `claude_code_only` group read the Claude Code
+    /// signature out of the *body*, not just the headers. Claude Code sends it;
+    /// Codex sends its own instructions and no metadata at all, so a bridged
+    /// request has to be signed here or the relay answers `this group only allows
+    /// Claude Code clients` for every turn while the claude platform works. The
+    /// connectivity probe has seeded both fields since the gate was found, which
+    /// is why such an account tests green and then fails on real traffic.
+    #[test]
+    fn bridged_anthropic_request_carries_the_claude_code_body_signature() {
+        let credential = api_credential("anthropic-signature", "anthropic");
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","instructions":"You are a coding agent running in the Codex CLI.","input":"hi"}"#,
+        )
+        .expect("bridged request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("anthropic json");
+
+        // Claude Code's own shape: the bare signature as its own leading block,
+        // the real instructions after — not one merged blob.
+        assert_eq!(
+            value.pointer("/system/0/text"),
+            Some(&json!(client_identity::CLAUDE_CODE_SYSTEM_PROMPT)),
+            "gated relays score the leading system block: {value}"
+        );
+        assert_eq!(
+            value.pointer("/system/1/text"),
+            Some(&json!("You are a coding agent running in the Codex CLI.")),
+            "the client's own instructions must survive: {value}"
+        );
+
+        let user_id = value
+            .pointer("/metadata/user_id")
+            .and_then(Value::as_str)
+            .expect("metadata.user_id");
+        let parsed: Value = serde_json::from_str(user_id).expect("the gate parses user_id as JSON");
+        assert_eq!(
+            parsed["device_id"].as_str().map(str::len),
+            Some(64),
+            "the gate's regex wants 64 hex chars: {user_id}"
+        );
+    }
+
+    /// A real Claude Code request already carries both fields, and its system
+    /// prompt is the thing being scored — rewriting it would be both pointless and
+    /// a way to corrupt a working request.
+    #[test]
+    fn claude_passthrough_body_is_forwarded_untouched() {
+        let credential = api_credential("anthropic-passthrough", "anthropic");
+        let body = br#"{"model":"claude-sonnet-4-5","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#;
+
+        let (_, _, forwarded) = build_upstream_request(
+            &credential,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("passthrough request");
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(&forwarded).unwrap(),
+            serde_json::from_slice::<Value>(body).unwrap(),
+            "an Anthropic client's body is already what the gate wants"
+        );
+    }
+
+    #[test]
+    fn a_single_stainless_header_is_enough_to_count_as_an_sdk_identity() {
+        let mut headers = HeaderMap::new();
+        assert!(!has_stainless_sdk_identity(&headers));
+        headers.insert(
+            HeaderName::from_static("x-stainless-lang"),
+            HeaderValue::from_static("js"),
+        );
+        assert!(has_stainless_sdk_identity(&headers));
+    }
+
+    #[test]
+    fn apply_claude_code_identity_defaults_when_headers_absent() {
+        let mut headers = HeaderMap::new();
+        apply_claude_code_identity(&mut headers);
+        assert_eq!(
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CLAUDE_CODE_DEFAULT_BETA)
+        );
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CLAUDE_CODE_USER_AGENT)
+        );
+    }
+
+    #[test]
+    fn apply_codex_cli_identity_fills_originator_and_user_agent() {
+        let mut headers = HeaderMap::new();
+        apply_codex_cli_identity(&mut headers, "account-1");
+        assert_eq!(
+            headers.get("originator").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CODEX_CLI_ORIGINATOR)
+        );
+        assert!(headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ua| ua.starts_with("codex_cli_rs/")));
+        // sub2api's `codex_cli_only` gate requires an `x-codex-*` header on top of
+        // the official UA; without one it answers `This account only allows Codex
+        // official clients`, the same message it gives an unknown client.
+        assert_eq!(
+            headers
+                .get(client_identity::CODEX_WINDOW_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(client_identity::codex_engine_window_id("account-1").as_str())
+        );
+    }
+
+    /// The reported failure: a client that is not Codex reaches a Responses relay
+    /// through the pool. Grafting `originator` onto its own UA left the gate with an
+    /// official client and a version it could not parse, so every turn 403'd while
+    /// the same account served the claude platform fine.
+    #[test]
+    fn codex_identity_replaces_a_foreign_client_wholesale() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-lang"),
+            HeaderValue::from_static("js"),
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static("claude-code-20250219"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-app"),
+            HeaderValue::from_static("cli"),
+        );
+        apply_codex_cli_identity(&mut headers, "account-1");
+
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some(client_identity::codex_cli_user_agent().as_str()),
+            "an official originator beside a foreign UA is what the gate refuses"
+        );
+        assert_eq!(
+            headers.get("originator").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CODEX_CLI_ORIGINATOR)
+        );
+        assert!(headers.contains_key(client_identity::CODEX_WINDOW_ID_HEADER));
+        // No real client is the Codex CLI and an Anthropic SDK at the same time.
+        assert!(!headers.contains_key("x-stainless-lang"));
+        assert!(!headers.contains_key("anthropic-beta"));
+        assert!(!headers.contains_key("x-app"));
+    }
+
+    #[test]
+    fn codex_identity_leaves_a_real_codex_client_alone() {
+        let mut headers = HeaderMap::new();
+        // The interactive TUI reports itself with a hyphen. Filling in
+        // `codex_cli_rs` here is the pairing mismatch OpenAI's inference endpoint
+        // answers with 404.
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-codex-window-id"),
+            HeaderValue::from_static("6f1d1f2c-0f5a-4a0e-9a1c-1d1f2c0f5a11"),
+        );
+        apply_codex_cli_identity(&mut headers, "account-1");
+
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
+            "a real client's own version and terminal fingerprint must survive"
+        );
+        assert_eq!(
+            headers.get("originator").and_then(|v| v.to_str().ok()),
+            Some("codex-tui")
+        );
+        assert_eq!(
+            headers
+                .get(client_identity::CODEX_WINDOW_ID_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("6f1d1f2c-0f5a-4a0e-9a1c-1d1f2c0f5a11"),
+            "the client's own window id is not ours to overwrite"
+        );
+    }
+
+    /// The probe and every bridged turn start from a header map with no client
+    /// identity in it, so the gate's two checks have to be satisfied by the builder.
+    #[test]
+    fn built_responses_request_carries_the_codex_engine_fingerprint() {
+        let credential = api_credential("responses-relay", "openai-responses");
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","input":"hi"}"#,
+        )
+        .expect("responses request");
+
+        assert_eq!(
+            headers.get("originator").and_then(|v| v.to_str().ok()),
+            Some(client_identity::CODEX_CLI_ORIGINATOR)
+        );
+        assert!(headers.contains_key(client_identity::CODEX_WINDOW_ID_HEADER));
+    }
+
+    /// A credential that pins a User-Agent of its own keeps it, and gets no Codex
+    /// claim bolted onto it: the pinned UA is what a gate would read the engine
+    /// version from, so half a Codex identity could only make the request worse.
+    #[test]
+    fn a_pinned_user_agent_is_not_dressed_up_as_the_codex_cli() {
+        let credential = api_credential_with_config(
+            "pinned-ua",
+            &serde_json::json!({
+                "base_url": "https://api.example.com/v1",
+                "interface_format": "openai-responses",
+                "headers": {"User-Agent": "MyRelayClient/1.0"}
+            })
+            .to_string(),
+        );
+
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","input":"hi"}"#,
+        )
+        .expect("pinned request");
+
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("MyRelayClient/1.0")
+        );
+        assert!(!headers.contains_key("originator"));
+        assert!(!headers.contains_key(client_identity::CODEX_WINDOW_ID_HEADER));
+    }
+
+    /// A Claude Code client routed to a Responses relay: the bridge rewrites the
+    /// body, so the headers have to stop advertising Anthropic and start
+    /// advertising Codex, fingerprint included. Left half-converted, the relay's
+    /// `codex_cli_only` gate reads `claude-cli/2.1.2` as the engine and refuses the
+    /// account on every turn.
+    #[test]
+    fn bridged_anthropic_client_reaches_a_responses_relay_as_the_codex_cli() {
+        let credential = api_credential("claude-to-responses", "openai-responses");
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("claude-cli/2.1.2 (external, cli)"),
+        );
+        inbound.insert(
+            HeaderName::from_static("x-stainless-runtime"),
+            HeaderValue::from_static("node"),
+        );
+
+        let (url, headers, _) = build_upstream_request(
+            &credential,
+            "claude",
+            "/v1/messages",
+            None,
+            inbound,
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,
+        )
+        .expect("bridged request");
+
+        assert_eq!(url, "https://api.example.com/v1/responses");
+        assert_eq!(
+            headers.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some(client_identity::codex_cli_user_agent().as_str())
+        );
+        assert!(headers.contains_key(client_identity::CODEX_WINDOW_ID_HEADER));
+        assert!(!headers.contains_key("x-stainless-runtime"));
+    }
+
+    #[test]
+    fn response_body_metadata_caps_previews() {
+        let body = vec![b'a'; ROUTE_PROXY_RESPONSE_BODY_LIMIT + 1024];
+
+        let success_preview =
+            route_proxy_response_body_metadata(Some(&body), true).expect("success body");
+        assert_eq!(
+            success_preview.len(),
+            ROUTE_PROXY_SUCCESS_BODY_LIMIT,
+            "成功响应只留 2 KiB 预览"
+        );
+
+        let failure_preview =
+            route_proxy_response_body_metadata(Some(&body), false).expect("failure body");
+        assert_eq!(
+            failure_preview.len(),
+            ROUTE_PROXY_RESPONSE_BODY_LIMIT,
+            "失败响应保留 16 KiB 预览"
+        );
+
+        assert!(route_proxy_response_body_metadata(Some(b""), true).is_none());
+        assert!(route_proxy_response_body_metadata(Some(b"   \n"), true).is_none());
+        assert!(route_proxy_response_body_metadata(None, true).is_none());
+    }
+
+    #[test]
+    fn force_identity_accept_encoding_overrides_client_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("accept-encoding"),
+            HeaderValue::from_static("gzip, br, zstd"),
+        );
+        force_identity_accept_encoding(&mut headers);
+        let values: Vec<_> = headers
+            .get_all("accept-encoding")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec!["identity"]);
+    }
+
+    #[test]
+    fn collects_and_replaces_remote_image_urls() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role":"user","content":[
+                    {"type":"text","text":"hi"},
+                    {"type":"image_url","image_url":{"url":"https://example.com/a.png"}},
+                    {"type":"input_image","image_url":"https://example.com/b.jpg"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+                ]}
+            ]
+        });
+        let mut urls = Vec::new();
+        collect_remote_image_urls(&body, &mut urls);
+        urls.sort();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/a.png".to_string(),
+                "https://example.com/b.jpg".to_string()
+            ]
+        );
+
+        let mut value = body.clone();
+        let mut replacements = std::collections::HashMap::new();
+        replacements.insert(
+            "https://example.com/a.png".to_string(),
+            "data:image/png;base64,ZZZ".to_string(),
+        );
+        replacements.insert(
+            "https://example.com/b.jpg".to_string(),
+            "data:image/jpeg;base64,YYY".to_string(),
+        );
+        replace_remote_image_urls(&mut value, &replacements);
+        assert_eq!(
+            value["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,ZZZ"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][2]["image_url"],
+            "data:image/jpeg;base64,YYY"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][3]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn sniffs_image_mime_and_reads_flag() {
+        assert_eq!(
+            sniff_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0, 0]).as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0]).as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_mime(b"GIF89a").as_deref(), Some("image/gif"));
+        assert!(sniff_image_mime(b"plain text bytes").is_none());
+        assert_eq!(
+            image_mime_from_url("https://x/y/a.PNG?v=1").as_deref(),
+            Some("image/png")
+        );
+        assert!(!inline_remote_images_enabled(&serde_json::json!({})));
+        assert!(inline_remote_images_enabled(
+            &serde_json::json!({"inline_remote_images": true})
+        ));
+    }
+
+    #[test]
+    fn pick_credential_selects_by_cursor_round_robin() {
+        let credentials = vec![
+            api_credential("first", "openai"),
+            api_credential("second", "openai"),
+        ];
+        assert_eq!(
+            pick_credential(&credentials, 0).map(|item| item.id.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            pick_credential(&credentials, 3).map(|item| item.id.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn retry_credential_indexes_wrap_once_from_the_route_cursor() {
+        assert_eq!(retry_credential_indexes(3, 0), vec![0, 1, 2]);
+        assert_eq!(retry_credential_indexes(3, 2), vec![2, 0, 1]);
+        assert_eq!(retry_credential_indexes(3, -1), vec![2, 0, 1]);
+        assert!(retry_credential_indexes(0, 0).is_empty());
+    }
+
+    #[test]
+    fn retry_policy_marks_retryable_transport_and_upstream_statuses_as_transient() {
+        assert!(should_retry_proxy_failure(StatusCode::UNAUTHORIZED));
+        assert!(should_retry_proxy_failure(StatusCode::FORBIDDEN));
+        assert!(should_retry_proxy_failure(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry_proxy_failure(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(should_retry_proxy_failure(StatusCode::BAD_GATEWAY));
+        assert!(should_retry_proxy_failure(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!should_retry_proxy_failure(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn same_account_retry_excludes_authentication_failures() {
+        assert!(should_retry_same_credential_status(
+            StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(should_retry_same_credential_status(
+            StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(should_retry_same_credential_status(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(should_retry_same_credential_status(StatusCode::BAD_GATEWAY));
+        assert!(should_retry_same_credential_status(
+            StatusCode::GATEWAY_TIMEOUT
+        ));
+        assert!(!should_retry_same_credential_status(
+            StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_retry_same_credential_status(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn proxy_failure_classification_separates_transient_and_permanent_errors() {
+        assert_eq!(
+            classify_proxy_failure(Some(StatusCode::BAD_GATEWAY), None),
+            ProxyFailureKind::Transient
+        );
+        assert_eq!(
+            classify_proxy_failure(None, Some("connection reset by peer")),
+            ProxyFailureKind::Transient
+        );
+        assert_eq!(
+            classify_proxy_failure(
+                Some(StatusCode::UNAUTHORIZED),
+                Some("invalid_grant: refresh token has been revoked")
+            ),
+            ProxyFailureKind::Permanent
+        );
+        assert_eq!(
+            classify_proxy_failure(Some(StatusCode::BAD_REQUEST), Some("invalid model")),
+            ProxyFailureKind::None
+        );
+    }
+
+    #[test]
+    fn retry_eligibility_accepts_missing_or_invalid_timestamps() {
+        let now = Utc::now();
+        assert!(credential_is_retryable_now(None, None, now));
+        assert!(!credential_is_retryable_now(
+            Some("2999-01-01T00:00:00Z"),
+            None,
+            now
+        ));
+        assert!(credential_is_retryable_now(
+            Some("not-a-timestamp"),
+            None,
+            now
+        ));
+        assert!(credential_is_retryable_now(
+            Some("2000-01-01T00:00:00Z"),
+            Some("2000-01-01T00:00:00Z"),
+            now
+        ));
+    }
+
+    #[test]
+    fn apply_model_mappings_rewrites_nested_model_fields() {
+        let body = br#"{"model":"gpt-5","nested":{"model":"gpt-5"},"keep":"same"}"#;
+        let mapped = apply_model_mappings(
+            body,
+            &[ModelMapping {
+                from: "gpt-5".to_string(),
+                to: "up-gpt".to_string(),
+                label: None,
+                supports_1m: None,
+                ..Default::default()
+            }],
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("up-gpt")
+        );
+        assert_eq!(
+            value.pointer("/nested/model").and_then(Value::as_str),
+            Some("up-gpt")
+        );
+    }
+
+    #[test]
+    fn apply_model_mappings_strips_claude_one_m_suffix_for_lookup() {
+        let mapped = apply_model_mappings(
+            br#"{"model":"claude-sonnet-alias [1M]","nested":{"model":"claude-opus-alias[1m]"}}"#,
+            &[
+                ModelMapping {
+                    from: "claude-sonnet-alias".to_string(),
+                    to: "provider-sonnet".to_string(),
+                    label: Some("Sonnet".to_string()),
+                    supports_1m: Some(true),
+                    ..Default::default()
+                },
+                ModelMapping {
+                    from: "claude-opus-alias".to_string(),
+                    to: "provider-opus".to_string(),
+                    label: Some("Opus".to_string()),
+                    supports_1m: Some(true),
+                    ..Default::default()
+                },
+            ],
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("provider-sonnet")
+        );
+        assert_eq!(
+            value.pointer("/nested/model").and_then(Value::as_str),
+            Some("provider-opus")
+        );
+    }
+
+    #[test]
+    fn apply_model_mappings_does_not_strip_one_m_suffix_from_non_claude_models() {
+        let mapped = apply_model_mappings(
+            br#"{"model":"gpt-5[1M]"}"#,
+            &[ModelMapping {
+                from: "gpt-5".to_string(),
+                to: "up-gpt".to_string(),
+                label: None,
+                supports_1m: None,
+                ..Default::default()
+            }],
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("gpt-5[1M]")
+        );
+    }
+
+    #[test]
+    fn apply_model_mappings_uses_fallback_only_when_no_specific_entry_matches() {
+        // Fallback sits FIRST on purpose: a single-pass `.find()` would let it
+        // swallow the specific claude-sonnet-alias entry that follows.
+        let mapped = apply_model_mappings(
+            br#"{"model":"claude-sonnet-alias","nested":{"model":"claude-opus-alias"}}"#,
+            &[
+                ModelMapping {
+                    from: "claude-model".to_string(),
+                    to: "fallback-upstream".to_string(),
+                    label: None,
+                    supports_1m: None,
+                    ..Default::default()
+                },
+                ModelMapping {
+                    from: "claude-sonnet-alias".to_string(),
+                    to: "sonnet-upstream".to_string(),
+                    label: None,
+                    supports_1m: None,
+                    ..Default::default()
+                },
+            ],
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("sonnet-upstream")
+        );
+        assert_eq!(
+            value.pointer("/nested/model").and_then(Value::as_str),
+            Some("fallback-upstream")
+        );
+    }
+
+    #[test]
+    fn apply_model_mappings_rewrites_the_subagent_alias() {
+        let mapped = apply_model_mappings(
+            br#"{"model":"claude-subagent"}"#,
+            &[ModelMapping {
+                from: "claude-subagent".to_string(),
+                to: "provider-haiku".to_string(),
+                label: None,
+                supports_1m: None,
+                ..Default::default()
+            }],
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("provider-haiku")
+        );
+    }
+
+    #[test]
+    fn upstream_model_mode_does_not_rewrite_b_when_another_mapping_uses_b_as_from() {
+        let mappings = vec![
+            ModelMapping {
+                from: "A".to_string(),
+                to: "B".to_string(),
+                ..Default::default()
+            },
+            ModelMapping {
+                from: "B".to_string(),
+                to: "C".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let body = br#"{"model":"B","messages":[]}"#;
+        let mapped = apply_model_mappings_with_mode(body, &mappings, ModelMatchMode::Upstream);
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+        assert_eq!(value.pointer("/model").and_then(Value::as_str), Some("B"));
+    }
+
+    #[test]
+    fn upstream_model_mode_only_uses_fallback_for_unmatched_models() {
+        let mappings = vec![
+            ModelMapping {
+                from: "claude-model".to_string(),
+                to: "catch-all".to_string(),
+                ..Default::default()
+            },
+            ModelMapping {
+                from: "A".to_string(),
+                to: "B".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let mapped = apply_model_mappings_with_mode(
+            br#"{"model":"B"}"#,
+            &mappings,
+            ModelMatchMode::Upstream,
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+        assert_eq!(value.pointer("/model").and_then(Value::as_str), Some("B"));
+
+        let mapped = apply_model_mappings_with_mode(
+            br#"{"model":"unknown-model"}"#,
+            &mappings,
+            ModelMatchMode::Upstream,
+        );
+        let value: Value = serde_json::from_slice(&mapped).expect("json");
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("catch-all")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_ignores_placeholder_model_mapping() {
+        let mut credential = api_credential("placeholder", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [{"from":"gpt-5","to":"upstream-model"}]
+        })
+        .to_string();
+
+        let (_, _, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5"}"#,
+        )
+        .expect("openai request");
+        let value: Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("gpt-5")
+        );
+    }
+
+    #[test]
+    fn plaintext_reasoning_compat_is_scoped_to_responses_and_account_override() {
+        let request = json!({"model":"fixture","stream":true,"store":true,"input":[
+            {"type":"reasoning","id":"rs_fixture","summary":[],"encrypted_content":"opaque","content":[{"type":"reasoning_text","text":"Keep this reasoning"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let me check."}]},
+            {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":"ok"},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]});
+        let raw = serde_json::to_vec(&request).unwrap();
+        for (host, mode, converted) in [
+            ("anyrouter.top", None, true),
+            ("anyrouter.top", Some("off"), false),
+            ("another.example", None, false),
+            ("another.example", Some("on"), true),
+        ] {
+            let mut config = json!({"base_url":format!("https://{host}/v1"),"interface_format":"openai-responses","model_mappings":[]});
+            if let Some(mode) = mode {
+                config["responses_plaintext_reasoning_compat"] = json!(mode);
+            }
+            let account = api_credential_with_config("fixture", &config.to_string());
+            let (_, _, body) = build_upstream_request(
+                &account,
+                "codex",
+                "/v1/responses",
+                None,
+                HeaderMap::new(),
+                &raw,
+            )
+            .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value["input"][0].get("content").is_none(),
+                converted,
+                "{host} {mode:?}"
+            );
+            assert_eq!(value["input"][0]["encrypted_content"], "opaque");
+            assert_eq!(value["input"][2], request["input"][2]);
+            if converted {
+                assert_eq!(
+                    value["input"][0]["summary"][0]["text"],
+                    "Keep this reasoning"
+                );
+            }
+        }
+        // 切回 DeepSeek/GLM 的 Chat 接口，从原历史生成，不被 Responses 兼容规则污染。
+        let account=api_credential_with_config("chat",&json!({"base_url":"https://anyrouter.top/v1","interface_format":"openai","model_mappings":[],"responses_plaintext_reasoning_compat":"on"}).to_string());
+        let (_, _, body) = build_upstream_request(
+            &account,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            &raw,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["reasoning_content"] == "Keep this reasoning"));
+        assert_eq!(serde_json::from_slice::<Value>(&raw).unwrap(), request);
+        for dialect in ["openai", "anthropic", "gemini"] {
+            let output = |mode: &str| {
+                let config = json!({"base_url":"https://anyrouter.top/v1","interface_format":dialect,"model_mappings":[],"responses_plaintext_reasoning_compat":mode});
+                let account = api_credential_with_config("switching-fixture", &config.to_string());
+                let (_, _, body) = build_upstream_request(
+                    &account,
+                    "codex",
+                    "/v1/responses",
+                    None,
+                    HeaderMap::new(),
+                    &raw,
+                )
+                .unwrap();
+                let mut value: Value = serde_json::from_slice(&body).unwrap();
+                if dialect == "anthropic" {
+                    // 现有身份适配器每次随机生成 session_id；只归一化这个随机值，
+                    // 其余正文、工具、推理载体及 metadata 字段必须完全一致。
+                    let mut identity: Value = serde_json::from_str(value["metadata"]["user_id"].as_str().unwrap()).unwrap();
+                    assert!(identity["session_id"].is_string());
+                    identity["session_id"] = json!("fixed-for-comparison");
+                    value["metadata"]["user_id"] = json!(identity.to_string());
+                }
+                value
+            };
+            assert_eq!(
+                output("on"),
+                output("off"),
+                "{dialect} 的出站请求不得受此开关影响"
+            );
+        }
+        // AnyRouter 阶段的请求副本即使被再送入 Chat，也能从摘要取回同样明文。
+        let normalized = crate::services::responses_plaintext_reasoning::normalize(&raw).unwrap();
+        let (_, _, body) = build_upstream_request(
+            &account,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            &normalized,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["reasoning_content"] == "Keep this reasoning"));
+    }
+
+    #[test]
+    fn aggressive_cleanup_strips_well_formed_ciphertext_only_when_both_switches_are_on() {
+        // A structurally valid Fernet envelope: conservative cleanup keeps it,
+        // which is exactly the production failure where the account's cleanup
+        // switch looked inert. Only the aggressive sub-switch may drop it, and
+        // it must be subordinate to the main switch.
+        const VALID: &str = "gAAAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQICAgICAgICAgICAgICAgIDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==";
+        let request = json!({
+            "model": "gpt-6-astra", "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "codex-cli-key",
+            "input": [
+                {"type": "reasoning", "id": "rs_foreign", "summary": [], "encrypted_content": VALID},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                {"type": "compaction", "id": "cc_1", "encrypted_content": "keep compaction"}
+            ],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+        });
+        for (cleanup, aggressive, should_strip) in [
+            (None, None, false),
+            (Some(false), Some(true), false),
+            (Some(true), None, false),
+            (Some(true), Some(false), false),
+            (Some(true), Some(true), true),
+        ] {
+            let mut config = json!({
+                "base_url": "https://api.example.com/v1",
+                "interface_format": "openai-responses",
+                "model_mappings": []
+            });
+            if let Some(cleanup) = cleanup {
+                config["responses_encrypted_content_cleanup"] = json!(cleanup);
+            }
+            if let Some(aggressive) = aggressive {
+                config["responses_encrypted_content_aggressive_strip"] = json!(aggressive);
+            }
+            let account = api_credential_with_config("cleanup", &config.to_string());
+            let (_, _, body) = build_upstream_request(
+                &account,
+                "codex",
+                "/v1/responses",
+                None,
+                HeaderMap::new(),
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .expect("request");
+            let mut expected = request.clone();
+            if should_strip {
+                expected["input"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("encrypted_content");
+                expected["input"][0].as_object_mut().unwrap().remove("id");
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                expected,
+                "cleanup={cleanup:?} aggressive={aggressive:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conservative_cleanup_only_sanitizes_opted_in_native_requests() {
+        let request = json!({
+            "model": "gpt-6-astra", "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "codex-cli-key",
+            "input": [
+                {"type": "reasoning", "summary": [], "encrypted_content": "foreign-history"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                {"type": "compaction_trigger"}
+            ],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+        });
+        for (dialect, path, enabled, should_strip) in [
+            ("openai-responses", "/v1/responses", None, false),
+            ("openai-responses", "/v1/responses", Some(false), false),
+            ("openai-responses", "/v1/responses", Some(true), true),
+            ("openai", "/v1/chat/completions", Some(true), false),
+        ] {
+            let mut config = json!({"base_url": "https://api.example.com/v1", "interface_format": dialect, "model_mappings": []});
+            if let Some(enabled) = enabled {
+                config["responses_encrypted_content_cleanup"] = json!(enabled);
+            }
+            let account = api_credential_with_config("cleanup", &config.to_string());
+            let (_, _, body) = build_upstream_request(
+                &account,
+                "codex",
+                path,
+                None,
+                HeaderMap::new(),
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .expect("request");
+            let mut expected = request.clone();
+            if should_strip {
+                expected["input"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("encrypted_content");
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                expected,
+                "{dialect} {enabled:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_encrypted_content_cleanup_does_not_retry_an_already_clean_request() {
+        let (upstream, calls, bodies) = start_encrypted_content_upstream().await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "cleanup",
+            &upstream,
+            json!({
+                "interface_format": "openai-responses", "responses_encrypted_content_cleanup": true,
+                "failure_policy": {"retry_count": 3, "retry_interval_ms": 0},
+                "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("proxy");
+        for (attempt, expected_status) in [(1, StatusCode::OK), (2, StatusCode::OK)] {
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/responses", proxy.base_url.as_deref().unwrap()))
+                .bearer_auth(&route_key).json(&json!({
+                    "model": "gpt-6-astra", "input": [
+                        {"type": "reasoning", "summary": [], "encrypted_content": "foreign-history"},
+                        {"type": "message", "role": "user", "content": "continue"}
+                    ]
+                })).send().await.expect("response");
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(calls.load(Ordering::SeqCst), attempt);
+            assert_eq!(
+                bodies.lock().unwrap()[attempt - 1]["input"][0],
+                json!({"type": "reasoning", "summary": []})
+            );
+        }
+        let account = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account");
+        assert_eq!(account.status, "ok");
+        assert_eq!(account.transient_failure_count, 0);
+        RouteProxyService::stop(&runtime).await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn aggressive_cleanup_strips_a_well_formed_ciphertext_before_it_reaches_upstream() {
+        // The fake upstream rejects any reasoning item that still carries
+        // ciphertext, which is how a relay behaves when it cannot decrypt a
+        // foreign envelope. Conservative cleanup keeps a well-formed envelope
+        // (hence the reported "switch does nothing"); aggressive cleanup must
+        // make the same request succeed on the first attempt.
+        const VALID: &str = "gAAAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQICAgICAgICAgICAgICAgIDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw==";
+        for (aggressive, expected_status) in
+            [(false, StatusCode::BAD_REQUEST), (true, StatusCode::OK)]
+        {
+            let (upstream, calls, bodies) = start_encrypted_content_upstream().await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let credential_id = create_proxy_api_credential_with_config(
+                &pool,
+                "aggressive",
+                &upstream,
+                json!({
+                    "interface_format": "openai-responses",
+                    "responses_encrypted_content_cleanup": true,
+                    "responses_encrypted_content_aggressive_strip": aggressive,
+                    "failure_policy": {"retry_count": 0},
+                    "model_mappings": [{"from": "gpt-6-astra", "to": "gpt-6-astra"}]
+                }),
+            )
+            .await;
+            RoutePoolRepository::replace_members(
+                &pool,
+                "codex",
+                std::slice::from_ref(&credential_id),
+            )
+            .await
+            .expect("members");
+            let key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+                .await
+                .expect("key");
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .expect("proxy");
+            let response = reqwest::Client::new()
+                .post(format!("{}/v1/responses", proxy.base_url.as_deref().unwrap()))
+                .bearer_auth(&key)
+                .json(&json!({
+                    "model": "gpt-6-astra", "store": false, "input": [
+                        {"type": "reasoning", "id": "rs_foreign", "summary": [], "encrypted_content": VALID},
+                        {"type": "message", "role": "user", "content": "continue"}
+                    ]
+                }))
+                .send()
+                .await
+                .expect("proxy response");
+            assert_eq!(
+                response.status(),
+                expected_status,
+                "aggressive={aggressive}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "no retry for aggressive={aggressive}"
+            );
+            let sent = bodies.lock().unwrap().clone();
+            assert_eq!(
+                sent[0]["input"][0],
+                if aggressive {
+                    json!({"type": "reasoning", "summary": []})
+                } else {
+                    json!({"type": "reasoning", "id": "rs_foreign", "summary": [], "encrypted_content": VALID})
+                },
+                "aggressive={aggressive}"
+            );
+            let account = RouteCredentialRepository::get(&pool, &credential_id)
+                .await
+                .expect("account");
+            assert_eq!(account.status, "ok");
+            assert_eq!(account.transient_failure_count, 0);
+            RouteProxyService::stop(&runtime).await.expect("stop");
+        }
+    }
+
+    /// A Codex pool reached with the Anthropic Messages wire shape must bridge
+    /// the request to its own upstream dialect and translate the answer back.
+    /// Before this, `/v1/messages` fell through to passthrough: an Anthropic
+    /// body was sent verbatim to a Responses/Chat/Gemini upstream.
+    #[tokio::test]
+    async fn codex_pool_accepts_anthropic_messages_inbound() {
+        // Upstream answers in OpenAI Chat Completions shape.
+        let app = Router::new().fallback(|| async {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"id":"chatcmpl_1","object":"chat.completion","model":"up-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+            )
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "codex chat upstream",
+            &upstream,
+            json!({
+                "interface_format": "openai",
+                "model_mappings": [{"from": "claude-sonnet-4", "to": "up-model"}]
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("members");
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-test")
+            .await
+            .expect("key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/messages",
+                proxy.base_url.as_deref().unwrap()
+            ))
+            .bearer_auth(&route_key)
+            .json(&json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.expect("json body");
+        // The client asked for Anthropic Messages and must get that shape back,
+        // not the upstream's Chat Completions payload.
+        assert_eq!(body["type"], "message", "body: {body}");
+        assert_eq!(body["role"], "assistant", "body: {body}");
+        assert_eq!(body["content"][0]["type"], "text", "body: {body}");
+        assert_eq!(body["content"][0]["text"], "ok", "body: {body}");
+
+        RouteProxyService::stop(&runtime).await.expect("stop");
+    }
+
+    /// The account-level `responses_custom_tool_compat` switch keys off the
+    /// account's dialect, not the inbound path, so it stays armed when a Messages
+    /// request lands on an `openai-responses` account. Real Anthropic tools carry
+    /// only `name`/`description`/`input_schema` and no Responses `type`, so the
+    /// rewrite must be a no-op on them — the bridge below is what converts them.
+    #[test]
+    fn messages_inbound_is_untouched_by_responses_tool_rewrites() {
+        let request = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "tools": [
+                {"name": "lookup", "description": "Lookup", "input_schema": {"type": "object"}},
+                {"name": "apply_patch", "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]}
+            ]
+        });
+        let config = json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": [],
+            "responses_custom_tool_compat": true
+        });
+        let account = api_credential_with_config("probe", &config.to_string());
+        let (_, _, body) = build_upstream_request(
+            &account,
+            "codex",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .expect("request");
+        // The account is a Responses account, so the Messages body is bridged
+        // into Responses. What matters is that both tools arrived as plain
+        // functions with their schemas intact, rather than being mangled by the
+        // custom-tool rewrite into a description-wrapped stub.
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let tools = value["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2, "body={value}");
+        assert_eq!(tools[0]["type"], "function", "body={value}");
+        assert_eq!(
+            tools[0]["parameters"],
+            json!({"type": "object"}),
+            "body={value}"
+        );
+        assert_eq!(
+            tools[1]["parameters"],
+            json!({"type": "object"}),
+            "body={value}"
+        );
+        assert!(
+            !tools[1]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Original tool definition"),
+            "the Responses custom-tool rewrite must not fire on an Anthropic tool: {value}"
+        );
+    }
+
+    /// Anthropic's own tool `type` defaults to `custom`, so a real Messages
+    /// request may legitimately carry `{"type":"custom","name":…,"input_schema":…}`.
+    /// The Responses custom-tool rewrite must not touch it: that rewrite exists for
+    /// Codex `custom` tools, and applying it here replaces `input_schema` with an
+    /// empty `parameters` object, silently destroying the tool's schema.
+    #[test]
+    fn messages_inbound_keeps_anthropic_custom_typed_tools_intact() {
+        let request = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Patch files",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                    "required": ["input"]
+                }
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let config = json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": [],
+            "responses_custom_tool_compat": true
+        });
+        let account = api_credential_with_config("probe", &config.to_string());
+        let (_, _, body) = build_upstream_request(
+            &account,
+            "codex",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            &serde_json::to_vec(&request).unwrap(),
+        )
+        .expect("request");
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let tool = &value["tools"][0];
+        assert_eq!(
+            tool["parameters"]["properties"]["input"]["type"], "string",
+            "the Anthropic input_schema must survive the bridge: {value}"
+        );
+        assert_eq!(
+            tool["parameters"]["required"],
+            json!(["input"]),
+            "the Anthropic input_schema must survive the bridge: {value}"
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_sets_auth_by_interface_format() {
+        let openai = api_credential("openai", "openai");
+        let (_, headers, body) = build_upstream_request(
+            &openai,
+            "codex",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5"}"#,
+        )
+        .expect("openai request");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+        assert!(String::from_utf8(body).expect("body").contains("up-gpt"));
+
+        let anthropic = api_credential("anthropic", "anthropic");
+        let (_, headers, _) = build_upstream_request(
+            &anthropic,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{}"#,
+        )
+        .expect("anthropic request");
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("sk-test")
+        );
+        assert!(headers.get("authorization").is_none());
+
+        let mut anthropic_bearer = api_credential("anthropic-bearer", "anthropic");
+        anthropic_bearer.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "anthropic",
+            "api_key_field": "ANTHROPIC_AUTH_TOKEN",
+            "model_mappings": []
+        })
+        .to_string();
+        let (_, headers, _) = build_upstream_request(
+            &anthropic_bearer,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{}"#,
+        )
+        .expect("anthropic bearer request");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-test")
+        );
+        assert!(headers.get("x-api-key").is_none());
+
+        let gemini = api_credential("gemini", "gemini");
+        let (url, _, _) = build_upstream_request(
+            &gemini,
+            "gemini",
+            "/v1beta/models/gemini:generateContent",
+            None,
+            HeaderMap::new(),
+            br#"{}"#,
+        )
+        .expect("gemini request");
+        assert!(url.contains("key=sk-test"));
+    }
+
+    #[test]
+    fn build_upstream_request_appends_chat_completions_to_base_url() {
+        let mut credential = api_credential("root-openai", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": "openai",
+            "model_mappings": []
+        })
+        .to_string();
+
+        let (url, _, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(url, "https://api.example.com/chat/completions");
+    }
+
+    #[test]
+    fn build_upstream_request_appends_responses_to_base_url() {
+        let mut credential = api_credential("root-responses", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": "openai-responses",
+            "model_mappings": []
+        })
+        .to_string();
+
+        let (url, _, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(url, "https://api.example.com/responses");
+    }
+
+    #[test]
+    fn build_upstream_request_bridges_codex_responses_to_chat_upstream() {
+        let credential = api_credential("chat-upstream", "openai");
+        let (url, _, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","input":"hello","max_output_tokens":32}"#,
+        )
+        .expect("bridged request");
+        let body: Value = serde_json::from_slice(&body).expect("chat json");
+
+        assert_eq!(url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(body["model"], "up-gpt");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert_eq!(body["max_tokens"], 32);
+        assert!(body.get("input").is_none());
+    }
+
+    #[test]
+    fn build_upstream_request_keeps_codex_responses_for_responses_upstream() {
+        let credential = api_credential("responses-upstream", "openai-responses");
+        let (url, _, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5","input":"hello"}"#,
+        )
+        .expect("responses request");
+        let body: Value = serde_json::from_slice(&body).expect("responses json");
+
+        assert_eq!(url, "https://api.example.com/v1/responses");
+        assert_eq!(body["model"], "up-gpt");
+        assert_eq!(body["input"], "hello");
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn build_upstream_request_bridges_custom_responses_tools_to_chat_functions() {
+        let credential = api_credential("chat-custom-tool", "openai");
+        let body = br#"{
+            "model":"gpt-5",
+            "input":[{
+                "type":"custom_tool_call",
+                "call_id":"call_1",
+                "name":"apply_patch",
+                "input":"*** Begin Patch"
+            }],
+            "tools":[{
+                "type":"custom",
+                "name":"apply_patch",
+                "description":"Apply a patch"
+            }]
+        }"#;
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("bridged custom request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("chat json");
+
+        assert_eq!(value.pointer("/tools/0/type"), Some(&json!("function")));
+        assert_eq!(
+            value.pointer("/tools/0/function/name"),
+            Some(&json!("apply_patch"))
+        );
+        let assistant = value["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["role"] == "assistant")
+            })
+            .expect("assistant message");
+        assert_eq!(
+            assistant.pointer("/tool_calls/0/function/name"),
+            Some(&json!("apply_patch"))
+        );
+        assert_eq!(
+            assistant.pointer("/tool_calls/0/function/arguments"),
+            Some(&json!(r#"{"input":"*** Begin Patch"}"#))
+        );
+    }
+
+    /// The same custom-tool rewrite the chat bridge gets, for an Anthropic relay.
+    /// Without it `apply_patch` reaches Claude declared as `input_schema: {}` —
+    /// the model has nowhere to put the patch — and the `custom_tool_call` items
+    /// Codex replays next turn fail the request outright.
+    #[test]
+    fn build_upstream_request_bridges_custom_responses_tools_to_anthropic_tools() {
+        let credential = api_credential("anthropic-custom-tool", "anthropic");
+        let body = br#"{
+            "model":"gpt-5",
+            "input":[{
+                "type":"custom_tool_call",
+                "call_id":"call_1",
+                "name":"apply_patch",
+                "input":"*** Begin Patch"
+            }],
+            "tools":[{
+                "type":"custom",
+                "name":"apply_patch",
+                "description":"Apply a patch"
+            }]
+        }"#;
+        let (url, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("bridged custom request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("anthropic json");
+
+        assert_eq!(url, "https://api.example.com/v1/messages?beta=true");
+        assert_eq!(value.pointer("/tools/0/name"), Some(&json!("apply_patch")));
+        assert_eq!(
+            value.pointer("/tools/0/input_schema/properties/input/type"),
+            Some(&json!("string")),
+            "the freeform payload needs a declared slot: {value}"
+        );
+        assert_eq!(
+            value.pointer("/messages/0/content/0/type"),
+            Some(&json!("tool_use"))
+        );
+        assert_eq!(
+            value.pointer("/messages/0/content/0/input/input"),
+            Some(&json!("*** Begin Patch"))
+        );
+    }
+
+    /// The return leg of the same round trip. Codex declared `apply_patch` as a
+    /// freeform tool, so it only accepts the answer back as `custom_tool_call`
+    /// with the patch as a bare string — a `function_call` carrying
+    /// `{"input": "…"}` is a tool it has no handler for.
+    #[test]
+    fn anthropic_tool_use_comes_back_to_codex_as_a_custom_tool_call() {
+        let client_body = br#"{
+            "model":"gpt-5",
+            "input":"edit the file",
+            "tools":[{"type":"custom","name":"apply_patch","description":"Apply a patch"}]
+        }"#;
+        let custom_tool_names = collect_custom_tool_names(client_body);
+        assert!(custom_tool_names.contains("apply_patch"));
+
+        let upstream = serde_json::json!({
+            "id": "msg_01",
+            "model": "claude-sonnet-4-5",
+            "stop_reason": "tool_use",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": "apply_patch",
+                "input": {"input": "*** Begin Patch\n*** End Patch\n"}
+            }]
+        });
+        let transformed = transform_protocol_bridge_response(
+            ProtocolBridgeKind::ResponsesToAnthropic,
+            200,
+            Some("application/json"),
+            &serde_json::to_vec(&upstream).unwrap(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("bridged response");
+        let restored =
+            restore_custom_tools_in_responses_payload(&transformed.body, &custom_tool_names);
+        let value: Value = serde_json::from_slice(&restored).expect("responses json");
+
+        assert_eq!(
+            value.pointer("/output/0/type"),
+            Some(&json!("custom_tool_call")),
+            "Codex must see the freeform item type it declared: {value}"
+        );
+        assert_eq!(value.pointer("/output/0/name"), Some(&json!("apply_patch")));
+        assert_eq!(value.pointer("/output/0/call_id"), Some(&json!("toolu_01")));
+        assert_eq!(
+            value.pointer("/output/0/input"),
+            Some(&json!("*** Begin Patch\n*** End Patch\n")),
+            "the patch must arrive unwrapped: {value}"
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_appends_endpoint_to_openai_base_url_path() {
+        let mut credential = api_credential("path-responses", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://new.sharedchat.cc/codex",
+            "interface_format": "openai-responses",
+            "model_mappings": []
+        })
+        .to_string();
+
+        let (url, _, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(url, "https://new.sharedchat.cc/codex/responses");
+    }
+
+    #[test]
+    fn extract_token_count_supports_openai_and_anthropic_shapes() {
+        let openai = br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let anthropic = br#"{"usage":{"input_tokens":11,"output_tokens":7}}"#;
+        assert_eq!(extract_token_count(openai), Some(15));
+        assert_eq!(extract_token_count(anthropic), Some(18));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_supports_deepseek_usage_and_cny_price() {
+        let body = br#"{
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "prompt_cache_hit_tokens": 80,
+                "price_cny": 7.1
+            }
+        }"#;
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.cache_tokens, Some(80));
+        assert_eq!(usage.price_cny_micros, Some(7_100_000));
+        assert_eq!(usage.price_currency.as_deref(), Some("cny"));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_supports_openai_responses_and_usd_price() {
+        let body = br#"{
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "input_tokens_details": {"cached_tokens": 60},
+                "cost_usd": 0.0042
+            }
+        }"#;
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(25));
+        assert_eq!(usage.cache_tokens, Some(60));
+        assert_eq!(usage.price_usd_micros, Some(4_200));
+        assert_eq!(usage.price_currency.as_deref(), Some("usd"));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_supports_generic_object_price() {
+        let usage = extract_usage_breakdown(
+            br#"{"usage":{"input_tokens":1,"output_tokens":2,"price":{"amount":"0.12","currency":"CNY"}}}"#,
+        );
+
+        assert_eq!(usage.price_cny_micros, Some(120_000));
+        assert_eq!(usage.price_currency.as_deref(), Some("cny"));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_supports_anthropic_and_gemini_cache_shapes() {
+        let anthropic = extract_usage_breakdown(
+            br#"{"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}"#,
+        );
+        let gemini = extract_usage_breakdown(
+            br#"{"usageMetadata":{"promptTokenCount":13,"candidatesTokenCount":9,"cachedContentTokenCount":4}}"#,
+        );
+
+        assert_eq!(anthropic.input_tokens, Some(11));
+        assert_eq!(anthropic.output_tokens, Some(7));
+        assert_eq!(anthropic.cache_tokens, Some(7));
+        assert_eq!(gemini.input_tokens, Some(13));
+        assert_eq!(gemini.output_tokens, Some(9));
+        assert_eq!(gemini.cache_tokens, Some(4));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_leaves_price_empty_when_upstream_omits_price() {
+        let usage =
+            extract_usage_breakdown(br#"{"usage":{"prompt_tokens":10,"completion_tokens":2}}"#);
+
+        assert_eq!(usage.price_usd_micros, None);
+        assert_eq!(usage.price_cny_micros, None);
+        assert_eq!(usage.price_currency, None);
+    }
+
+    #[test]
+    fn extract_usage_breakdown_merges_anthropic_streaming_frames() {
+        // Anthropic splits usage across frames: input and cache tokens arrive in
+        // `message_start` (nested under `message`), output tokens in `message_delta`.
+        let body = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":1,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10}}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":88}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(88));
+        assert_eq!(usage.cache_tokens, Some(50));
+        assert_eq!(extract_token_count(body), Some(208));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_reads_openai_final_streaming_chunk() {
+        // OpenAI reports usage only in the final chunk; earlier chunks carry `"usage":null`.
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\
+\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":64,\"completion_tokens\":12,\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\
+\n\
+data: [DONE]\n\n";
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(64));
+        assert_eq!(usage.output_tokens, Some(12));
+        assert_eq!(usage.cache_tokens, Some(32));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_reads_gemini_streaming_frames() {
+        let body = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\
+\n\
+data: {\"usageMetadata\":{\"promptTokenCount\":31,\"candidatesTokenCount\":9,\"cachedContentTokenCount\":7}}\n\n";
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(31));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.cache_tokens, Some(7));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_keeps_usage_from_truncated_stream() {
+        // A client that disconnects mid-response leaves a partial trailing frame.
+        // The usage already received must survive that unparsable tail.
+        let body = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":77,\"output_tokens\":2}}}\n\
+\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partia";
+
+        let usage = extract_usage_breakdown(body);
+
+        assert_eq!(usage.input_tokens, Some(77));
+        assert_eq!(usage.output_tokens, Some(2));
+    }
+
+    #[test]
+    fn extract_usage_breakdown_reads_streaming_price_and_total_tokens() {
+        // Gateways that price requests themselves put the price in the tail frame.
+        let priced = extract_usage_breakdown(
+            b"data: {\"usage\":{\"input_tokens\":5,\"output_tokens\":6,\"price_cny\":7.1}}\n\n",
+        );
+        assert_eq!(priced.price_cny_micros, Some(7_100_000));
+        assert_eq!(priced.price_currency.as_deref(), Some("cny"));
+
+        // total_tokens-only shapes must still resolve through the SSE path.
+        assert_eq!(
+            extract_token_count(b"data: {\"usage\":{\"total_tokens\":404}}\n\n"),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn extract_usage_breakdown_stays_empty_for_non_sse_garbage() {
+        let usage = extract_usage_breakdown(b"<html><body>502 Bad Gateway</body></html>");
+
+        assert_eq!(
+            usage,
+            crate::models::route_pool::RouteUsageBreakdown::default()
+        );
+        assert_eq!(extract_token_count(b"<html>502</html>"), None);
+    }
+
+    #[test]
+    fn estimated_price_fills_in_cost_when_upstream_omits_it() {
+        // The case behind "cost is always 0": Anthropic reports tokens, no price.
+        let body =
+            br#"{"model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0}}"#;
+        let mut usage = extract_usage_breakdown(body);
+        assert_eq!(usage.price_usd_micros, None, "upstream sends no price");
+
+        apply_estimated_price(&mut usage, extract_response_model(body).as_deref());
+
+        // 1M input tokens at $5/MTok.
+        assert_eq!(usage.price_usd_micros, Some(5_000_000));
+        assert_eq!(usage.price_currency.as_deref(), Some("usd"));
+        assert_eq!(usage.price_source.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn upstream_price_is_never_overwritten_by_an_estimate() {
+        let mut usage = extract_usage_breakdown(
+            br#"{"model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0,"cost_usd":0.25}}"#,
+        );
+
+        apply_estimated_price(&mut usage, Some("claude-opus-5"));
+
+        // The real charge stands, tagged as such rather than replaced by $5.
+        assert_eq!(usage.price_usd_micros, Some(250_000));
+        assert_eq!(usage.price_source.as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn unknown_model_is_left_unpriced_rather_than_free() {
+        let mut usage = extract_usage_breakdown(
+            br#"{"model":"some-unreleased-model","usage":{"input_tokens":500,"output_tokens":5}}"#,
+        );
+
+        apply_estimated_price(&mut usage, Some("some-unreleased-model"));
+
+        assert_eq!(usage.price_usd_micros, None);
+        assert_eq!(usage.price_source, None, "unpriced must be distinguishable");
+    }
+
+    #[test]
+    fn zero_token_response_is_not_priced() {
+        // A failed or empty response should not gain a price row.
+        let mut usage = crate::models::route_pool::RouteUsageBreakdown::default();
+        apply_estimated_price(&mut usage, Some("claude-opus-5"));
+
+        assert_eq!(usage.price_usd_micros, None);
+        assert_eq!(usage.price_source, None);
+    }
+
+    #[test]
+    fn response_model_is_read_from_json_and_streaming_shapes() {
+        assert_eq!(
+            extract_response_model(br#"{"model":"claude-opus-5"}"#).as_deref(),
+            Some("claude-opus-5")
+        );
+        // Anthropic nests the model under `message` in `message_start`.
+        assert_eq!(
+            extract_response_model(
+                b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-alias\"}}\n\n"
+            )
+            .as_deref(),
+            Some("claude-opus-alias")
+        );
+        // Gemini reports `modelVersion`.
+        assert_eq!(
+            extract_response_model(br#"{"modelVersion":"gemini-2.5-flash"}"#).as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert_eq!(extract_response_model(b"<html>502</html>"), None);
+    }
+
+    #[test]
+    fn streaming_anthropic_response_is_priced_end_to_end() {
+        // The full regression: a streaming Anthropic reply used to persist NULL
+        // tokens and NULL cost. It must now yield both.
+        let body = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1000000}}\n\
+\n\
+data: [DONE]\n\n";
+
+        let mut usage = extract_usage_breakdown(body);
+        apply_estimated_price(&mut usage, extract_response_model(body).as_deref());
+
+        assert_eq!(usage.input_tokens, Some(1_000_000));
+        assert_eq!(usage.output_tokens, Some(1_000_000));
+        // $5 input + $25 output.
+        assert_eq!(usage.price_usd_micros, Some(30_000_000));
+        assert_eq!(usage.price_source.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn extract_inbound_api_key_from_bearer_x_api_key_and_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ai-switch-bearer"),
+        );
+        assert_eq!(
+            extract_inbound_api_key(&headers, None).as_deref(),
+            Some("sk-ai-switch-bearer")
+        );
+
+        let mut key_headers = HeaderMap::new();
+        key_headers.insert("x-api-key", HeaderValue::from_static("sk-ai-switch-xkey"));
+        assert_eq!(
+            extract_inbound_api_key(&key_headers, None).as_deref(),
+            Some("sk-ai-switch-xkey")
+        );
+
+        assert_eq!(
+            extract_inbound_api_key(&HeaderMap::new(), Some("key=sk-ai-switch-query&x=1"))
+                .as_deref(),
+            Some("sk-ai-switch-query")
+        );
+    }
+
+    #[test]
+    fn strip_route_proxy_auth_query_keeps_unrelated_parameters() {
+        assert_eq!(
+            strip_route_proxy_auth_query(Some("key=sk-ai-switch-local&alt=sse&api_key=ignored")),
+            Some("alt=sse".to_string())
+        );
+        assert_eq!(strip_route_proxy_auth_query(Some("apiKey=local")), None);
+        assert_eq!(
+            strip_route_proxy_auth_query(Some("alt=sse")),
+            Some("alt=sse".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_route_proxy_auth_headers_removes_only_local_credential_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ai-switch-local"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("sk-ai-switch-local"));
+        headers.insert(
+            "x-goog-api-key",
+            HeaderValue::from_static("sk-ai-switch-local"),
+        );
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+        // Old clients may still send this header. It grants no authority and
+        // must not leak into the upstream credential's request.
+        headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
+
+        strip_route_proxy_auth_headers(&mut headers);
+
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("x-goog-api-key").is_none());
+        assert!(headers.get(ROUTE_PROXY_PLATFORM_HEADER).is_none());
+        assert_eq!(
+            headers.get("accept"),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+    }
+
+    #[test]
+    fn cors_preflight_echoes_origin_requested_headers_and_private_network_access() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://fastview.lingyun.net"),
+        );
+        headers.insert(
+            "access-control-request-method",
+            HeaderValue::from_static("POST"),
+        );
+        headers.insert(
+            "access-control-request-headers",
+            HeaderValue::from_static("authorization,content-type,x-ai-switch-platform"),
+        );
+        headers.insert(
+            "access-control-request-private-network",
+            HeaderValue::from_static("true"),
+        );
+
+        let response = cors_preflight_response(&headers);
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://fastview.lingyun.net")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|value| value.to_str().ok()),
+            Some("authorization,content-type,x-ai-switch-platform")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let mut actual = StatusCode::OK.into_response();
+        add_cors_headers(&mut actual, cors_request_origin(&headers).as_ref());
+        assert_eq!(
+            actual
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://fastview.lingyun.net")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_platform_preserves_hermes_proxy_key_identity() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "hermes", "sk-ai-switch-hermes")
+            .await
+            .expect("store key");
+
+        let state = ProxyAppState {
+            pool,
+            access_scope: None,
+            model_match_mode: ModelMatchMode::ClientFacing,
+            key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            codex_history: CodexReasoningCache::default(),
+            upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-ai-switch-hermes"),
+        );
+        let platform = resolve_platform(&state, &headers, Some("sk-ai-switch-hermes"))
+            .await
+            .expect("resolve");
+        assert_eq!(platform, PlatformId::Hermes);
+
+        // Second lookup should hit the in-memory cache (still within 30s TTL).
+        let cached = resolve_platform(&state, &headers, Some("sk-ai-switch-hermes"))
+            .await
+            .expect("cached resolve");
+        assert_eq!(cached, PlatformId::Hermes);
+    }
+
+    #[tokio::test]
+    async fn resolve_platform_without_key_or_header_fails_closed() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let state = ProxyAppState {
+            pool,
+            access_scope: None,
+            model_match_mode: ModelMatchMode::ClientFacing,
+            key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            codex_history: CodexReasoningCache::default(),
+            upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+        };
+
+        let error = resolve_platform(&state, &HeaderMap::new(), None)
+            .await
+            .expect_err("platform identity must be explicit");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "route_proxy.platform_unresolved",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_platform_rejects_unknown_proxy_key() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let state = ProxyAppState {
+            pool,
+            access_scope: None,
+            model_match_mode: ModelMatchMode::ClientFacing,
+            key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            codex_history: CodexReasoningCache::default(),
+            upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+        };
+
+        let key = "sk-invalid";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-invalid"),
+        );
+        let error = resolve_platform(&state, &headers, Some(key))
+            .await
+            .expect_err("unknown proxy key must be rejected");
+
+        let message = match error {
+            AppError::Validation { code, message, .. } => {
+                assert_eq!(code, "route_proxy.key_invalid");
+                message
+            }
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(!message.contains(key));
+    }
+
+    #[tokio::test]
+    async fn resolve_platform_rejects_a_chatgpt_token_even_when_the_header_names_the_platform() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // Official OAuth tokens remain upstream credentials. A public request
+        // still needs the local proxy key; a platform header grants no authority.
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let state = ProxyAppState {
+            pool,
+            access_scope: None,
+            model_match_mode: ModelMatchMode::ClientFacing,
+            key_cache: Arc::new(Mutex::new(RouteProxyKeyCache::default())),
+            activity: RouteCredentialActivityRegistry::default(),
+            live_log: RouteProxyLiveLog::default(),
+            codex_history: CodexReasoningCache::default(),
+            upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
+            proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJSUzI1NiJ9.chatgpt-access-token"),
+        );
+        headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
+
+        let error = resolve_platform(&state, &headers, Some("eyJhbGciOiJSUzI1NiJ9.chatgpt-access-token"))
+            .await
+            .expect_err("platform headers must not authorize public requests");
+        assert!(matches!(error, AppError::Validation { code: "route_proxy.key_invalid", .. }));
+    }
+
+    #[tokio::test]
+    async fn codex_login_uses_explicit_local_key_without_falling_back_from_an_invalid_key() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "local-test-key")
+            .await.unwrap();
+        let state = build_proxy_state(pool, &RouteProxyRuntimeState::default());
+        for (explicit_key, bearer, expected) in [
+            (Some("local-test-key"), Some("chatgpt-token"), StatusCode::OK),
+            (Some("invalid-local-key"), Some("local-test-key"), StatusCode::UNAUTHORIZED),
+            (Some("local-test-key"), None, StatusCode::OK),
+            (None, Some("local-test-key"), StatusCode::OK),
+            (Some("   "), Some("local-test-key"), StatusCode::OK),
+            (None, Some("chatgpt-token"), StatusCode::UNAUTHORIZED),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(key) = explicit_key {
+                headers.insert("x-api-key", HeaderValue::from_str(key).unwrap());
+            }
+            if let Some(token) = bearer {
+                headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+            }
+            headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
+            let response = proxy_handler(
+                AxumState(state.clone()), Method::GET, headers,
+                "/v1/models".parse().unwrap(), Body::empty(),
+            ).await;
+            assert_eq!(response.status(), expected, "x-api-key={explicit_key:?}, bearer={bearer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_proxy_platform_header_cannot_bypass_local_key_authentication() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "local-test-key")
+            .await.unwrap();
+        let state = build_proxy_state(pool, &RouteProxyRuntimeState::default());
+        for key in [None, Some("invalid-key"), Some("eyJhbGciOiJSUzI1NiJ9.official-token")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("codex"));
+            if let Some(key) = key {
+                headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {key}")).unwrap());
+            }
+            let response = proxy_handler(
+                AxumState(state.clone()), Method::GET, headers,
+                "/v1/models".parse().unwrap(), Body::empty(),
+            ).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "key={key:?}");
+        }
+
+        for header in ["authorization", "x-api-key", "api-key", "x-goog-api-key"] {
+            let mut headers = HeaderMap::new();
+            // A valid local key wins even over a forged/unknown platform header.
+            headers.insert(ROUTE_PROXY_PLATFORM_HEADER, HeaderValue::from_static("not-a-platform"));
+            headers.insert(header, HeaderValue::from_static(if header == "authorization" {
+                "Bearer local-test-key"
+            } else {
+                "local-test-key"
+            }));
+            let response = proxy_handler(
+                AxumState(state.clone()), Method::GET, headers,
+                "/v1/models".parse().unwrap(), Body::empty(),
+            ).await;
+            assert_eq!(response.status(), StatusCode::OK, "header={header}");
+        }
+        let response = proxy_handler(
+            AxumState(state), Method::GET, HeaderMap::new(),
+            "/v1/models?key=local-test-key".parse().unwrap(), Body::empty(),
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn build_upstream_request_uses_official_cpa_base_url_and_headers() {
+        let credential = SelectedCredential {
+            id: "official-grok".to_string(),
+            platform: "grok".to_string(),
+            kind: "official".to_string(),
+            display_name: "Grok OAuth".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"access_token":"at-xai","refresh_token":"rt-xai"}"#
+                .to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "token_endpoint": "https://auth.x.ai/oauth2/token",
+                "headers": {
+                    "X-Client-Name": "grok-cli"
+                }
+            })
+            .to_string(),
+        };
+
+        let (url, headers, _) = build_upstream_request(
+            &credential,
+            "grok",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"grok-3"}"#,
+        )
+        .expect("official grok request");
+
+        assert_eq!(url, "https://cli-chat-proxy.grok.com/v1/chat/completions");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer at-xai")
+        );
+        // Outdated CPA User-Agent/X-Client-Name must be upgraded to CLIProxyAPI identity.
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-workspace/0.2.93")
+        );
+        assert_eq!(
+            headers
+                .get("x-grok-client-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.2.93")
+        );
+        assert_eq!(
+            headers
+                .get("x-xai-token-auth")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-cli")
+        );
+        assert!(headers.get("x-client-name").is_none());
+    }
+
+    #[test]
+    fn build_upstream_request_custom_user_agent_overrides_grok_forced_ua() {
+        let credential = SelectedCredential {
+            id: "official-grok-custom-ua".to_string(),
+            platform: "grok".to_string(),
+            kind: "official".to_string(),
+            display_name: "Grok Custom UA".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"access_token":"at-xai"}"#.to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "headers": {
+                    "User-Agent": "MyGrokClient/9.9.9",
+                    "X-Client-Name": "grok-cli"
+                }
+            })
+            .to_string(),
+        };
+
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "grok",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"grok-4.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("MyGrokClient/9.9.9")
+        );
+        assert_eq!(
+            headers
+                .get("x-grok-client-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.2.93")
+        );
+        assert_eq!(
+            headers
+                .get("x-xai-token-auth")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-cli")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_empty_user_agent_keeps_grok_forced_ua() {
+        let credential = SelectedCredential {
+            id: "official-grok-empty-ua".to_string(),
+            platform: "grok".to_string(),
+            kind: "official".to_string(),
+            display_name: "Grok Empty UA".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"access_token":"at-xai"}"#.to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://cli-chat-proxy.grok.com/v1",
+                "headers": {
+                    "User-Agent": "   "
+                }
+            })
+            .to_string(),
+        };
+
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "grok",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"grok-4.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("xai-grok-workspace/0.2.93")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_custom_user_agent_applies_on_api_accounts() {
+        let mut credential = api_credential("relay-ua", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [],
+            "headers": {
+                "user-agent": "RelayBot/1.0"
+            }
+        })
+        .to_string();
+
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.5"}"#,
+        )
+        .expect("request");
+
+        assert_eq!(
+            headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("RelayBot/1.0")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_skips_cli_headers_for_official_xai_api() {
+        let credential = SelectedCredential {
+            id: "official-grok-api".to_string(),
+            platform: "grok".to_string(),
+            kind: "official".to_string(),
+            display_name: "Grok API".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: r#"{"access_token":"at-xai"}"#.to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://api.x.ai/v1"
+            })
+            .to_string(),
+        };
+
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "grok",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"grok-3"}"#,
+        )
+        .expect("official api.x.ai request");
+
+        assert!(headers.get("x-grok-client-version").is_none());
+        assert!(headers.get("x-xai-token-auth").is_none());
+    }
+
+    fn anthropic_api_credential() -> SelectedCredential {
+        SelectedCredential {
+            id: "claude-api-1".to_string(),
+            platform: "claude".to_string(),
+            kind: "api".to_string(),
+            display_name: "Claude API".to_string(),
+            status: "ok".to_string(),
+            route_priority: 1,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({"api_key": "sk-test"}).to_string(),
+            config_json: serde_json::json!({
+                "base_url": "https://api.example.com",
+                "interface_format": "anthropic",
+                "model_mappings": [
+                    {"from": "claude-opus-alias", "to": "provider-opus", "supports_1m": true}
+                ]
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn the_one_m_suffix_adds_the_beta_marker_that_actually_enables_it() {
+        // Claude Code signals 1M with a `[1M]` model suffix, which the mapping
+        // lookup strips — so the suffix alone reaches the gateway as an ordinary
+        // request and it replies "please enable 1m context and retry".
+        let (_, headers, body) = build_upstream_request(
+            &anthropic_api_credential(),
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-opus-alias[1M]","max_tokens":16}"#,
+        )
+        .expect("1M request");
+
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "beta header must carry the 1M marker: {beta}"
+        );
+        // The Claude Code identity marker still has to survive the merge.
+        assert!(beta.contains(client_identity::CLAUDE_CODE_BETA_MARKER));
+        // The suffix itself is stripped for the upstream body — that is exactly
+        // why the header has to carry the intent.
+        let sent: Value = serde_json::from_slice(&body).expect("body json");
+        assert_eq!(sent["model"], "provider-opus");
+    }
+
+    /// One-alias account, with or without the 1M declaration on that alias.
+    fn anthropic_alias_credential(alias: &str, supports_one_m: bool) -> SelectedCredential {
+        let mut mapping = serde_json::json!({"from": alias, "to": "provider-opus"});
+        if supports_one_m {
+            mapping["supports_1m"] = serde_json::json!(true);
+        }
+        let mut credential = anthropic_api_credential();
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": "anthropic",
+            "model_mappings": [mapping]
+        })
+        .to_string();
+        credential
+    }
+
+    #[test]
+    fn a_mapping_that_declares_one_m_marks_the_request_without_a_client_suffix() {
+        // The reported failure: the pool withheld the `[1M]` tag from the haiku
+        // pin (one in-pool account did not declare it), so Claude Code sent
+        // `claude-haiku-alias` bare, no beta marker reached the relay, and it
+        // answered "1m 上下文已经全量可用，请启用 1m 上下文后重试" on every
+        // background call. The declaration belongs to the account that serves the
+        // request, so the account's own `supports_1m` has to decide.
+        let (_, headers, body) = build_upstream_request(
+            &anthropic_alias_credential("claude-haiku-alias", true),
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-haiku-alias","max_tokens":16}"#,
+        )
+        .expect("haiku request");
+
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "the declared 1M window must reach the upstream: {beta}"
+        );
+        let sent: Value = serde_json::from_slice(&body).expect("body json");
+        assert_eq!(sent["model"], "provider-opus");
+    }
+
+    #[test]
+    fn the_connectivity_probe_also_carries_the_accounts_one_m_declaration() {
+        // The failure was read off the *probe*: pressing "test" on the anyrouter
+        // account kept answering "1m 上下文已经全量可用，请启用 1m 上下文后重试"
+        // while real Claude Code traffic through the same account was served.
+        // The probe does not enter through `build_upstream_request` — it uses
+        // `build_upstream_request_with_bridge` — so the declaration has to reach
+        // that entry point as well. The two differ only in the turn reminder and
+        // the return type, and this pins that they agree on the marker, so a
+        // future change cannot fix one path and leave the probe reporting the
+        // account broken.
+        let probe = build_upstream_request_with_bridge(
+            &anthropic_alias_credential("claude-haiku-alias", true),
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-haiku-alias","max_tokens":16}"#,
+            TurnReminderMode::Skip,
+        )
+        .expect("probe request");
+
+        let beta = probe
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "the probe must declare the 1M window the account can serve: {beta}"
+        );
+        // `?beta=true` is the other half of what the relay reads on `/v1/messages`.
+        assert!(
+            probe.target_url.contains("beta=true"),
+            "the messages endpoint needs the beta query flag too: {}",
+            probe.target_url
+        );
+    }
+
+    #[test]
+    fn a_catch_all_row_carries_its_one_m_declaration_to_the_aliases_it_rewrites() {
+        // Every alias without a row of its own is served by the catch-all, so its
+        // declaration is the one that applies — the same resolution the model
+        // rewrite uses.
+        let credential = anthropic_alias_credential("claude-model", true);
+        let (_, headers, _) = build_upstream_request(
+            &credential,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-haiku-alias","max_tokens":16}"#,
+        )
+        .expect("catch-all request");
+
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "the catch-all's declaration must apply to what it rewrites: {beta}"
+        );
+    }
+
+    #[test]
+    fn a_plain_model_gets_no_one_m_marker() {
+        // Same request as above against an account that declares nothing: the
+        // marker stays out, so an upstream that cannot serve 1M is never asked
+        // to.
+        let (_, headers, _) = build_upstream_request(
+            &anthropic_alias_credential("claude-opus-alias", false),
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-opus-alias","max_tokens":16}"#,
+        )
+        .expect("plain request");
+
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            !beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "a mapping that declares no 1M support must not claim it: {beta}"
+        );
+    }
+
+    #[test]
+    fn codex_claude_upstream_with_one_m_context_sends_the_beta_marker() {
+        // Codex routed to a Claude `message` (Anthropic) upstream: the catalog
+        // advertises the 1M window through the `claude-` prefix default, so the
+        // request must carry the `context-1m-2025-08-07` beta marker even without
+        // a `[1M]` model-name variant.
+        let (_, headers, _) = build_upstream_request(
+            &anthropic_api_credential(),
+            "codex",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"claude-opus-5","max_tokens":16}"#,
+        )
+        .expect("codex request");
+
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .expect("anthropic-beta header");
+        assert!(
+            beta.contains(client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA),
+            "beta header must carry the 1M marker for a 1M Claude upstream: {beta}"
+        );
+    }
+
+    /// A credential of `platform` whose upstream speaks `dialect`, with the
+    /// per-turn reminder switched on.
+    fn reminder_credential(
+        platform: &str,
+        dialect: &str,
+        text: Option<&str>,
+    ) -> SelectedCredential {
+        let mut config = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": dialect,
+            "model_mappings": [],
+            "turn_reminder": true,
+        });
+        if let Some(text) = text {
+            config["turn_reminder_text"] = serde_json::json!(text);
+        }
+        SelectedCredential {
+            id: format!("{platform}-{dialect}"),
+            platform: platform.to_string(),
+            kind: "api".to_string(),
+            display_name: format!("{platform} via {dialect}"),
+            status: "ok".to_string(),
+            route_priority: 1,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({"api_key": "sk-test"}).to_string(),
+            config_json: config.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_turn_reminder_lands_in_each_upstream_dialects_own_shape() {
+        // Injection has to happen after protocol bridging: a Codex client speaks
+        // Responses, so against an Anthropic upstream the body it produces is
+        // `messages`, and against Gemini it is `contents`. Each row below asserts
+        // the pointer where that dialect actually carries user text.
+        for (platform, dialect, path, request, pointer) in [
+            (
+                "claude",
+                "anthropic",
+                "/v1/messages",
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                "/messages/0/content/1/text",
+            ),
+            (
+                "codex",
+                "openai",
+                "/v1/responses",
+                r#"{"model":"m","input":"hi"}"#,
+                // No tools in this request, so no system message is prepended and
+                // the single converted user turn sits at index 0.
+                "/messages/0/content",
+            ),
+            (
+                "codex",
+                "openai-responses",
+                "/v1/responses",
+                r#"{"model":"m","input":"hi"}"#,
+                "/input",
+            ),
+            (
+                "codex",
+                "gemini",
+                "/v1/responses",
+                r#"{"model":"m","input":"hi"}"#,
+                "/contents/0/parts/1/text",
+            ),
+        ] {
+            let (_, _, body) = build_upstream_request(
+                &reminder_credential(platform, dialect, None),
+                platform,
+                path,
+                None,
+                HeaderMap::new(),
+                request.as_bytes(),
+            )
+            .unwrap_or_else(|error| panic!("{platform}/{dialect}: {error}"));
+
+            let sent: Value = serde_json::from_slice(&body).expect("body json");
+            let carried = sent
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{platform}/{dialect}: nothing at {pointer}"));
+            assert!(
+                carried.contains(turn_reminder::DEFAULT_TURN_REMINDER),
+                "{platform}/{dialect}: {pointer} = {carried}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_reminder_text_replaces_the_default() {
+        let (_, _, body) = build_upstream_request(
+            &reminder_credential("claude", "anthropic", Some("Answer in Japanese.")),
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .expect("request");
+
+        let sent: Value = serde_json::from_slice(&body).expect("body json");
+        let text = sent
+            .pointer("/messages/0/content/1/text")
+            .and_then(Value::as_str)
+            .expect("reminder block");
+        assert_eq!(text, "Answer in Japanese.");
+        assert!(!text.contains(turn_reminder::DEFAULT_TURN_REMINDER));
+    }
+
+    #[test]
+    fn an_account_without_the_reminder_sends_a_byte_identical_body() {
+        let request = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut off = reminder_credential("claude", "anthropic", None);
+        off.config_json = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": "anthropic",
+            "model_mappings": [],
+        })
+        .to_string();
+
+        let (_, _, body) = build_upstream_request(
+            &off,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            request,
+        )
+        .expect("request");
+
+        // Anthropic→Anthropic is a passthrough, so an untouched body is literally
+        // the input bytes. Anything else means the feature leaked when off.
+        assert_eq!(body, request.to_vec());
+    }
+
+    #[test]
+    fn the_connectivity_probe_opts_out_of_the_reminder() {
+        // The probe asks for exactly `ai-switch-ok`. A reminder that says "answer
+        // in Chinese" contradicts that, so applying it here would make the probe
+        // fail forever on any account that enables the reminder — the account
+        // would look broken when only the probe was.
+        let credential = reminder_credential("claude", "anthropic", None);
+        let request = br#"{"model":"m","messages":[{"role":"user","content":"Reply with exactly: ai-switch-ok"}]}"#;
+
+        let probe = build_upstream_request_with_bridge(
+            &credential,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            request,
+            TurnReminderMode::Skip,
+        )
+        .expect("probe request");
+        assert_eq!(probe.body, request.to_vec());
+
+        // Same credential on the proxy path still gets it — proving the exemption
+        // is the probe's, not a dead config reader.
+        let forwarded = build_upstream_request_with_bridge(
+            &credential,
+            "claude",
+            "/v1/messages",
+            None,
+            HeaderMap::new(),
+            request,
+            TurnReminderMode::Apply,
+        )
+        .expect("forwarded request");
+        assert_ne!(forwarded.body, request.to_vec());
+    }
+
+    /// A ChatGPT-subscription Codex account, imported the way the app's own
+    /// example JSON produces it: access + refresh token, no `base_url`, no
+    /// agent-identity fields.
+    ///
+    /// This must reach ChatGPT's backend. Sent to `api.openai.com` instead — which
+    /// is where it went until this was pinned — the subscription token is judged as
+    /// an API key and refused for missing `api.responses.write`, so a perfectly good
+    /// account reads as broken while the same login works in any tool that talks to
+    /// the right host.
+    #[test]
+    fn plain_oauth_official_codex_goes_to_the_chatgpt_backend() {
+        let credential = SelectedCredential {
+            id: "official-chatgpt".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "ChatGPT Plus".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({
+                "access_token": "at-chatgpt",
+                "refresh_token": "rt-chatgpt",
+                "account_id": "acct-workspace-1"
+            })
+            .to_string(),
+            config_json: serde_json::json!({"type": "codex", "auth_kind": "oauth"}).to_string(),
+        };
+
+        let (url, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.6-sol"}"#,
+        )
+        .expect("official codex request");
+
+        // ChatGPT's backend hosts the endpoint unversioned, so the client's `/v1`
+        // must be dropped rather than appended.
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer at-chatgpt")
+        );
+        // The backend bills per account of the token's owner, exactly as it does on
+        // the agent-identity path.
+        assert_eq!(
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("acct-workspace-1")
+        );
+    }
+
+    #[test]
+    fn official_codex_normalizes_chatgpt_backend_request_body() {
+        let credential = SelectedCredential {
+            id: "official-chatgpt-body".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "ChatGPT Plus".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({"access_token": "at-chatgpt"}).to_string(),
+            config_json: serde_json::json!({"type": "codex", "auth_kind": "oauth"}).to_string(),
+        };
+        let (_, _, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.6-sol","stream":true,"store":true,"max_output_tokens":65536,"instructions":"keep me"}"#,
+        )
+        .expect("official codex request");
+        let body: Value = serde_json::from_slice(&body).expect("body json");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["instructions"], "keep me");
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn official_codex_model_mappings_rewrite_the_request_body() {
+        let credential = SelectedCredential {
+            id: "official-mapped".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "ChatGPT Mapped".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({"access_token": "at-mapped"}).to_string(),
+            config_json: serde_json::json!({
+                "model_mappings": [{"from": "gpt-5.6-sol", "to": "gpt-5.6-terra"}]
+            })
+            .to_string(),
+        };
+
+        let (_, _, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.6-sol"}"#,
+        )
+        .expect("official codex request");
+
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body json");
+        assert_eq!(body["model"], "gpt-5.6-terra");
+    }
+
+    /// Importers that carry no `account_id` still have one available: ChatGPT mints
+    /// it into the access token. Deriving it beats sending none, which silently
+    /// bills the owner's default workspace.
+    #[test]
+    fn official_codex_reads_the_account_id_out_of_the_access_token() {
+        // {"alg":"none"}.{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-from-jwt"}}.sig
+        let token = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1mcm9tLWp3dCJ9fQ.sig";
+        let credential = SelectedCredential {
+            id: "official-jwt".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "ChatGPT Pro".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({"access_token": token}).to_string(),
+            config_json: "{}".to_string(),
+        };
+
+        let (url, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.6-sol"}"#,
+        )
+        .expect("official codex request");
+
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("acct-from-jwt")
+        );
+    }
+
+    /// A relay hosting an OAuth token is not ChatGPT: it has its own auth and no
+    /// notion of ChatGPT workspaces, so an explicit `base_url` must win outright and
+    /// pick up none of the ChatGPT-specific handling.
+    #[test]
+    fn official_codex_keeps_an_explicit_relay_base_url_untouched() {
+        let credential = SelectedCredential {
+            id: "official-relay".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "Relay Hosted".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({
+                "access_token": "at-relay",
+                "account_id": "acct-1"
+            })
+            .to_string(),
+            config_json: serde_json::json!({"base_url": "https://relay.example.com/v1"})
+                .to_string(),
+        };
+
+        let (url, headers, body) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5.6-sol","store":true,"max_output_tokens":8192}"#,
+        )
+        .expect("official codex request");
+
+        assert_eq!(url, "https://relay.example.com/v1/responses");
+        assert!(headers.get("chatgpt-account-id").is_none());
+        let body: Value = serde_json::from_slice(&body).expect("body json");
+        assert_eq!(body["store"], true);
+        assert_eq!(body["max_output_tokens"], 8192);
+    }
+
+    #[test]
+    fn build_upstream_request_uses_agent_identity_for_sub2api_codex() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let private_key = signing_key.to_pkcs8_der().expect("encode key");
+        let credential = SelectedCredential {
+            id: "official-k12".to_string(),
+            platform: "codex".to_string(),
+            kind: "official".to_string(),
+            display_name: "K12 Agent".to_string(),
+            status: "ok".to_string(),
+            route_priority: 3,
+            max_concurrency: 1,
+            secret_payload_json: serde_json::json!({
+                "agent_runtime_id": "agent-runtime-1",
+                "agent_private_key": BASE64_STANDARD.encode(private_key.as_bytes()),
+                "task_id": "task-run-1",
+                "account_id": "account-1"
+            })
+            .to_string(),
+            config_json: serde_json::json!({
+                "auth_mode": "agentIdentity",
+                "chatgpt_account_is_fedramp": true
+            })
+            .to_string(),
+        };
+
+        let (url, headers, _) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            br#"{"model":"gpt-5"}"#,
+        )
+        .expect("agent identity request");
+
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert!(headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("AgentAssertion ")));
+        assert_eq!(
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("account-1")
+        );
+        assert_eq!(
+            headers
+                .get("x-openai-fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn is_route_credential_quota_available_filters_zero_remaining() {
+        assert!(is_route_credential_quota_available("{}"));
+        assert!(is_route_credential_quota_available(
+            r#"{"quota_remaining":12}"#
+        ));
+        assert!(is_route_credential_quota_available(
+            r#"{"primary_remain":12}"#
+        ));
+        assert!(!is_route_credential_quota_available(
+            r#"{"quota_remaining":0}"#
+        ));
+        assert!(!is_route_credential_quota_available(
+            r#"{"primary_remain":0}"#
+        ));
+        assert!(!is_route_credential_quota_available(
+            r#"{"primary_remain":5,"weekly_remain":0}"#
+        ));
+        assert!(!is_route_credential_quota_available(
+            r#"{"quota_remaining":-1}"#
+        ));
+        assert!(!is_route_credential_quota_available(
+            r#"{"quota_remaining":"0"}"#
+        ));
+        assert!(is_route_credential_quota_available(
+            r#"{"quota_remaining":"5"}"#
+        ));
+    }
+
+    #[test]
+    fn parse_official_quota_snapshot_from_free_usage_exhausted() {
+        let body = r#"{
+  "code": "subscription:free-usage-exhausted",
+  "error": "You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1177205/1000000. Upgrade to a Grok subscription for higher limits: https://grok.com/supergrok"
+}"#;
+        let snapshot = parse_official_quota_snapshot(body).expect("snapshot");
+        assert_eq!(snapshot.subscription_type.as_deref(), Some("free"));
+        assert_eq!(snapshot.primary_remain, Some(0));
+        assert_eq!(snapshot.quota_remaining, Some(0));
+        assert_eq!(snapshot.quota_used, Some(1_177_205));
+        assert_eq!(snapshot.quota_limit, Some(1_000_000));
+
+        let next = apply_official_quota_snapshot("{}", &snapshot).expect("config");
+        assert!(next.contains("\"subscription_type\":\"free\""));
+        assert!(next.contains("\"primary_remain\":0"));
+        assert!(next.contains("\"quota_remaining\":0"));
+        assert!(next.contains("\"quota_used\":1177205"));
+        assert!(next.contains("\"quota_limit\":1000000"));
+        assert!(next.contains("quota_updated_at"));
+        assert!(next.contains("reset_primary"));
+    }
+
+    #[test]
+    fn apply_official_quota_snapshot_persists_credit_metadata() {
+        let snapshot = OfficialQuotaSnapshot {
+            subscription_type: Some("k12".to_string()),
+            primary_remain: Some(75),
+            weekly_remain: None,
+            reset_primary: Some("2026-09-07T12:00:00Z".to_string()),
+            reset_weekly: None,
+            quota_remaining: Some(75),
+            quota_limit: None,
+            quota_used: None,
+            credits_has_credits: Some(true),
+            credits_unlimited: Some(false),
+            credits_balance: Some("12.34".to_string()),
+            rate_limit_reset_credits_available_count: Some(0),
+        };
+
+        let next =
+            apply_official_quota_snapshot(r#"{"existing":"value"}"#, &snapshot).expect("config");
+        let config: serde_json::Value = serde_json::from_str(&next).expect("json");
+        assert_eq!(config["credits_has_credits"], serde_json::json!(true));
+        assert_eq!(config["credits_unlimited"], serde_json::json!(false));
+        assert_eq!(config["credits_balance"], serde_json::json!("12.34"));
+        assert_eq!(
+            config["rate_limit_reset_credits_available_count"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
+    fn access_token_is_expired_parses_rfc3339() {
+        let future = serde_json::json!({
+            "expired": (Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+        });
+        let past = serde_json::json!({
+            "expired": (Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+        });
+        assert!(!access_token_is_expired(&future));
+        assert!(access_token_is_expired(&past));
+    }
+
+    #[test]
+    fn is_permanent_oauth_refresh_failure_detects_revoked_refresh_token() {
+        assert!(is_permanent_oauth_refresh_failure(
+            r#"OAuth refresh failed with status 400: {"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#
+        ));
+        assert!(!is_permanent_oauth_refresh_failure(
+            "OAuth refresh request failed: error sending request"
+        ));
+        assert!(format_oauth_refresh_failure("invalid_grant").contains("重新导入"));
+    }
+
+    #[test]
+    fn resolve_oauth_client_id_uses_xai_public_client_for_grok() {
+        let config = serde_json::json!({
+            "token_endpoint": "https://auth.x.ai/oauth2/token"
+        });
+        let secret = serde_json::json!({});
+        assert_eq!(
+            resolve_oauth_client_id("grok", &config, &secret).as_deref(),
+            Some(XAI_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            resolve_oauth_client_id("xai", &config, &secret).as_deref(),
+            Some(XAI_OAUTH_CLIENT_ID)
+        );
+    }
+
+    #[test]
+    fn resolve_oauth_client_id_prefers_config_value() {
+        let config = serde_json::json!({
+            "client_id": "custom-client",
+            "token_endpoint": "https://auth.x.ai/oauth2/token"
+        });
+        let secret = serde_json::json!({});
+        assert_eq!(
+            resolve_oauth_client_id("grok", &config, &secret).as_deref(),
+            Some("custom-client")
+        );
+    }
+
+    #[test]
+    fn jwt_claim_helpers_parse_payload() {
+        // {"alg":"none"}.{"exp":1893456000,"client_id":"cid-from-jwt"}.sig
+        let token =
+            "eyJhbGciOiJub25lIn0.eyJleHAiOjE4OTM0NTYwMDAsImNsaWVudF9pZCI6ImNpZC1mcm9tLWp3dCJ9.sig";
+        assert_eq!(jwt_claim_i64(token, "exp"), Some(1893456000));
+        assert_eq!(
+            jwt_claim_string(token, "client_id").as_deref(),
+            Some("cid-from-jwt")
+        );
+    }
+
+    #[test]
+    fn strip_unsupported_hosted_tools_drops_web_search_keeps_functions() {
+        let body = br#"{
+            "model":"gpt-5.5",
+            "tools":[
+                {"type":"web_search"},
+                {"type":"function","name":"exec_command","parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch"},
+                {"type":"file_search"}
+            ],
+            "tool_choice":{"type":"web_search"},
+            "input":"hi"
+        }"#;
+        let out = strip_unsupported_hosted_tools(body);
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        let tools = value["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .all(|tool| matches!(tool["type"].as_str(), Some("function") | Some("custom"))));
+        // A tool_choice pinned to a removed hosted tool is relaxed to auto.
+        assert_eq!(value["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn strip_unsupported_hosted_tools_noop_without_hosted_tools() {
+        let body = br#"{"tools":[{"type":"function","name":"exec_command"}],"input":"hi"}"#;
+        let out = strip_unsupported_hosted_tools(body);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn apply_responses_custom_tool_compat_rewrites_custom_tools_and_calls() {
+        let body = br#"{
+            "model":"gpt-5",
+            "tools":[
+                {"type":"function","name":"shell","parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch","description":"patch files"}
+            ],
+            "input":[
+                {
+                    "type":"custom_tool_call",
+                    "id":"call_1",
+                    "call_id":"call_1",
+                    "name":"apply_patch",
+                    "input":"*** Begin Patch"
+                }
+            ]
+        }"#;
+        let rewritten = apply_responses_custom_tool_compat(body);
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+
+        assert_eq!(
+            value.pointer("/tools/1/type").and_then(Value::as_str),
+            Some("function")
+        );
+        assert_eq!(
+            value.pointer("/tools/1/name").and_then(Value::as_str),
+            Some("apply_patch")
+        );
+        assert_eq!(
+            value
+                .pointer("/tools/1/parameters/properties/input/type")
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            value.pointer("/input/0/type").and_then(Value::as_str),
+            Some("function_call")
+        );
+        let args = value
+            .pointer("/input/0/arguments")
+            .and_then(Value::as_str)
+            .expect("arguments");
+        let args_value: Value = serde_json::from_str(args).expect("args json");
+        assert_eq!(
+            args_value.pointer("/input").and_then(Value::as_str),
+            Some("*** Begin Patch")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_rewrites_custom_tools_for_responses_api_relays() {
+        let mut credential = api_credential("xiaomi", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.xiaomi.example/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": [{"from":"gpt-5","to":"mi-model"}],
+            "responses_custom_tool_compat": true
+        })
+        .to_string();
+
+        let body = br#"{
+            "model":"gpt-5",
+            "tools":[{"type":"custom","name":"apply_patch","description":"patch files"}]
+        }"#;
+        let (url, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/v1/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("request");
+        assert_eq!(url, "https://api.xiaomi.example/v1/responses");
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("mi-model")
+        );
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("function")
+        );
+        assert_eq!(
+            value.pointer("/tools/0/name").and_then(Value::as_str),
+            Some("apply_patch")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_skips_custom_tool_rewrite_when_switch_off() {
+        let mut credential = api_credential("xiaomi", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.xiaomi.example/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": [{"from":"gpt-5","to":"mi-model"}],
+            "responses_custom_tool_compat": false
+        })
+        .to_string();
+
+        let body = br#"{
+            "model":"gpt-5",
+            "tools":[{"type":"custom","name":"apply_patch","description":"patch files"}]
+        }"#;
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("mi-model")
+        );
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_rewrites_custom_tools_when_switch_on() {
+        let mut credential = api_credential("xiaomi", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.xiaomi.example/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": [{"from":"gpt-5","to":"mi-model"}],
+            "responses_custom_tool_compat": true
+        })
+        .to_string();
+
+        let body = br#"{
+            "model":"gpt-5",
+            "tools":[{"type":"custom","name":"apply_patch","description":"patch files"}]
+        }"#;
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("function")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_skips_custom_tool_rewrite_when_switch_missing() {
+        let mut credential = api_credential("xiaomi", "openai-responses");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.xiaomi.example/v1",
+            "interface_format": "openai-responses",
+            "model_mappings": []
+        })
+        .to_string();
+
+        let body = br#"{"tools":[{"type":"custom","name":"apply_patch"}]}"#;
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/responses",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn build_upstream_request_skips_custom_tool_rewrite_on_non_responses_path_even_when_on() {
+        let mut credential = api_credential("xiaomi", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.xiaomi.example/v1",
+            "interface_format": "openai",
+            "model_mappings": [],
+            "responses_custom_tool_compat": true
+        })
+        .to_string();
+
+        let body = br#"{"tools":[{"type":"custom","name":"apply_patch"}]}"#;
+        let (_, _, rewritten) = build_upstream_request(
+            &credential,
+            "codex",
+            "/chat/completions",
+            None,
+            HeaderMap::new(),
+            body,
+        )
+        .expect("request");
+        let value: Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(
+            value.pointer("/tools/0/type").and_then(Value::as_str),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn restore_custom_tools_in_sse_payload_rewrites_function_calls() {
+        let names = std::collections::HashSet::from(["apply_patch".to_string()]);
+        let body = concat!(
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"patch\"}","call_id":"c1"}}"#,
+            "\n",
+            "data: [DONE]\n"
+        );
+        let restored = restore_custom_tools_in_responses_payload(body.as_bytes(), &names);
+        let text = String::from_utf8(restored).expect("utf8");
+        assert!(text.contains("custom_tool_call"), "restored={text}");
+        assert!(
+            text.contains(r#""input":"patch""#) || text.contains(r#""input": "patch""#),
+            "restored={text}"
+        );
+        assert!(text.contains("data: [DONE]"), "restored={text}");
+        assert!(!text.contains("function_call"), "restored={text}");
+    }
+
+    #[test]
+    fn is_models_list_path_matches_openai_style_paths() {
+        assert!(is_models_list_path("/v1/models"));
+        assert!(is_models_list_path("/models"));
+        assert!(is_models_list_path("/v1/models/"));
+        assert!(!is_models_list_path("/v1/chat/completions"));
+        assert!(!is_models_list_path(
+            "/v1beta/models/gemini:generateContent"
+        ));
+    }
+
+    #[test]
+    fn filter_credentials_for_model_keeps_baseline_and_matching_mappings_only() {
+        let wildcard = api_credential_with_config("wildcard", r#"{"model_mappings":[]}"#);
+        let sol = api_credential_with_config(
+            "sol",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let luna = api_credential_with_config(
+            "luna",
+            r#"{"model_mappings":[{"from":"gpt-5.6-luna","to":"luna-upstream"}]}"#,
+        );
+
+        let selected = filter_credentials_for_model(
+            "codex",
+            vec![wildcard.clone(), sol.clone(), luna],
+            Some("gpt-5.6-sol"),
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wildcard", "sol"]
+        );
+
+        let selected = filter_credentials_for_model(
+            "codex",
+            vec![wildcard, sol],
+            Some("deepseek-v4-flash-0731"),
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn filter_credentials_for_model_keeps_fallback_accounts_for_unmatched_models() {
+        let wildcard = api_credential_with_config("wildcard", r#"{"model_mappings":[]}"#);
+        let sol = api_credential_with_config(
+            "sol",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let fallback = api_credential_with_config(
+            "fallback",
+            r#"{"model_mappings":[{"from":"claude-model","to":"catch-all-upstream"}]}"#,
+        );
+
+        // An unknown model used to empty the candidate list and hard-fail the
+        // whole request with route_pool.model_unmatched.
+        let selected = filter_credentials_for_model(
+            "codex",
+            vec![wildcard.clone(), sol.clone(), fallback.clone()],
+            Some("deepseek-v4-flash-0731"),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fallback"]
+        );
+
+        // A baseline model still keeps every eligible account.
+        let selected = filter_credentials_for_model(
+            "codex",
+            vec![wildcard, sol, fallback],
+            Some("gpt-5.6-sol"),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wildcard", "sol", "fallback"]
+        );
+    }
+
+    #[test]
+    fn official_credentials_are_selected_for_synthetic_aliases() {
+        let mut official = api_credential_with_config(
+            "official",
+            r#"{"model_mappings":[{"from":"claude-subagent","to":"provider-haiku"}]}"#,
+        );
+        official.kind = "official".to_string();
+        official.platform = "claude".to_string();
+        let api = api_credential_with_config(
+            "api",
+            r#"{"model_mappings":[{"from":"claude-subagent","to":"provider-haiku"}]}"#,
+        );
+
+        let selected =
+            filter_credentials_for_model("claude", vec![official, api], Some("claude-subagent"));
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|item| item.display_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["official", "api"]
+        );
+    }
+
+    #[test]
+    fn official_credentials_with_a_fallback_serve_unmatched_models() {
+        let mut official = api_credential_with_config(
+            "official",
+            r#"{"model_mappings":[{"from":"claude-model","to":"catch-all"}]}"#,
+        );
+        official.kind = "official".to_string();
+        official.platform = "claude".to_string();
+
+        let unmatched = filter_credentials_for_model(
+            "claude",
+            vec![official.clone()],
+            Some("deepseek-v4-flash-0731"),
+        );
+        assert_eq!(unmatched.len(), 1);
+
+        let baseline =
+            filter_credentials_for_model("claude", vec![official], Some("claude-sonnet-alias"));
+        assert_eq!(baseline.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_access_scope_filters_accounts_and_records_local_usage() {
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let id = create_proxy_api_credential(&pool, "allowed", "http://127.0.0.1:1").await;
+        let state = build_proxy_state(pool.clone(), &RouteProxyRuntimeState::default())
+            .with_access_scope(PlatformId::Codex, HashSet::from([id.clone()]));
+        let candidates = restrict_candidates(
+            &state,
+            vec![candidate(&id, None, None), candidate("forbidden", None, None)],
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].credential.id, id);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ROUTE_PROXY_PLATFORM_HEADER,
+            HeaderValue::from_static("claude"),
+        );
+        assert_eq!(
+            resolve_platform(&state, &headers, None)
+                .await
+                .unwrap()
+                .as_str(),
+            "codex"
+        );
+        insert_route_credential_request_event(
+            &state,
+            &id,
+            "{}",
+            &RouteUsageBreakdown::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "trusted local image/video requests must remain visible in usage");
+        let empty_state = build_proxy_state(pool, &RouteProxyRuntimeState::default())
+            .with_access_scope(PlatformId::parse("codex").unwrap(), Default::default());
+        assert!(
+            restrict_candidates(&empty_state, vec![candidate("allowed", None, None)]).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_video_account_remains_available_after_active_pool_changes() {
+        let pool = crate::database::create_memory_pool().await.unwrap();
+        crate::database::run_migrations(&pool).await.unwrap();
+        let first = RouteCredentialRepository::create(
+            &pool,
+            "codex",
+            "api",
+            "ordinary",
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"test"}"#,
+            r#"{"base_url":"http://127.0.0.1:1","interface_format":"openai"}"#,
+            "{}",
+        )
+        .await
+        .unwrap();
+        let second = RouteCredentialRepository::create(
+            &pool,
+            "codex",
+            "api",
+            "pinned-video-account",
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"test"}"#,
+            r#"{"base_url":"http://127.0.0.1:1","interface_format":"openai"}"#,
+            "{}",
+        )
+        .await
+        .unwrap();
+        RoutePoolRepository::replace_group_members(
+            &pool,
+            "codex",
+            "codex-default",
+            std::slice::from_ref(&first.id),
+        )
+        .await
+        .unwrap();
+        RoutePoolRepository::replace_group_members(
+            &pool,
+            "codex",
+            "codex-out",
+            std::slice::from_ref(&second.id),
+        )
+        .await
+        .unwrap();
+        let ordinary = build_proxy_state(pool.clone(), &RouteProxyRuntimeState::default());
+        let scoped = ordinary
+            .clone()
+            .with_access_scope(PlatformId::Codex, HashSet::from([second.id.clone()]));
+        let candidates = load_request_candidates(&ordinary, "codex").await.unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.credential.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str()]
+        );
+        let candidates = load_request_candidates(&scoped, "codex").await.unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.credential.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str()]
+        );
+        RoutePoolRepository::update_group(&pool, "codex", "codex-archived", None, None, true, None)
+            .await
+            .unwrap();
+        assert!(load_request_candidates(&ordinary, "codex")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            load_request_candidates(&scoped, "codex")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let empty = ordinary.with_access_scope(PlatformId::Codex, HashSet::new());
+        assert!(load_request_candidates(&empty, "codex")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    fn candidate(id: &str, cooldown_until: Option<&str>, model_key: Option<&str>) -> PoolCandidate {
+        PoolCandidate {
+            credential: SelectedCredential {
+                id: id.to_string(),
+                platform: "codex".to_string(),
+                kind: "api".to_string(),
+                display_name: id.to_string(),
+                status: "ok".to_string(),
+                route_priority: 3,
+                max_concurrency: 5,
+                secret_payload_json: r#"{"api_key":"sk"}"#.to_string(),
+                config_json: r#"{"base_url":"https://example.com","model_mappings":[]}"#
+                    .to_string(),
+            },
+            cooldown_until: cooldown_until.map(str::to_string),
+            model_key: model_key.map(str::to_string),
+        }
+    }
+
+    fn model_state(
+        credential_id: &str,
+        model_key: &str,
+        status: &str,
+        cooldown_until: Option<&str>,
+    ) -> ((String, String), RouteCredentialModelState) {
+        (
+            (credential_id.to_string(), model_key.to_string()),
+            RouteCredentialModelState {
+                route_credential_id: credential_id.to_string(),
+                model_key: model_key.to_string(),
+                status: status.to_string(),
+                transient_failure_count: 1,
+                cooldown_until: cooldown_until.map(str::to_string),
+                semantic_failure_streak_count: 0,
+                semantic_failure_streak_fingerprint: None,
+                last_failure_kind: None,
+                last_failure_message: None,
+                last_failure_response_json: None,
+                aliases: Vec::new(),
+                created_at: "2026-09-02T00:00:00Z".to_string(),
+                updated_at: "2026-09-02T00:00:00Z".to_string(),
+            },
+        )
+    }
+
+    fn now_for_partition() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-02T12:00:00Z")
+            .expect("fixed now")
+            .with_timezone(&Utc)
+    }
+
+    /// Model filtering now works on candidates, but the pre-existing assertions
+    /// are about which accounts survive — wrap so they keep reading that way.
+    fn filter_credentials_for_model(
+        platform: &str,
+        credentials: Vec<SelectedCredential>,
+        requested_model: Option<&str>,
+    ) -> Vec<SelectedCredential> {
+        filter_candidates_for_model(
+            platform,
+            credentials
+                .into_iter()
+                .map(|credential| PoolCandidate {
+                    credential,
+                    cooldown_until: None,
+                    model_key: None,
+                })
+                .collect(),
+            requested_model,
+        )
+        .into_iter()
+        .map(|candidate| candidate.credential)
+        .collect()
+    }
+
+    /// The precise-mode step as the forward path runs it: names in, the surviving
+    /// accounts plus the model name and body the rest of the pipeline sees out.
+    fn resolve_scoped(
+        platform: &str,
+        credentials: Vec<SelectedCredential>,
+        requested_model: &str,
+        body: &str,
+    ) -> (Vec<String>, Option<String>, Value) {
+        let (candidates, model, body) = resolve_account_scoped_model(
+            platform,
+            credentials
+                .into_iter()
+                .map(|credential| PoolCandidate {
+                    credential,
+                    cooldown_until: None,
+                    model_key: None,
+                })
+                .collect(),
+            Some(requested_model.to_string()),
+            axum::body::Bytes::from(body.to_string()),
+            None,
+        );
+        (
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.credential.display_name)
+                .collect(),
+            model,
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+        )
+    }
+
+    fn official_credential(name: &str) -> SelectedCredential {
+        let mut credential = api_credential(name, "openai");
+        credential.kind = "official".to_string();
+        credential.config_json = r#"{"model_mappings":[]}"#.to_string();
+        credential
+    }
+
+    #[test]
+    fn a_prefixed_model_pins_the_pool_to_that_account() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox, kan],
+            "Grox/gpt-5.6-sol",
+            r#"{"model":"Grox/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        // The body has to carry the bare alias: the API branch maps it per account
+        // and the official branch forwards it untouched.
+        assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    /// What WorkBuddy sends: its picker needs `id` and `name` to be one string, so
+    /// we tag the catalog id and peel the tag back off here.
+    #[test]
+    fn a_vendor_tagged_precise_model_is_peeled_before_the_account_split() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox, kan],
+            "AISwitch:Grox/gpt-5.6-sol",
+            r#"{"model":"AISwitch:Grox/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        // The tag must not reach the upstream either.
+        assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn a_vendor_tagged_aggregate_model_loses_only_the_tag() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+
+        // Aggregate mode advertises `AISwitch:<model>`: no account segment to
+        // split, so nothing is pinned and only the tag comes off.
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox, kan],
+            "AISwitch:gpt-5.6-sol",
+            r#"{"model":"AISwitch:gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string(), "247Kan".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(body["model"], "gpt-5.6-sol");
+    }
+
+    /// Relays publish model names that already contain `:`. Only our own tag may
+    //  be peeled — a blind "everything after the first colon" would cut these.
+    #[test]
+    fn a_colon_inside_a_model_name_is_not_mistaken_for_the_vendor_tag() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"glm-5.3:cloud","to":"glm-upstream"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox],
+            "glm-5.3:cloud",
+            r#"{"model":"glm-5.3:cloud"}"#,
+        );
+
+        assert_eq!(model.as_deref(), Some("glm-5.3:cloud"));
+        assert_eq!(body["model"], "glm-5.3:cloud");
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+    }
+
+    #[test]
+    fn the_official_prefix_pins_the_pool_to_every_official_account() {
+        let api = api_credential_with_config("Grox", r#"{"model_mappings":[]}"#);
+        let first = official_credential("chatgpt-one");
+        let second = official_credential("chatgpt-two");
+
+        let (accounts, model, _) = resolve_scoped(
+            "codex",
+            vec![api, first, second],
+            "official/gpt-5.6-sol",
+            r#"{"model":"official/gpt-5.6-sol"}"#,
+        );
+
+        // Both, so quota rotation — the only reason official accounts are pooled —
+        // still happens between them.
+        assert_eq!(
+            accounts,
+            vec!["chatgpt-one".to_string(), "chatgpt-two".to_string()]
+        );
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn an_unknown_prefix_falls_back_to_the_whole_model_name() {
+        let grox = api_credential_with_config("Grox", r#"{"model_mappings":[]}"#);
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![grox],
+            "Nobody/gpt-5.6-sol",
+            r#"{"model":"Nobody/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+        assert_eq!(model.as_deref(), Some("Nobody/gpt-5.6-sol"));
+        assert_eq!(body["model"], "Nobody/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn a_vendor_pathed_model_name_survives_an_account_of_the_same_name() {
+        // Relays publish `z-ai/glm-5.3` as a model id of its own. An account that
+        // happens to be called `z-ai` must not turn that into a pin — it cannot
+        // serve the remainder, so the whole string has to stay the model name.
+        let z_ai = api_credential_with_config(
+            "z-ai",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol"}]}"#,
+        );
+        let relay = api_credential_with_config(
+            "relay",
+            r#"{"model_mappings":[{"from":"z-ai/glm-5.3","to":"z-ai/glm-5.3"}]}"#,
+        );
+
+        let (accounts, model, body) = resolve_scoped(
+            "codex",
+            vec![z_ai, relay],
+            "z-ai/glm-5.3",
+            r#"{"model":"z-ai/glm-5.3"}"#,
+        );
+
+        assert_eq!(accounts, vec!["z-ai".to_string(), "relay".to_string()]);
+        assert_eq!(model.as_deref(), Some("z-ai/glm-5.3"));
+        assert_eq!(body["model"], "z-ai/glm-5.3");
+    }
+
+    #[test]
+    fn a_catch_all_account_cannot_swallow_a_prefixed_model() {
+        // A fallback mapping accepts any model name, so trying the whole string
+        // first would route `Grox/gpt-5.6-sol` here and send that name upstream.
+        let catch_all = api_credential_with_config(
+            "sink",
+            r#"{"model_mappings":[{"from":"claude-model","to":"catch-all-upstream"}]}"#,
+        );
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+
+        let (accounts, model, _) = resolve_scoped(
+            "codex",
+            vec![catch_all, grox],
+            "Grox/gpt-5.6-sol",
+            r#"{"model":"Grox/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["Grox".to_string()]);
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn stripping_the_prefix_reaches_nested_model_fields() {
+        let grox = api_credential_with_config("Grox", r#"{"model_mappings":[]}"#);
+
+        let (_, _, body) = resolve_scoped(
+            "codex",
+            vec![grox],
+            "Grox/gpt-5.6-sol",
+            r#"{"model":"Grox/gpt-5.6-sol","nested":{"model":"Grox/gpt-5.6-sol"},"other":{"model":"gpt-5.5"}}"#,
+        );
+
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["nested"]["model"], "gpt-5.6-sol");
+        // A model that was never prefixed is left exactly as the client sent it.
+        assert_eq!(body["other"]["model"], "gpt-5.5");
+    }
+
+    #[test]
+    fn a_prefixed_claude_model_keeps_its_one_m_suffix() {
+        let account = {
+            let mut credential = api_credential_with_config(
+                "TaBiAI",
+                r#"{"model_mappings":[{"from":"claude-opus-alias","to":"claude-opus-5","supports_1m":true}]}"#,
+            );
+            credential.platform = "claude".to_string();
+            credential
+        };
+
+        let (accounts, model, body) = resolve_scoped(
+            "claude",
+            vec![account],
+            "TaBiAI/claude-opus-alias[1m]",
+            r#"{"model":"TaBiAI/claude-opus-alias[1m]"}"#,
+        );
+
+        assert_eq!(accounts, vec!["TaBiAI".to_string()]);
+        // The suffix belongs to the alias, so the context-tier logic downstream
+        // still sees it.
+        assert_eq!(model.as_deref(), Some("claude-opus-alias[1m]"));
+        assert_eq!(body["model"], "claude-opus-alias[1m]");
+    }
+
+    #[test]
+    fn an_official_account_never_answers_to_an_account_prefix() {
+        // Its body is forwarded unrewritten, and it shares the reserved prefix,
+        // so a per-account name must not resolve to it.
+        let official = official_credential("chatgpt-one");
+
+        let (accounts, model, _) = resolve_scoped(
+            "codex",
+            vec![official],
+            "chatgpt-one/gpt-5.6-sol",
+            r#"{"model":"chatgpt-one/gpt-5.6-sol"}"#,
+        );
+
+        assert_eq!(accounts, vec!["chatgpt-one".to_string()]);
+        assert_eq!(model.as_deref(), Some("chatgpt-one/gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn precise_mode_lists_one_entry_per_api_account_and_one_for_the_official_group() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+        let kan = api_credential_with_config(
+            "247 Kan",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"other-upstream"}]}"#,
+        );
+        let official = official_credential("chatgpt-one");
+
+        let payload = super::build_models_list_payload(
+            "codex",
+            &[grox, kan, official],
+            PoolModelMode::Precise,
+        );
+        let ids: Vec<&str> = payload["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+
+        assert!(ids.contains(&"Grox/gpt-5.6-sol"), "ids={ids:?}");
+        // Whitespace in the account name would break config keys and shells.
+        assert!(ids.contains(&"247-Kan/gpt-5.6-sol"), "ids={ids:?}");
+        assert!(ids.contains(&"official/gpt-5.6-sol"), "ids={ids:?}");
+        // Nothing unprefixed survives: an aggregated id would rotate, which is
+        // the opposite of what this mode is for.
+        assert!(!ids.contains(&"gpt-5.6-sol"), "ids={ids:?}");
+        // The official group merges rather than expanding per account.
+        let official_ids: Vec<&str> = ids
+            .iter()
+            .copied()
+            .filter(|id| id.starts_with("official/"))
+            .collect();
+        assert_eq!(
+            official_ids,
+            vec![
+                "official/gpt-6-astra",
+                "official/gpt-5.6-sol",
+                "official/gpt-5.6-terra",
+                "official/gpt-5.6-luna",
+                "official/gpt-5.5",
+            ],
+            "ids={ids:?}"
+        );
+    }
+
+    #[test]
+    fn precise_mode_reads_reasoning_levels_off_the_bare_alias() {
+        let grox = api_credential_with_config(
+            "Grox",
+            r#"{"model_mappings":[{"from":"gpt-5.6-luna","to":"luna-upstream"}]}"#,
+        );
+
+        let payload = super::build_models_list_payload("codex", &[grox], PoolModelMode::Precise);
+        let entry = &payload["data"][0];
+
+        assert_eq!(entry["id"], "Grox/gpt-5.6-luna");
+        // Keyed by `gpt-5.6-luna`: the prefixed id matches no profile and would
+        // silently drop the model to the generic three-tier default.
+        assert_eq!(
+            entry["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn a_cooling_model_does_not_park_its_siblings_on_the_same_account() {
+        let now = now_for_partition();
+        let states = HashMap::from([model_state(
+            "cred-1",
+            "upstream-sol",
+            MODEL_STATUS_OK,
+            Some("2026-09-02T12:00:30Z"),
+        )]);
+
+        // The request asks for the healthy sibling, so the account is eligible.
+        let healthy = partition_by_cooldown(
+            vec![candidate("cred-1", None, Some("upstream-glm"))],
+            &states,
+            now,
+        );
+        assert_eq!(
+            healthy.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["cred-1"]
+        );
+
+        // The same account for the cooling model: only reachable as the
+        // all-cooling probe, never as a normal pick.
+        let cooling = partition_by_cooldown(
+            vec![
+                candidate("cred-1", None, Some("upstream-sol")),
+                candidate("cred-2", None, Some("upstream-sol")),
+            ],
+            &states,
+            now,
+        );
+        assert_eq!(
+            cooling.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["cred-2"]
+        );
+    }
+
+    #[test]
+    fn account_level_cooldown_still_parks_every_model() {
+        let now = now_for_partition();
+        let selected = partition_by_cooldown(
+            vec![
+                candidate(
+                    "cooling",
+                    Some("2026-09-02T12:05:00Z"),
+                    Some("upstream-glm"),
+                ),
+                candidate("ready", None, Some("upstream-glm")),
+            ],
+            &HashMap::new(),
+            now,
+        );
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["ready"]
+        );
+    }
+
+    #[test]
+    fn paused_and_error_models_are_hard_excluded_even_when_nothing_else_is_left() {
+        let now = now_for_partition();
+        let states = HashMap::from([
+            model_state("paused-acc", "upstream-sol", MODEL_STATUS_PAUSED, None),
+            model_state("error-acc", "upstream-sol", MODEL_STATUS_ERROR, None),
+        ]);
+        let selected = partition_by_cooldown(
+            vec![
+                candidate("paused-acc", None, Some("upstream-sol")),
+                candidate("error-acc", None, Some("upstream-sol")),
+            ],
+            &states,
+            now,
+        );
+        // No probe fallback: unlike a cooldown these are verdicts, not waits.
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn all_cooling_falls_back_to_the_earliest_recovering_candidate() {
+        let now = now_for_partition();
+        let states = HashMap::from([
+            model_state(
+                "late",
+                "upstream-sol",
+                MODEL_STATUS_OK,
+                Some("2026-09-02T12:10:00Z"),
+            ),
+            model_state(
+                "soon",
+                "upstream-sol",
+                MODEL_STATUS_OK,
+                Some("2026-09-02T12:01:00Z"),
+            ),
+        ]);
+        let selected = partition_by_cooldown(
+            vec![
+                candidate("late", None, Some("upstream-sol")),
+                candidate("soon", None, Some("upstream-sol")),
+            ],
+            &states,
+            now,
+        );
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["soon"]
+        );
+    }
+
+    #[test]
+    fn a_candidate_without_a_model_key_only_consults_account_level_cooldown() {
+        let now = now_for_partition();
+        // A Gemini-style request carries its model in the path, so there is no
+        // key to look up; the model table must not park it.
+        let states = HashMap::from([model_state(
+            "cred-1",
+            "upstream-sol",
+            MODEL_STATUS_PAUSED,
+            None,
+        )]);
+        let selected = partition_by_cooldown(vec![candidate("cred-1", None, None)], &states, now);
+        assert_eq!(
+            selected.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["cred-1"]
+        );
+    }
+
+    #[test]
+    fn filter_candidates_for_model_records_the_upstream_key() {
+        let mut item = candidate("cred-1", None, None);
+        item.credential.config_json =
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol"}]}"#.to_string();
+        let filtered = filter_candidates_for_model("codex", vec![item], Some("gpt-5.6-sol"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].model_key.as_deref(), Some("upstream-sol"));
+    }
+
+    #[test]
+    fn filter_candidates_for_model_leaves_the_key_empty_without_a_requested_model() {
+        let filtered =
+            filter_candidates_for_model("codex", vec![candidate("cred-1", None, None)], None);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].model_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_does_not_take_out_its_sibling_on_the_same_account() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let upstream = start_per_model_upstream("upstream-sol").await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential = RouteCredentialRepository::create(
+            &pool,
+            "codex",
+            "api",
+            "Dual Model",
+            None,
+            "ok",
+            None,
+            r#"{"api_key":"sk-upstream"}"#,
+            &json!({
+                "base_url": upstream,
+                "interface_format": "openai",
+                "model_mappings": [
+                    {"from": "gpt-5.6-sol", "to": "upstream-sol"},
+                    {"from": "glm-5.3", "to": "upstream-glm"}
+                ],
+                "failure_policy": {"cooldown_enabled": true, "cooldown_seconds": 600, "retry_count": 0}
+            })
+            .to_string(),
+            "{}",
+        )
+        .await
+        .expect("create credential");
+        RoutePoolRepository::replace_members(&pool, "codex", &[credential.id.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-per-model")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let endpoint = format!(
+            "{}/v1/chat/completions",
+            proxy.base_url.as_deref().expect("base url")
+        );
+        let client = reqwest::Client::new();
+        let post = |model: &'static str| {
+            let client = client.clone();
+            let endpoint = endpoint.clone();
+            let route_key = route_key.clone();
+            async move {
+                client
+                    .post(&endpoint)
+                    .bearer_auth(&route_key)
+                    .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+                    .json(&json!({"model": model, "messages": []}))
+                    .send()
+                    .await
+                    .expect("proxy response")
+            }
+        };
+
+        // 1. The failing model parks itself.
+        assert_eq!(
+            post("gpt-5.6-sol").await.status(),
+            reqwest::StatusCode::BAD_GATEWAY
+        );
+        let states =
+            RouteCredentialModelRepository::list_for_credentials(&pool, &[credential.id.clone()])
+                .await
+                .expect("model states");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].model_key, "upstream-sol");
+        assert!(states[0].cooldown_until.is_some());
+
+        // 2. The sibling still works — this is the regression this feature exists for.
+        assert_eq!(post("glm-5.3").await.status(), reqwest::StatusCode::OK);
+
+        // 3. The account itself was never parked, so the cooling model can still
+        //    be probed as the last resort.
+        let stored = RouteCredentialRepository::get(&pool, &credential.id)
+            .await
+            .expect("account row");
+        assert!(stored.cooldown_until.is_none());
+        assert_eq!(
+            post("gpt-5.6-sol").await.status(),
+            reqwest::StatusCode::BAD_GATEWAY
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn a_healthy_account_wins_over_one_whose_model_is_cooling() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let failing = start_per_model_upstream("upstream-sol").await;
+        let healthy = start_fixed_upstream(StatusCode::OK, r#"{"route":"healthy"}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let cooling_id = create_proxy_api_credential_with_mappings(
+            &pool,
+            "cooling",
+            &failing,
+            json!([{"from": "gpt-5.6-sol", "to": "upstream-sol"}]),
+        )
+        .await;
+        sqlx::query("UPDATE route_credentials SET config_json = json_set(config_json, '$.failure_policy', json('{\"cooldown_enabled\":true,\"cooldown_seconds\":600,\"retry_count\":0}')) WHERE id = ?")
+            .bind(&cooling_id)
+            .execute(&pool)
+            .await
+            .expect("enable cooldown");
+        let healthy_id = create_proxy_api_credential_with_mappings(
+            &pool,
+            "healthy",
+            &healthy,
+            json!([{"from": "gpt-5.6-sol", "to": "upstream-sol"}]),
+        )
+        .await;
+        RoutePoolRepository::replace_members(
+            &pool,
+            "codex",
+            &[cooling_id.clone(), healthy_id.clone()],
+        )
+        .await
+        .expect("pool members");
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-model-failover",
+        )
+        .await
+        .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let endpoint = format!(
+            "{}/v1/chat/completions",
+            proxy.base_url.as_deref().expect("base url")
+        );
+        let client = reqwest::Client::new();
+
+        // First request fails over from the cooling account to the healthy one.
+        let first = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({"model": "gpt-5.6-sol", "messages": []}))
+            .send()
+            .await
+            .expect("first response");
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        // Second request skips the parked model outright.
+        let second = client
+            .post(&endpoint)
+            .bearer_auth(&route_key)
+            .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+            .json(&json!({"model": "gpt-5.6-sol", "messages": []}))
+            .send()
+            .await
+            .expect("second response");
+        assert_eq!(second.status(), reqwest::StatusCode::OK);
+        assert_eq!(second.text().await.expect("body"), r#"{"route":"healthy"}"#);
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn every_model_cooling_escalates_to_an_account_level_cooldown() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        // This upstream fails everything, so both mapped models get parked.
+        let upstream = start_fixed_upstream(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_mappings(
+            &pool,
+            "all-models",
+            &upstream,
+            json!([
+                {"from": "gpt-5.6-sol", "to": "upstream-sol"},
+                {"from": "glm-5.3", "to": "upstream-glm"}
+            ]),
+        )
+        .await;
+        sqlx::query("UPDATE route_credentials SET config_json = json_set(config_json, '$.failure_policy', json('{\"cooldown_enabled\":true,\"cooldown_seconds\":600,\"retry_count\":0}')) WHERE id = ?")
+            .bind(&credential_id)
+            .execute(&pool)
+            .await
+            .expect("enable cooldown");
+        RoutePoolRepository::replace_members(&pool, "codex", &[credential_id.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-escalate")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+        let endpoint = format!(
+            "{}/v1/chat/completions",
+            proxy.base_url.as_deref().expect("base url")
+        );
+        let client = reqwest::Client::new();
+        for model in ["gpt-5.6-sol", "glm-5.3"] {
+            let _ = client
+                .post(&endpoint)
+                .bearer_auth(&route_key)
+                .header(ROUTE_PROXY_PLATFORM_HEADER, "codex")
+                .json(&json!({"model": model, "messages": []}))
+                .send()
+                .await
+                .expect("response");
+        }
+
+        let stored = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account row");
+        // With nothing left to serve, the account itself backs off — otherwise a
+        // fully-down relay would be re-probed once per model forever.
+        assert!(stored.cooldown_until.is_some());
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    #[tokio::test]
+    async fn model_unmatched_error_uses_stable_error_code() {
+        let response = json_error(
+            StatusCode::BAD_GATEWAY,
+            "route_pool.model_unmatched: no enabled route credential supports model 'gpt-5.6-luna' on platform 'codex'",
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        let value: Value = serde_json::from_slice(&body).expect("error json");
+
+        assert_eq!(
+            value.pointer("/error/code").and_then(Value::as_str),
+            Some("route_pool.model_unmatched")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_proxy_auth_errors_use_stable_codes_and_challenge() {
+        let cases = [
+            (
+                "route_proxy.platform_unresolved: provide a local route proxy key",
+                "route_proxy.auth_required",
+            ),
+            (
+                "route_proxy.key_invalid: local route proxy key is invalid",
+                "route_proxy.key_invalid",
+            ),
+        ];
+
+        for (message, expected_code) in cases {
+            assert_eq!(route_proxy_error_status(message), StatusCode::UNAUTHORIZED);
+            let response = json_error(StatusCode::UNAUTHORIZED, message);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer")
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body");
+            let value: Value = serde_json::from_slice(&body).expect("error json");
+            assert_eq!(
+                value.pointer("/error/code").and_then(Value::as_str),
+                Some(expected_code)
+            );
+        }
+    }
+
+    #[test]
+    fn models_list_includes_codex_baseline_when_pool_has_wildcard_account() {
+        let wildcard = api_credential_with_config("wildcard", r#"{"model_mappings":[]}"#);
+        let mut mapped = api_credential("mapped", "openai");
+        mapped.config_json = serde_json::json!({
+            "model_mappings": [{"from":"gpt-5.6-sol","to":"sol-upstream"}]
+        })
+        .to_string();
+
+        let payload = build_models_list_payload("codex", &[wildcard, mapped]);
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("models data")
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            models,
+            vec![
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5"
+            ]
+        );
+    }
+
+    #[test]
+    fn advertised_models_aggregate_and_dedupe_mappings() {
+        let mut first = api_credential("first", "openai");
+        first.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [
+                {"from":"gpt-5.5","to":"up-a"},
+                {"from":"gpt-5","to":"up-b"},
+                {"from":"upstream-model","to":"ignored"}
+            ]
+        })
+        .to_string();
+
+        let mut second = api_credential("second", "openai");
+        second.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [
+                {"from":"GPT-5","to":"up-c"},
+                {"from":"gpt-4.1","to":"up-d"}
+            ]
+        })
+        .to_string();
+
+        let payload = build_models_list_payload("codex", &[first, second]);
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("models data")
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(models, vec!["gpt-5.5", "gpt-5", "gpt-4.1"]);
+    }
+
+    #[test]
+    fn models_list_excludes_the_fallback_sentinel() {
+        let mut credential = api_credential("claude-fallback", "anthropic");
+        credential.platform = "claude".to_string();
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com",
+            "interface_format": "anthropic",
+            "model_mappings": [
+                {"from":"claude-sonnet-alias","to":"provider-sonnet"},
+                {"from":"claude-model","to":"catch-all-upstream"}
+            ]
+        })
+        .to_string();
+
+        let payload = build_models_list_payload("claude", &[credential]);
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("models data")
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        // The catch-all is a routing sentinel, not a model id — it must never be
+        // advertised.
+        assert!(!models.contains(&FALLBACK_MODEL_ALIAS), "models={models:?}");
+        assert!(models.contains(&"claude-sonnet-alias"), "models={models:?}");
+        // A fallback account accepts anything, so it advertises the baseline.
+        assert!(models.contains(&"claude-haiku-alias"), "models={models:?}");
+    }
+
+    #[test]
+    fn advertised_models_expose_claude_1m_variants() {
+        let mut credential = api_credential("claude-a", "anthropic");
+        credential.platform = "claude".to_string();
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.anthropic.com",
+            "interface_format": "anthropic",
+            "model_mappings": [
+                {
+                    "from": "claude-sonnet-alias",
+                    "to": "provider-sonnet",
+                    "supports_1m": true
+                },
+                {
+                    "from": "claude-opus-alias",
+                    "to": "provider-opus",
+                    "supports_1m": false
+                }
+            ]
+        })
+        .to_string();
+
+        let payload = build_models_list_payload("claude", &[credential]);
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("models data")
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            models,
+            vec![
+                "claude-sonnet-alias",
+                "claude-sonnet-alias[1m]",
+                "claude-opus-alias"
+            ]
+        );
+    }
+
+    #[test]
+    fn json_models_list_response_returns_openai_compatible_list() {
+        let mut credential = api_credential("first", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [
+                {"from":"gpt-5.5","to":"up-a"},
+                {"from":"gpt-5","to":"up-b"}
+            ]
+        })
+        .to_string();
+
+        let payload = build_route_models_list_payload("codex", &[credential]);
+        assert_eq!(payload.get("object").and_then(Value::as_str), Some("list"));
+        let data = payload.get("data").and_then(Value::as_array).expect("data");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].get("id").and_then(Value::as_str), Some("gpt-5.5"));
+        assert_eq!(data[0].get("object").and_then(Value::as_str), Some("model"));
+        assert_eq!(
+            data[0].get("owned_by").and_then(Value::as_str),
+            Some("ai-switch")
+        );
+        assert_eq!(
+            data[0]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+        // Nothing was declared on the mapping, so we advertise the upstream
+        // baseline ladder and preselect its highest tier (xhigh) by default.
+        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("xhigh"));
+        assert_eq!(data[1].get("id").and_then(Value::as_str), Some("gpt-5"));
+        assert_eq!(data[0]["context_window"].as_u64(), Some(128_000));
+        assert!(payload.get("models").is_none());
+
+        let response = json_models_list_response("codex", &[], PoolModelMode::Aggregate, None);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn codex_models_endpoint_states_the_one_m_default_for_a_one_m_upstream() {
+        let mut credential = api_credential("first", "openai");
+        credential.config_json = serde_json::json!({
+            "model_mappings": [
+                {"from": "gpt-5.6-sol", "to": "deepseek-v4-flash-0731"},
+                {"from": "gpt-5.5", "to": "gpt-5.5"}
+            ]
+        })
+        .to_string();
+
+        let payload = build_route_models_list_payload("codex", &[credential]);
+        let data = payload.get("data").and_then(Value::as_array).expect("data");
+
+        assert_eq!(data[0]["context_window"].as_u64(), Some(1_000_000));
+        assert_eq!(data[1]["context_window"].as_u64(), Some(272_000));
+    }
+
+    #[test]
+    fn codex_models_endpoint_advertises_per_mapping_catalog_overrides() {
+        let mut credential = api_credential("first", "openai");
+        credential.config_json = serde_json::json!({
+            "base_url": "https://api.example.com/v1",
+            "interface_format": "openai",
+            "model_mappings": [{
+                "from": "gpt-5.5",
+                "to": "up-a",
+                "context_window": 400000,
+                "reasoning_levels": ["xhigh", "max"]
+            }]
+        })
+        .to_string();
+
+        let payload = build_route_models_list_payload("codex", &[credential]);
+        let data = payload.get("data").and_then(Value::as_array).expect("data");
+
+        assert_eq!(data[0]["context_window"].as_u64(), Some(400_000));
+        assert_eq!(
+            data[0]["supported_reasoning_levels"]
+                .as_array()
+                .expect("reasoning levels")
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            vec!["xhigh", "max"]
+        );
+        // The mapping declares ["xhigh", "max"], so the highest tier (max) is
+        // preselected rather than the upstream's medium default.
+        assert_eq!(data[0]["default_reasoning_level"].as_str(), Some("max"));
+    }
+
+    #[test]
+    fn non_codex_models_endpoint_carries_no_catalog_fields() {
+        let mut credential = api_credential("first", "anthropic");
+        credential.config_json = serde_json::json!({
+            "model_mappings": [{
+                "from": "claude-sonnet-alias",
+                "to": "up-sonnet",
+                "context_window": 400000,
+                "reasoning_levels": ["max"]
+            }]
+        })
+        .to_string();
+
+        let payload = build_route_models_list_payload("claude", &[credential]);
+        let data = payload.get("data").and_then(Value::as_array).expect("data");
+
+        // Claude clients do not read these keys, and a stray value here would be
+        // a config the user cannot see or clear from the Claude editor.
+        assert!(data[0].get("context_window").is_none());
+        assert!(data[0].get("supported_reasoning_levels").is_none());
+    }
+
+    #[test]
+    fn codex_catalog_payload_is_separate_from_models_endpoint() {
+        let mut credential = api_credential("first", "openai");
+        credential.config_json = serde_json::json!({
+            "model_mappings": [{"from":"gpt-5.6-sol","to":"sol-upstream"}]
+        })
+        .to_string();
+
+        let payload = crate::services::route_model_capability::codex_model_catalog_payload(
+            &crate::services::route_model_capability::catalog_members(&[CatalogMemberInput {
+                id: &credential.id,
+                display_name: &credential.display_name,
+                kind: &credential.kind,
+                config_json: &credential.config_json,
+            }]),
+            PoolModelMode::Aggregate,
+        );
+        let models = payload
+            .get("models")
+            .and_then(Value::as_array)
+            .expect("codex models");
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].get("slug").and_then(Value::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            models[0].get("display_name").and_then(Value::as_str),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            models[0].get("visibility").and_then(Value::as_str),
+            Some("list")
+        );
+        assert_eq!(
+            models[0].get("supported_in_api").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(payload.get("object").is_none());
+        assert!(payload.get("data").is_none());
+        assert!(build_route_models_list_payload("codex", &[credential])
+            .get("models")
+            .is_none());
+    }
+
+    #[test]
+    fn count_tokens_path_is_recognized_across_version_spellings() {
+        for path in [
+            "/v1/messages/count_tokens",
+            "/messages/count_tokens",
+            "/v1/messages/count_tokens/",
+        ] {
+            assert!(
+                is_anthropic_count_tokens_path(path),
+                "should recognize {path}"
+            );
+        }
+        // The chat endpoint itself, and unrelated sub-resources, must not match.
+        for path in [
+            "/v1/messages",
+            "/v1/messages/batches",
+            "/v1/responses",
+            "/v1/count_tokens",
+        ] {
+            assert!(
+                !is_anthropic_count_tokens_path(path),
+                "should not recognize {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_tokens_estimate_covers_text_and_skips_base64() {
+        let empty = estimate_anthropic_input_tokens(br#"{"messages":[]}"#);
+        assert_eq!(empty, 0, "an empty request has no tokens");
+
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "system": "You are concise.",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello there"}]}]
+        });
+        let counted = estimate_anthropic_input_tokens(&serde_json::to_vec(&body).unwrap());
+        assert!(counted > 0, "text content must produce a positive estimate");
+
+        // A base64 image must not inflate the estimate by its encoded size.
+        let with_image = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "system": "You are concise.",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Hello there"},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "A".repeat(100_000)
+                }}
+            ]}]
+        });
+        let with_image_count =
+            estimate_anthropic_input_tokens(&serde_json::to_vec(&with_image).unwrap());
+        assert!(
+            with_image_count < counted + 500,
+            "base64 payload must not dominate the estimate: {with_image_count} vs {counted}"
+        );
+    }
+
+    #[test]
+    fn count_tokens_response_uses_anthropic_shape() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "Count these tokens please"}]
+        });
+        let response = json_count_tokens_response(&serde_json::to_vec(&body).unwrap());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    /// Sweeps how one upstream reacts to each way of declaring the 1M context
+    /// window, so a report of "1M does not work on relay X" can be answered with
+    /// evidence instead of a guess.
+    ///
+    /// Opt in with two env vars; nothing runs without them:
+    ///
+    /// ```text
+    /// ONE_M_PROBE_URL=https://relay.example/v1/messages     /// ONE_M_PROBE_KEY=sk-...     ///   cargo test --lib probe_one_m_declaration -- --ignored --nocapture
+    /// ```
+    ///
+    /// `ONE_M_PROBE_MODEL` overrides the upstream model name (default
+    /// `claude-opus-5`) — send the real upstream name, not one of our aliases,
+    /// since this bypasses the proxy's mapping.
+    ///
+    /// Use the rustls-backed client the proxy itself uses. A relay's edge may
+    /// accept rustls while rejecting curl (Schannel) and Python (OpenSSL) at the
+    /// TLS handshake — mistaking that for an upstream outage cost real debugging
+    /// time on anyrouter.top, where every tool but this one failed to connect.
+    ///
+    /// Recorded result for anyrouter.top (2026-08-24): the header form is the only
+    /// one it reads. Without it, every combination returns 400 "1m 上下文已经全量
+    /// 可用，请启用 1m 上下文后重试"; with it, every combination returns 503. The
+    /// body array (which cc-switch also sends, as `anthropic_beta`) and adaptive
+    /// thinking changed nothing. So its 1M backend was simply unavailable — the
+    /// relay demanded a declaration it could not then serve.
+    ///
+    /// Re-checked 2026-09-24: the header form still decides, and the backend now
+    /// serves. Across 130 logged requests to this account the split is exact —
+    /// 71 requests without the marker, all 400 in the same 14-minute window; 42
+    /// with it, all 200. So the 503 above was a transient state of the relay, not
+    /// a property of the declaration: a 503 here is worth re-probing, not a reason
+    /// to stop sending the marker.
+    #[tokio::test]
+    #[ignore = "diagnostic: set ONE_M_PROBE_URL and ONE_M_PROBE_KEY to hit a live relay"]
+    async fn probe_one_m_declaration() {
+        let (Ok(url), Ok(key)) = (
+            std::env::var("ONE_M_PROBE_URL"),
+            std::env::var("ONE_M_PROBE_KEY"),
+        ) else {
+            println!("  set ONE_M_PROBE_URL and ONE_M_PROBE_KEY to run this probe");
+            return;
+        };
+        let model =
+            std::env::var("ONE_M_PROBE_MODEL").unwrap_or_else(|_| "claude-opus-5".to_string());
+        let client = build_outbound_http_client(Some(Duration::from_secs(60))).expect("client");
+
+        // cc-switch declares 1M in two places: the `anthropic-beta` *header* and an
+        // `anthropic_beta` *body array* (note the underscore). This sweep isolates
+        // which form a given relay reads, and whether adaptive thinking matters.
+        for (label, header_one_m, body_one_m, adaptive) in [
+            ("A 头无 体无        ", false, false, false),
+            ("B 头有 体无        ", true, false, false),
+            ("C 头无 体有        ", false, true, false),
+            ("D 头有 体有        ", true, true, false),
+            ("E 头有 体有 +thinking", true, true, true),
+            ("F 头无 体有 +thinking", false, true, true),
+        ] {
+            let mut body = serde_json::json!({
+                "model": model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            if body_one_m {
+                body["anthropic_beta"] =
+                    serde_json::json!([client_identity::ANTHROPIC_ONE_M_CONTEXT_BETA]);
+            }
+            if adaptive {
+                body["thinking"] = serde_json::json!({"type": "adaptive"});
+                body["output_config"] = serde_json::json!({"effort": "max"});
+            }
+            let beta = if header_one_m {
+                "context-1m-2025-08-07,claude-code-20250219,interleaved-thinking-2025-05-14"
+            } else {
+                "claude-code-20250219,interleaved-thinking-2025-05-14"
+            };
+            match client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("x-api-key", key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", beta)
+                .header("user-agent", client_identity::CLAUDE_CODE_USER_AGENT)
+                .body(body.to_string())
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    let text: String = text.chars().take(160).collect();
+                    println!("  [{label}] http={status} {text}");
+                }
+                Err(error) => println!("  [{label}] ERR {error}"),
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    fn transport_detail<'a>(
+        text: &'a str,
+        is_connect: bool,
+        is_timeout: bool,
+    ) -> TransportErrorDetail<'a> {
+        TransportErrorDetail {
+            text,
+            is_connect,
+            is_timeout,
+            ..TransportErrorDetail::default()
+        }
+    }
+
+    const TRANSPORT_TIMEOUTS: OutboundTimeouts = OutboundTimeouts {
+        total: None,
+        connect: Some(Duration::from_secs(20)),
+        read: Some(Duration::from_secs(180)),
+    };
+
+    #[test]
+    fn transport_error_reports_connect_timeout_as_connect_phase() {
+        let message = format_upstream_transport_error(
+            "justwoker",
+            "upstream request failed",
+            &transport_detail(
+                "error sending request for url (https://api.justwoker.icu/v1/messages)",
+                true,
+                true,
+            ),
+            TRANSPORT_TIMEOUTS,
+        );
+        assert!(message.contains("connect timed out after 20s"), "{message}");
+        assert!(!message.contains("no data from upstream"), "{message}");
+    }
+
+    #[test]
+    fn transport_error_does_not_claim_connect_deadline_when_connection_failed_fast() {
+        let message = format_upstream_transport_error(
+            "justwoker",
+            "upstream request failed",
+            &transport_detail(
+                "error sending request for url (https://api.justwoker.icu/v1/messages)",
+                true,
+                false,
+            ),
+            TRANSPORT_TIMEOUTS,
+        );
+        assert!(!message.contains("within 20s"), "{message}");
+        assert!(!message.contains("no data from upstream"), "{message}");
+        assert!(message.contains("connect deadline"), "{message}");
+    }
+
+    #[test]
+    fn transport_error_keeps_stalled_wording_for_read_timeout() {
+        let message = format_upstream_transport_error(
+            "justwoker",
+            "upstream request failed",
+            &transport_detail(
+                "error sending request for url (https://api.justwoker.icu/v1/messages)",
+                false,
+                true,
+            ),
+            TRANSPORT_TIMEOUTS,
+        );
+        assert!(
+            message.contains("no data from upstream for 180s"),
+            "{message}"
+        );
+        assert!(!message.contains("connect deadline"), "{message}");
+    }
+
+    #[test]
+    fn transport_error_appends_the_deepest_cause_and_the_outbound_proxy() {
+        let message = format_upstream_transport_error(
+            "justwoker",
+            "upstream request failed",
+            &TransportErrorDetail {
+                text: "error sending request for url (https://api.justwoker.icu/v1/messages)",
+                cause: Some("tls handshake eof"),
+                proxy: Some("http://127.0.0.1:7897"),
+                is_connect: true,
+                is_timeout: false,
+            },
+            TRANSPORT_TIMEOUTS,
+        );
+        assert!(message.contains(": tls handshake eof"), "{message}");
+        assert!(
+            message.contains("outbound proxy http://127.0.0.1:7897"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn transport_error_omits_a_cause_already_present_in_the_top_level_text() {
+        let message = format_upstream_transport_error(
+            "justwoker",
+            "upstream request failed",
+            &TransportErrorDetail {
+                text: "error sending request for url (https://api.justwoker.icu/v1/messages): timed out",
+                cause: Some("timed out"),
+                proxy: None,
+                is_connect: false,
+                is_timeout: true,
+            },
+            TRANSPORT_TIMEOUTS,
+        );
+        assert_eq!(message.matches("timed out").count(), 1, "{message}");
+    }
+    /// 上游把内容发全了、就是没发 `response.completed`：今天这会被判成断流、
+    /// 记一次失败、整轮报废。补齐收尾后应当直接成功。
+    #[tokio::test]
+    async fn missing_terminal_event_is_completed_instead_of_reported_as_disconnect() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const BODY: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"完整回答\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"完整回答\"}]}}\n\n";
+
+        let (upstream, _calls) = start_scripted_sse_upstream(vec![vec![BODY]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "content-complete-no-terminal",
+            &upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        let status = response.status();
+        let body = response.text().await.expect("body");
+
+        assert!(status.is_success(), "status={status} body={body}");
+        assert!(
+            body.contains("\"type\":\"response.completed\""),
+            "补齐的收尾事件没到客户端: {body}"
+        );
+        let credential = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("credential");
+        assert_eq!(
+            credential.transient_failure_count, 0,
+            "补齐收尾不应记账: {:?}",
+            credential.last_failure_message
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 把一条 Responses SSE 响应体拆成事件，供续写接缝断言用。
+    fn responses_events(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .collect()
+    }
+
+    /// 续写默认关闭，所以凡是验证续写本身的用例都必须显式打开它。两个账号都开：
+    /// 聚合模式下续写会换号，写在同一份配置里更好读（预算仍只归断流那个账号）。
+    async fn create_continuation_credentials(pool: &SqlitePool, upstream: &str) -> (String, String) {
+        let config = json!({
+            "interface_format": "openai-responses",
+            "failure_policy": { "stream_continue_enabled": true },
+        });
+        let first = create_proxy_api_credential_with_config(pool, "first", upstream, config.clone())
+            .await;
+        let second = create_proxy_api_credential_with_config(pool, "second", upstream, config).await;
+        (first, second)
+    }
+
+    /// 文本流断在半句中间：网关换一个账号再发一次「继续」，把两段文字接回
+    /// 同一条 response，客户端只看到一个 `response.created` 与一条收尾事件。
+    #[tokio::test]
+    async fn a_mid_text_cut_is_continued_into_the_same_response() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const FIRST: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"content_index\":0,\"delta\":\"前半句，\"}\n\n";
+        const SECOND: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m2\",\"content_index\":0,\"delta\":\"后半句。\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"后半句。\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (upstream, calls) =
+            start_scripted_sse_upstream(vec![vec![FIRST], vec![SECOND]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert!(body.contains("前半句，"), "断流前的正文丢了: {body}");
+        assert!(body.contains("后半句。"), "续写的正文没接上: {body}");
+        assert!(body.contains("\"id\":\"r1\""), "必须沿用原 response id: {body}");
+        assert!(
+            !body.contains("\"id\":\"r2\""),
+            "续写流的 response id 不能泄漏给客户端: {body}"
+        );
+
+        let events = responses_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.created")
+                .count(),
+            1,
+            "续写流自己的 response.created 必须被吞掉: {body}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "response.completed"),
+            "必须补一条收尾事件: {body}"
+        );
+
+        // 断流时还开着的 m1 必须被网关补一条 done，客户端才会把它记成一条消息。
+        let m1_done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["id"] == "m1"
+            })
+            .unwrap_or_else(|| panic!("断流的 m1 没被补 done，客户端会丢掉前半句: {body}"));
+        assert_eq!(
+            m1_done["item"]["content"][0]["text"], "前半句，",
+            "补的 done 要带上断流前的正文: {body}"
+        );
+        assert_eq!(m1_done["output_index"], 0);
+
+        // 续写的新 item 必须排在 m1 后面，不能和它撞同一个 output_index。
+        let m2_added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added" && event["item"]["id"] == "m2"
+            })
+            .expect("m2 的 added");
+        assert_eq!(
+            m2_added["output_index"], 1,
+            "续写 item 要和断流 item 错开: {body}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "一次断流续写应当再打一次上游"
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 上游是 Chat 协议的续写：客户端看到的 Responses 事件是桥自己合成的，
+    /// 续写必须沿用同一个 bridge，只看到一条 `response.created`。
+    #[tokio::test]
+    async fn a_mid_text_cut_is_continued_over_chat_bridge() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const FIRST: &str = "data: {\"id\":\"chatcmpl-1\",\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n\
+            data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第一段\"}}]}\n\n";
+        const SECOND: &str = "data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"第二段。\"}}]}\n\n\
+            data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n";
+
+        let (upstream, calls) =
+            start_scripted_sse_upstream(vec![vec![FIRST], vec![SECOND]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let mappings = json!([{"from": "gpt-6-astra", "to": "deepseek-chat"}]);
+        let config = json!({
+            "interface_format": "openai",
+            "model_mappings": mappings,
+            "failure_policy": { "stream_continue_enabled": true },
+        });
+        let first =
+            create_proxy_api_credential_with_config(&pool, "first", &upstream, config.clone()).await;
+        let second =
+            create_proxy_api_credential_with_config(&pool, "second", &upstream, config).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert!(body.contains("第一段"), "断流前的正文丢了: {body}");
+        assert!(body.contains("第二段。"), "续写的正文没接上: {body}");
+        assert_eq!(
+            body.matches("\"type\":\"response.created\"").count(),
+            1,
+            "桥的状态跨请求保留，不能再合成一条 response.created: {body}"
+        );
+        assert!(
+            body.contains("\"type\":\"response.completed\""),
+            "收尾事件必须补上: {body}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "应当续写一次");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 预算用尽后仍然断流：不再续写，按断流收尾并给原账号记一次失败。
+    #[tokio::test]
+    async fn continuation_stops_at_the_configured_budget() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        // 预算记在断流的那个账号（first）上：续写换号只决定请求打给谁。
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &upstream,
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_enabled": true, "stream_continue_max": 2 },
+            }),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "1 次原始 + 2 次续写后必须停手: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"response.completed\""),
+            "没续完就不该补假的收尾事件: {body}"
+        );
+        let credential = RouteCredentialRepository::get(&pool, &first)
+            .await
+            .expect("credential");
+        assert_eq!(
+            credential.transient_failure_count, 1,
+            "断流要给原账号记一次失败: {:?}",
+            credential.last_failure_message
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 聚合模式默认换号续写：断流账号的上游只被问了一次，续写落在另一个账号的
+    /// 上游。两个账号各自指向不同的假上游，所以「有没有换号」直接可读。
+    #[tokio::test]
+    async fn continuation_moves_to_another_account_by_default() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+        const FULL: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m9\",\"delta\":\"接上了\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"接上了\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (first_upstream, first_calls) =
+            start_scripted_sse_upstream(vec![vec![CUT]]).await;
+        let (second_upstream, second_calls) =
+            start_scripted_sse_upstream(vec![vec![FULL]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &first_upstream,
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_enabled": true },
+            }),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &second_upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1, "断流只问一次");
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            1,
+            "默认应当换号续写: {body}"
+        );
+        assert!(body.contains("接上了"), "续写正文没接上: {body}");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 同一场景，但断流账号关掉了故障转移：续写只在自己身上重试，另一个账号的
+    /// 上游一次都不会被打到。
+    #[tokio::test]
+    async fn continuation_stays_on_the_same_account_when_failover_is_off() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+        const FULL: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m9\",\"delta\":\"接上了\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m9\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"接上了\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (first_upstream, first_calls) =
+            start_scripted_sse_upstream(vec![vec![CUT], vec![FULL]]).await;
+        let (second_upstream, second_calls) =
+            start_scripted_sse_upstream(vec![vec![FULL]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first = create_proxy_api_credential_with_config(
+            &pool,
+            "first",
+            &first_upstream,
+            json!({
+                "interface_format": "openai-responses",
+                "failure_policy": { "stream_continue_enabled": true, "failover_enabled": false },
+            }),
+        )
+        .await;
+        let second = create_proxy_api_credential_with_config(
+            &pool,
+            "second",
+            &second_upstream,
+            json!({"interface_format": "openai-responses"}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2, "续写必须落在自己身上");
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "关掉故障转移后不许换号: {body}"
+        );
+        assert!(body.contains("接上了"), "续写正文没接上: {body}");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 续写默认关闭：没配过失败策略的老账号、以及显式写了 `false` 的账号，都
+    /// 不会再问上游——哪怕预算充足——直接按断流路径收尾。
+    #[tokio::test]
+    async fn an_account_without_continuation_enabled_is_never_reasked() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CUT: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"半句\"}\n\n";
+
+        // 前者是默认值，后者是显式关掉且还留着预算——两种都不许续写。
+        let policies = [
+            json!({}),
+            json!({ "stream_continue_enabled": false, "stream_continue_max": 5 }),
+        ];
+        for policy in policies {
+            let (upstream, calls) = start_scripted_sse_upstream(vec![vec![CUT]]).await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let config = json!({
+                "interface_format": "openai-responses",
+                "failure_policy": policy.clone(),
+            });
+            let first =
+                create_proxy_api_credential_with_config(&pool, "first", &upstream, config).await;
+            let second = create_proxy_api_credential_with_config(
+                &pool,
+                "second",
+                &upstream,
+                json!({
+                    "interface_format": "openai-responses",
+                    "failure_policy": { "stream_continue_enabled": true },
+                }),
+            )
+            .await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+                .await
+                .expect("pool members");
+            let route_key =
+                RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                    .await
+                    .expect("route key");
+            let runtime = RouteProxyRuntimeState::default();
+            let proxy =
+                RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+                    .await
+                    .expect("start proxy");
+
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "{}/v1/responses",
+                    proxy.base_url.as_deref().expect("base url")
+                ))
+                .bearer_auth(route_key)
+                .json(&json!({
+                    "model": "gpt-6-astra",
+                    "stream": true,
+                    "input": [{"type":"message","role":"user",
+                               "content":[{"type":"input_text","text":"hi"}]}]
+                }))
+                .send()
+                .await
+                .expect("proxy response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.expect("body");
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "续写关着就不能再问上游（{policy}）: {body}"
+            );
+            assert!(
+                !body.contains("\"type\":\"response.completed\""),
+                "没续完就不该补假的收尾事件: {body}"
+            );
+
+            RouteProxyService::stop(&runtime).await.expect("stop proxy");
+        }
+    }
+
+    #[tokio::test]
+    async fn content_rejection_fails_over_without_retrying_or_penalizing_the_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"sensitive words detected (request id: test)","type":"new_api_error"}}"#;
+        let (first, first_calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let (second, second_calls) = start_status_sequence_upstream(
+            0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential_with_config(
+            &pool,
+            "content-a",
+            &first,
+            json!({"failure_policy":{"retry_count":2,"retry_interval_ms":0}}),
+        )
+        .await;
+        let second_id = create_proxy_api_credential_with_config(
+            &pool,
+            "content-b",
+            &second,
+            json!({"failure_policy":{"retry_count":2,"retry_interval_ms":0}}),
+        )
+        .await;
+        sqlx::query("UPDATE route_credentials SET route_priority = 1 WHERE id = ?")
+            .bind(&first_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE route_credentials SET route_priority = 2 WHERE id = ?")
+            .bind(&second_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[first_id.clone(), second_id])
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-content",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(
+                json!({"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}).to_string(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        let first = RouteCredentialRepository::get(&pool, &first_id)
+            .await
+            .expect("first account");
+        assert_eq!(first.status, "ok");
+        assert_eq!(first.transient_failure_count, 0);
+        assert!(first.cooldown_until.is_none());
+        assert_eq!(first.last_failure_kind.as_deref(), Some("content_rejected"));
+    }
+
+    #[tokio::test]
+    async fn stream_prime_content_rejection_does_not_retry_the_same_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE_FRAME: &str = "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"sensitive_words_detected\",\"message\":\"sensitive words detected\",\"type\":\"new_api_error\"}}}\n\n";
+        let (upstream, calls) = start_scripted_sse_upstream(vec![vec![SENSITIVE_FRAME]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-content",
+            &upstream,
+            json!({"interface_format":"openai-responses","failure_policy":{"retry_count":2,"retry_interval_ms":0}}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-stream",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&body).contains("sensitive words detected"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "A must not retry the same account"
+        );
+        let account = RouteCredentialRepository::get(&pool, &id)
+            .await
+            .expect("account");
+        assert_eq!(account.status, "ok");
+        assert_eq!(account.transient_failure_count, 0);
+        assert_eq!(
+            account.last_failure_kind.as_deref(),
+            Some("content_rejected")
+        );
+    }
+
+    fn b1_chat_body(model: &str) -> Value {
+        json!({
+            "model": model,
+            "messages": (0..7).map(|index| {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": format!("call-{index}"),
+                    "content": b1_old_tool_output(index)
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    fn b1_old_tool_output(index: usize) -> String {
+        format!("tool-output-{index}-{}", "x".repeat(160))
+    }
+
+    async fn proxy_b1(pool: &SqlitePool, model: &str) -> Response {
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            pool,
+            "codex",
+            "sk-ai-switch-test-b1",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+        proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(b1_chat_body(model).to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn content_rejection_compat_retries_only_the_enabled_rejected_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"sensitive words detected"}}"#;
+        let (enabled, enabled_calls) = start_status_sequence_upstream(
+            1,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":"trimmed"}"#,
+        )
+        .await;
+        let (disabled, disabled_calls) = start_status_sequence_upstream(
+            usize::MAX,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SENSITIVE,
+            r#"{"ok":"never"}"#,
+        )
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let enabled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "enabled",
+            &enabled,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        )
+        .await;
+        let disabled_id = create_proxy_api_credential_with_config(
+            &pool,
+            "disabled",
+            &disabled,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        )
+        .await;
+        sqlx::query("UPDATE route_credentials SET route_priority = 1 WHERE id = ?")
+            .bind(&enabled_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE route_credentials SET route_priority = 2 WHERE id = ?")
+            .bind(&disabled_id).execute(&pool).await.unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[enabled_id.clone(), disabled_id])
+            .await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+            r#"{"ok":"trimmed"}"#
+        );
+        assert_eq!(enabled_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(disabled_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failover_disabled_never_tries_a_fresh_account_but_b1_retries_the_rejected_one() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"content-blocked","message":"blocked"}}"#;
+        let (first, first_calls) = start_status_sequence_upstream(
+            1, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"b1"}"#,
+        ).await;
+        let (backup, backup_calls) = start_status_sequence_upstream(
+            0, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"backup"}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let first_id = create_proxy_api_credential_with_config(
+            &pool, "first", &first,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0,"failover_enabled":false}
+            }),
+        ).await;
+        let backup_id = create_proxy_api_credential_with_config(
+            &pool, "backup", &backup,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        ).await;
+        sqlx::query("UPDATE route_credentials SET route_priority = 1 WHERE id = ?")
+            .bind(&first_id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE route_credentials SET route_priority = 2 WHERE id = ?")
+            .bind(&backup_id).execute(&pool).await.unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[first_id, backup_id]).await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn precise_mode_b1_stays_on_the_pinned_account() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (pinned, pinned_calls) = start_status_sequence_upstream(
+            1, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"pinned"}"#,
+        ).await;
+        let (other, other_calls) = start_status_sequence_upstream(
+            0, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":"other"}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let pinned_id = create_proxy_api_credential_with_config(
+            &pool, "A", &pinned,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        let other_id = create_proxy_api_credential_with_config(
+            &pool, "B", &other,
+            json!({"failure_policy":{"retry_count":0,"retry_interval_ms":0}}),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[pinned_id, other_id]).await.unwrap();
+        let response = proxy_b1(&pool, "A/gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(pinned_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn content_rejection_without_a_trimmable_body_returns_the_pool_error() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (upstream, _calls) = start_status_sequence_upstream(
+            usize::MAX, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":true}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool, "short", &upstream,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[id]).await.unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool, "codex", "sk-ai-switch-test-short",
+        ).await.unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap());
+        let response = proxy_handler(
+            AxumState(state), Method::POST, headers,
+            "/v1/chat/completions".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}).to_string()),
+        ).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(body.contains("All route credentials failed"), "{body}");
+        assert!(body.contains("blocked"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn b1_runs_at_most_once_when_the_trimmed_request_is_rejected_again() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const SENSITIVE: &str = r#"{"error":{"code":"sensitive_words_detected","message":"blocked"}}"#;
+        let (upstream, calls) = start_status_sequence_upstream(
+            usize::MAX, StatusCode::INTERNAL_SERVER_ERROR, SENSITIVE, r#"{"ok":true}"#,
+        ).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool, "still rejected", &upstream,
+            json!({
+                "content_rejection_compat":"trim_old_tool_outputs",
+                "failure_policy":{"retry_count":0,"retry_interval_ms":0}
+            }),
+        ).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[id]).await.unwrap();
+        let response = proxy_b1(&pool, "gpt-5.5").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one original plus one trimmed attempt");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("blocked"));
+    }
+
+    /// 重试预算用尽之后是否走池里的下一个账号，由失败账号自己的
+    /// `failover_enabled` 决定：开着就切号，关着就把这个账号的错误原样交给客户端。
+    #[tokio::test]
+    async fn failover_switch_decides_whether_the_pool_walks_on_after_retries() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const DOWN: &str = r#"{"error":{"message":"upstream down"}}"#;
+        const OK_BODY: &str = r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+        for failover_enabled in [true, false] {
+            let (failing, failing_calls) =
+                start_status_sequence_upstream(usize::MAX, StatusCode::BAD_GATEWAY, DOWN, OK_BODY)
+                    .await;
+            let (healthy, healthy_calls) =
+                start_status_sequence_upstream(0, StatusCode::BAD_GATEWAY, DOWN, OK_BODY).await;
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let first = create_proxy_api_credential_with_config(
+                &pool,
+                "first",
+                &failing,
+                json!({"failure_policy": {"retry_count": 0, "failover_enabled": failover_enabled}}),
+            )
+            .await;
+            let second = create_proxy_api_credential(&pool, "second", &healthy).await;
+            RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+                .await
+                .expect("pool members");
+            let key =
+                RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-failover-switch")
+                    .await
+                    .expect("route key");
+            let runtime = RouteProxyRuntimeState::default();
+            let state = build_proxy_state(pool.clone(), &runtime);
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
+            );
+            let response = proxy_handler(
+                AxumState(state),
+                Method::POST,
+                headers,
+                "/v1/chat/completions".parse().unwrap(),
+                Body::from(json!({"model":"gpt-5.5","messages":[]}).to_string()),
+            )
+            .await;
+            let status = response.status();
+            let body = String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .expect("body"),
+            )
+            .to_string();
+
+            assert_eq!(
+                failing_calls.load(Ordering::SeqCst),
+                1,
+                "第一个账号只该被问一次"
+            );
+            if failover_enabled {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(
+                    healthy_calls.load(Ordering::SeqCst),
+                    1,
+                    "开着就该切号: {body}"
+                );
+            } else {
+                assert!(status.is_server_error(), "关掉后应当是失败响应: {body}");
+                assert!(body.contains("first"), "错误要点名失败的账号: {body}");
+                assert!(!body.contains("second"), "不该牵扯没打过的账号: {body}");
+                assert_eq!(
+                    healthy_calls.load(Ordering::SeqCst),
+                    0,
+                    "关掉故障转移后不许切号: {body}"
+                );
+            }
+        }
+    }
+
+    /// 断点落在工具调用参数中间：半截调用客户端从未见过，整条丢弃，再打一轮
+    /// 续写让模型重发一条完整的（spec 第 8.1/8.2 节）。顺带覆盖多轮续写：
+    /// 重写器跨轮沿用，序号接得上，客户端仍只看到一条 `response.created`。
+    #[tokio::test]
+    async fn a_cut_inside_a_tool_call_drops_it_and_the_next_round_reissues() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const FIRST: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"先看文件。\"}\n\n";
+        // 续写第一轮：模型去调工具，参数写到一半上游就断了。
+        const CUT_CALL: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"read\",\"arguments\":\"\"}}\n\n\
+            data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\"}\n\n";
+        // 续写第二轮：重发一次完整的调用，再收尾。
+        const FINISH: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r3\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc_2\",\"type\":\"function_call\",\"name\":\"read\",\"arguments\":\"\"}}\n\n\
+            data: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"item_id\":\"fc_2\",\"delta\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"fc_2\",\"type\":\"function_call\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r3\",\"status\":\"completed\"}}\n\n";
+
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            vec![FIRST],
+            vec![CUT_CALL],
+            vec![FINISH],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first, second])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"读一下 a.txt"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("body");
+
+        assert!(
+            !body.contains("fc_1"),
+            "半截工具调用绝不能到客户端: {body}"
+        );
+        assert!(body.contains("fc_2"), "重发的完整调用应当放行: {body}");
+        assert!(body.contains("a.txt"), "完整参数应当放行: {body}");
+        assert_eq!(
+            body.matches("\"type\":\"response.created\"").count(),
+            1,
+            "多轮续写也只能有一条 response.created: {body}"
+        );
+        assert!(body.contains("\"type\":\"response.completed\""), "{body}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "应当续写两轮");
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// 续写成功不改记账规则：断流照旧给原账号记一次 `semantic_response_transient`，
+    /// 客户端看到的是完整回答（spec 第 11 节）。
+    #[tokio::test]
+    async fn a_continued_request_still_charges_the_failing_account_once() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const FIRST: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"delta\":\"前半句，\"}\n\n";
+        const SECOND: &str = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n\
+            data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\"}}\n\n\
+            data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m2\",\"delta\":\"后半句。\"}\n\n\
+            data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"后半句。\"}]}}\n\n\
+            data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n";
+
+        let (upstream, _calls) =
+            start_scripted_sse_upstream(vec![vec![FIRST], vec![SECOND]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (first, second) = create_continuation_credentials(&pool, &upstream).await;
+        RoutePoolRepository::replace_members(&pool, "codex", &[first.clone(), second.clone()])
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/responses",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({
+                "model": "gpt-6-astra",
+                "stream": true,
+                "input": [{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":"hi"}]}]
+            }))
+            .send()
+            .await
+            .expect("proxy response");
+        let body = response.text().await.expect("body");
+
+        assert!(
+            body.contains("前半句，") && body.contains("后半句。"),
+            "客户端应当看到完整回答: {body}"
+        );
+        assert!(body.contains("\"type\":\"response.completed\""), "{body}");
+
+        let a = RouteCredentialRepository::get(&pool, &first)
+            .await
+            .expect("credential a");
+        let b = RouteCredentialRepository::get(&pool, &second)
+            .await
+            .expect("credential b");
+        assert_eq!(
+            a.transient_failure_count + b.transient_failure_count,
+            1,
+            "断流只给一个账号记一次失败: {:?} / {:?}",
+            a.last_failure_message,
+            b.last_failure_message
+        );
+        let failed = if a.transient_failure_count == 1 { &a } else { &b };
+        assert!(
+            failed
+                .last_failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stream disconnected")),
+            "失败原因应当是断流: {:?}",
+            failed.last_failure_message
+        );
+
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+}

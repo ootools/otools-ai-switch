@@ -1,0 +1,542 @@
+use super::common::{
+    ensure_codex_request_shape, repair_blank_call_ids_in_input, response_tool_name,
+    response_tool_namespace, ResponsesToolNamespaces,
+};
+use super::TransformedBridgeResponse;
+use crate::services::response_failure_service::stamp_context_length_exceeded_code;
+use serde_json::{Map, Value};
+
+pub(super) fn responses_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
+    let value = serde_json::from_slice::<Value>(body)
+        .map_err(|error| format!("Responses request JSON is invalid: {error}"))?;
+    let mut object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Responses request body must be a JSON object".to_string())?;
+
+    if let Some(tools) = object.get("tools") {
+        let flattened = flatten_native_responses_tools(tools, None)?;
+        let tools = flattened
+            .into_iter()
+            .map(normalize_response_tool)
+            .map(Value::Object)
+            .collect();
+        object.insert("tools".to_string(), Value::Array(tools));
+    }
+
+    // Repair `function_call_output` (and sibling custom/tool-search output) items
+    // whose `call_id` was dropped on the wire — typical after a model switch
+    // replays history into a strict Responses upstream that rejects the request
+    // with "... function_call_output ... is missing call_id". Pairing each output
+    // with the preceding `function_call` by order produces a call_id that matches
+    // the assistant `tool_calls` id the upstream expects.
+    //
+    // `prepare_request` already ran this for Codex clients, so it is a no-op on
+    // the normal path; it stays here because a strict Responses upstream is this
+    // converter's own contract to honour, and it is the only guard left if the
+    // dispatcher's gate ever changes. See [`repair_blank_call_ids_in_input`].
+    if let Some(input) = object.get_mut("input") {
+        repair_blank_call_ids_in_input(input);
+    }
+
+    if object.get("store").and_then(Value::as_bool) == Some(false) {
+        clear_unstored_reasoning_ids(&mut object);
+    }
+
+    // The Codex CLI sends these itself, but any other Responses client on a
+    // codex-platform pool does not — and a New API Codex channel refuses the
+    // request outright without them. A client that already named either one keeps
+    // its own value.
+    ensure_codex_request_shape(&mut object);
+
+    serde_json::to_vec(&Value::Object(object))
+        .map_err(|error| format!("Could not serialize Responses request: {error}"))
+}
+
+fn clear_unstored_reasoning_ids(object: &mut Map<String, Value>) {
+    let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let has_ciphertext = item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty());
+        if item.get("type").and_then(Value::as_str) == Some("reasoning") && !has_ciphertext {
+            // Do not drop the summary or content just because an upstream cannot
+            // resolve this ID. Full ciphertext-shape cleanup is account-opt-in.
+            item.remove("id");
+        }
+    }
+}
+
+fn flatten_native_responses_tools(
+    tools: &Value,
+    namespace: Option<&str>,
+) -> Result<Vec<Map<String, Value>>, String> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| "Responses tools must be an array".to_string())?;
+    let mut flattened = Vec::new();
+    for tool in tools {
+        let object = tool
+            .as_object()
+            .ok_or_else(|| "Responses tool entries must be objects".to_string())?;
+        let tool_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("function");
+        if tool_type == "namespace" {
+            let nested_namespace = object
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| object.get("namespace").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or(namespace);
+            if let Some(nested_tools) = object.get("tools") {
+                flattened.extend(flatten_native_responses_tools(
+                    nested_tools,
+                    nested_namespace,
+                )?);
+            }
+            continue;
+        }
+
+        let mut function = object.clone();
+        if tool_type == "function" {
+            if let (Some(namespace), Some(name)) = (
+                namespace.filter(|value| !value.is_empty()),
+                object.get("name").and_then(Value::as_str),
+            ) {
+                function.insert(
+                    "name".to_string(),
+                    Value::String(super::common::qualified_response_tool_name(namespace, name)),
+                );
+            }
+            function = normalize_response_tool(function);
+        }
+        flattened.push(function);
+    }
+    Ok(flattened)
+}
+
+pub(super) fn responses_response_to_responses(
+    status: u16,
+    content_type: Option<&str>,
+    body: &[u8],
+    tool_namespaces: &ResponsesToolNamespaces,
+) -> Result<TransformedBridgeResponse, String> {
+    if !(200..300).contains(&status) {
+        return Ok(TransformedBridgeResponse {
+            body: body.to_vec(),
+            content_type: content_type.map(str::to_string),
+        });
+    }
+
+    if content_type.is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        || looks_like_sse(body)
+    {
+        return Ok(TransformedBridgeResponse {
+            body: responses_sse_to_responses(body, tool_namespaces)?,
+            content_type: Some("text/event-stream".to_string()),
+        });
+    }
+
+    // An empty namespace map no longer short-circuits the whole bridge: a
+    // `response.failed` document with `code: null` and only a prose message
+    // still has to gain the structured code Codex compacts on. The record is
+    // parsed, but if neither rewrite applies the upstream's own bytes go back
+    // untouched, so the documented passthrough stays byte-for-byte.
+    let original = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        // Without a namespace to restore an unparseable body was always passed
+        // through verbatim; with one, a 200 that is not JSON is still a broken
+        // upstream response and the caller has to hear about it.
+        Err(_) if tool_namespaces.is_empty() => {
+            return Ok(TransformedBridgeResponse {
+                body: body.to_vec(),
+                content_type: content_type.map(str::to_string),
+            });
+        }
+        Err(error) => return Err(format!("Responses response JSON is invalid: {error}")),
+    };
+    let mut value = restore_tool_namespaces(original.clone(), tool_namespaces);
+    stamp_context_length_exceeded_code(&mut value);
+    if value == original {
+        return Ok(TransformedBridgeResponse {
+            body: body.to_vec(),
+            content_type: content_type.map(str::to_string),
+        });
+    }
+    Ok(TransformedBridgeResponse {
+        body: serde_json::to_vec(&value)
+            .map_err(|error| format!("Could not serialize Responses response: {error}"))?,
+        content_type: Some("application/json".to_string()),
+    })
+}
+
+fn normalize_response_tool(mut tool: Map<String, Value>) -> Map<String, Value> {
+    if !tool.contains_key("parameters") {
+        if let Some(input_schema) = tool.remove("inputSchema") {
+            tool.insert("parameters".to_string(), input_schema);
+        }
+    } else {
+        tool.remove("inputSchema");
+    }
+    tool
+}
+
+fn restore_tool_namespaces(mut value: Value, tool_namespaces: &ResponsesToolNamespaces) -> Value {
+    match &mut value {
+        Value::Array(items) => {
+            for item in items {
+                *item = restore_tool_namespaces(item.take(), tool_namespaces);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("function_call") {
+                if let Some(name) = object.get("name").and_then(Value::as_str) {
+                    if let Some(namespace) = response_tool_namespace(name, tool_namespaces) {
+                        let response_name = response_tool_name(name, tool_namespaces).to_string();
+                        object.insert("name".to_string(), Value::String(response_name));
+                        object.insert(
+                            "namespace".to_string(),
+                            Value::String(namespace.to_string()),
+                        );
+                    }
+                }
+            }
+            for item in object.values_mut() {
+                let current = item.take();
+                *item = restore_tool_namespaces(current, tool_namespaces);
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn responses_sse_to_responses(
+    body: &[u8],
+    tool_namespaces: &ResponsesToolNamespaces,
+) -> Result<Vec<u8>, String> {
+    let text = String::from_utf8_lossy(body).replace("\r\n", "\n");
+    let mut output = String::new();
+    for block in text.split("\n\n") {
+        let Some(converted) = responses_sse_block_to_responses(block, tool_namespaces)? else {
+            continue;
+        };
+        output.push_str(&converted);
+        output.push_str("\n\n");
+    }
+    Ok(output.into_bytes())
+}
+
+/// Converts one already-framed SSE block for the Responses → Responses bridge.
+///
+/// `block` arrives without its `\n\n` terminator and the result is returned the
+/// same way. [`responses_sse_to_responses`] drives this block by block, so the
+/// buffered path and the streamed path emit identical bytes and cannot drift.
+///
+/// Returns `None` for a block with nothing to forward — a blank keep-alive.
+pub(super) fn responses_sse_block_to_responses(
+    block: &str,
+    tool_namespaces: &ResponsesToolNamespaces,
+) -> Result<Option<String>, String> {
+    if block.trim().is_empty() {
+        return Ok(None);
+    }
+    let data = block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(Some(block.to_string()));
+    }
+    // This path only rewrites tool names and the structured context-limit
+    // code, so a record we cannot parse is forwarded untouched instead of
+    // failing the whole stream.
+    let Ok(original) = serde_json::from_str::<Value>(&data) else {
+        return Ok(Some(block.to_string()));
+    };
+    let mut value = restore_tool_namespaces(original.clone(), tool_namespaces);
+    stamp_context_length_exceeded_code(&mut value);
+    if value == original {
+        // Nothing to rewrite: return the record exactly as it arrived, keeping
+        // the upstream's key order and spacing. This is what lets the bridge
+        // run on every record without losing its byte-for-byte passthrough.
+        return Ok(Some(block.to_string()));
+    }
+    let mut output = String::new();
+    for line in block
+        .lines()
+        .filter(|line| !line.trim().starts_with("data:"))
+    {
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.push_str("data: ");
+    output.push_str(
+        &serde_json::to_string(&value)
+            .map_err(|error| format!("Could not serialize Responses SSE data: {error}"))?,
+    );
+    Ok(Some(output))
+}
+
+fn looks_like_sse(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body)
+        .lines()
+        .any(|line| line.trim_start().starts_with("data:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::responses_request_to_responses;
+    use serde_json::{json, Value};
+
+    /// The live gateway's null-code context rejection can also arrive over an
+    /// upstream that already speaks Responses. This bridge only rewrites tool
+    /// names, so without an explicit rule the `code: null` reaches Codex
+    /// unchanged and the compaction path never fires.
+    #[test]
+    fn a_null_code_context_rejection_gains_the_structured_code() {
+        use super::responses_response_to_responses;
+
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":null,\"message\":\"Your request resulted in more tokens than this model's maximum context length allows. Please reduce the length of the messages or run compaction.\"}}}\n\n"
+        );
+
+        let converted = responses_response_to_responses(
+            200,
+            Some("text/event-stream"),
+            body.as_bytes(),
+            &Default::default(),
+        )
+        .expect("sse conversion");
+        let text = String::from_utf8_lossy(&converted.body);
+        let failed: Value = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("response.failed"))
+            .expect("response.failed event");
+        assert_eq!(
+            failed
+                .pointer("/response/error/code")
+                .and_then(Value::as_str),
+            Some("context_length_exceeded"),
+            "Codex can only compact on the structured code: {failed}"
+        );
+    }
+
+    fn converted_request(body: Value) -> Value {
+        let body = serde_json::to_vec(&body).expect("request json");
+        let converted = responses_request_to_responses(&body).expect("converted request");
+        serde_json::from_slice(&converted).expect("converted json")
+    }
+
+    #[test]
+    fn store_false_preserves_reasoning_summary_without_orphan_id() {
+        let converted = converted_request(json!({
+            "model": "gpt-5",
+            "store": false,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_chatcmpl-opc-2537eab80ac672361146",
+                    "summary": [{"type": "summary_text", "text": "thinking"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            converted["input"],
+            json!([
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+            ])
+        );
+    }
+
+    #[test]
+    fn store_false_keeps_replayable_encrypted_reasoning() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_real",
+            "encrypted_content": "encrypted",
+            "summary": []
+        });
+        let converted = converted_request(json!({
+            "model": "gpt-5",
+            "store": false,
+            "input": [reasoning.clone()]
+        }));
+
+        assert_eq!(converted["input"], json!([reasoning]));
+    }
+
+    #[test]
+    fn store_true_keeps_reasoning_item_references() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_stored",
+            "summary": []
+        });
+        let converted = converted_request(json!({
+            "model": "gpt-5",
+            "store": true,
+            "input": [reasoning.clone()]
+        }));
+
+        assert_eq!(converted["input"], json!([reasoning]));
+    }
+
+    /// Model switch into a Responses upstream can replay a
+    /// `function_call_output` whose `call_id` was dropped; repair it from the
+    /// preceding `function_call` so the upstream's
+    /// "... function_call_output ... is missing call_id" check passes.
+    #[test]
+    fn repairs_function_call_output_missing_call_id_from_paired_function_call() {
+        let converted = converted_request(json!({
+            "model": "5.6",
+            "store": false,
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "42"}
+            ]
+        }));
+        assert_eq!(
+            converted["input"][1]["call_id"], "call_1",
+            "converted={converted}"
+        );
+        assert_eq!(converted["input"][1]["output"], "42");
+    }
+
+    #[test]
+    fn matches_missing_output_to_the_only_unmatched_call_after_explicit_out_of_order_output() {
+        let converted = converted_request(json!({
+            "model": "gpt-5",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_2", "output": "result-2"},
+                {"type": "function_call_output", "output": "result-1"}
+            ]
+        }));
+        assert_eq!(
+            converted["input"][3]["call_id"], "call_1",
+            "converted={converted}"
+        );
+    }
+
+    #[test]
+    fn leaves_missing_output_unmodified_when_multiple_calls_remain_unmatched() {
+        let converted = converted_request(json!({
+            "model": "gpt-5",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_2", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "output": "ambiguous"}
+            ]
+        }));
+        assert!(
+            converted["input"][2].get("call_id").is_none(),
+            "converted={converted}"
+        );
+    }
+
+    /// A Responses client that is not the Codex CLI — WorkBuddy and friends —
+    /// sends neither of the two fields a New API Codex channel demands, and the
+    /// channel refuses the request outright without them. The bridge fills both.
+    #[test]
+    fn supplies_the_codex_shape_a_bare_responses_client_cannot_send() {
+        let converted = converted_request(json!({
+            "model": "gpt-6-astra",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }]
+        }));
+
+        assert_eq!(
+            converted["include"],
+            json!(["reasoning.encrypted_content"]),
+            "converted={converted}"
+        );
+        assert!(
+            !converted["prompt_cache_key"]
+                .as_str()
+                .expect("prompt_cache_key is a string")
+                .is_empty(),
+            "converted={converted}"
+        );
+    }
+
+    /// The CLI names both itself. `prompt_cache_key` in particular is what the
+    /// upstream prompt cache is keyed on, so overwriting it would forfeit every
+    /// cache hit the client's own traffic gets.
+    #[test]
+    fn leaves_a_clients_own_codex_shape_untouched() {
+        let converted = converted_request(json!({
+            "model": "gpt-6-astra",
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "client-chosen",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}]
+            }]
+        }));
+
+        assert_eq!(converted["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            converted["prompt_cache_key"], "client-chosen",
+            "converted={converted}"
+        );
+    }
+
+    /// The derived key has to be stable across the turns of one conversation, or
+    /// the upstream sees a new cache partition on every request.
+    #[test]
+    fn derives_the_same_key_for_the_same_opening_turn() {
+        let first = converted_request(json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "more"}]}
+            ]
+        }));
+        let later = converted_request(json!({
+            "model": "gpt-6-astra",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "more"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ok"}]}
+            ]
+        }));
+
+        assert_eq!(first["prompt_cache_key"], later["prompt_cache_key"]);
+    }
+}

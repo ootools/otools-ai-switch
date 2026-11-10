@@ -1,0 +1,6 @@
+* text=auto eol=lf
+native/migrations/*.sql -text
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

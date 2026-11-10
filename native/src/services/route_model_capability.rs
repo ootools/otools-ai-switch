@@ -1,0 +1,2947 @@
+use crate::models::route_credential::{is_fallback_mapping, ModelMapping};
+use crate::services::model_image_input::default_supports_image_input;
+use crate::services::route_pool_model_mode::{
+    assign_member_prefixes, PoolModelMode, OFFICIAL_MODEL_PREFIX,
+};
+use serde_json::{json, Value};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCapability {
+    pub(crate) mappings: Vec<ModelMapping>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelMatchMode {
+    NativeAlias,
+    ClientFacing,
+    Upstream,
+}
+
+/// One pool member as the catalog sees it: its parsed mappings plus the prefix
+/// its entries carry in precise mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCatalogMember {
+    /// `"api"` or `"official"`.
+    pub(crate) kind: String,
+    /// The account's own prefix, or [`OFFICIAL_MODEL_PREFIX`] for every official
+    /// account — they share one entry set.
+    pub(crate) prefix: String,
+    pub(crate) capability: ModelCapability,
+}
+
+/// What a caller hands over per pool member. Every call site has these four
+/// fields on the row it already loaded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CatalogMemberInput<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) config_json: &'a str,
+}
+
+/// Shorthand for the two call sites that already hold full credential rows.
+pub(crate) fn catalog_member_inputs(
+    credentials: &[crate::models::route_credential::RouteCredential],
+) -> Vec<CatalogMemberInput<'_>> {
+    credentials
+        .iter()
+        .map(|credential| CatalogMemberInput {
+            id: &credential.id,
+            display_name: &credential.display_name,
+            kind: &credential.kind,
+            config_json: &credential.config_json,
+        })
+        .collect()
+}
+
+/// Parse each member's mappings and hand out precise-mode prefixes.
+///
+/// Official members are collapsed onto the reserved prefix; their mappings still
+/// decide which aliases that shared group can serve.
+pub(crate) fn catalog_members(inputs: &[CatalogMemberInput<'_>]) -> Vec<ModelCatalogMember> {
+    let api_members: Vec<(&str, &str)> = inputs
+        .iter()
+        .filter(|input| input.kind != "official")
+        .map(|input| (input.id, input.display_name))
+        .collect();
+    // Only API accounts compete for a prefix; the official ones share theirs.
+    let mut api_prefixes = assign_member_prefixes(&api_members).into_iter();
+
+    inputs
+        .iter()
+        .map(|input| {
+            let capability = parse_model_capability(input.config_json);
+            let prefix = if input.kind == "official" {
+                OFFICIAL_MODEL_PREFIX.to_string()
+            } else {
+                api_prefixes.next().unwrap_or_default()
+            };
+            ModelCatalogMember {
+                kind: input.kind.to_string(),
+                prefix,
+                capability,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvertisedModel {
+    pub(crate) id: String,
+    /// `id` without its account prefix. Everything that reads a *model name* out
+    /// of an entry — the Codex reasoning profile, the `[1m]` window rule — has to
+    /// use this: `Grox/gpt-5.6-sol` matches no profile table, and would silently
+    /// drop the model to the generic three-tier default.
+    pub(crate) base_id: String,
+    description: String,
+    /// The model this alias is rewritten to. Read per source before the merge,
+    /// because the default context window is a property of the *upstream* model
+    /// rather than of the alias the client asks for. A baseline (wildcard) entry
+    /// is not rewritten, so its id doubles as its upstream name.
+    ///
+    /// On a merged entry this names one of the sources. Which one no longer
+    /// matters to the advertised window: every source's default is resolved into
+    /// `context_window` before the entries are folded together.
+    pub(crate) upstream_model: String,
+    /// The window advertised for this alias: the largest window any source in
+    /// the pool claims for it. `None` keeps the platform default, so a baseline
+    /// (wildcard) model and a pre-existing mapping behave exactly as they did
+    /// before.
+    ///
+    /// For Codex this is always filled in, because each source's default is
+    /// resolved before the maximum is taken — see
+    /// [`contribution_context_window`].
+    pub(crate) context_window: Option<u32>,
+    /// Efforts advertised for this alias: only the ones every source that
+    /// contributed it offers. `None` keeps the baseline profile for the model id.
+    pub(crate) reasoning_levels: Option<Vec<String>>,
+    /// Whether every account serving this alias accepts image input. The merge is
+    /// conservative: one text-only source must not silently receive an image.
+    pub(crate) supports_image_input: bool,
+    /// `Some` only for Claude third-party catalog entries. It is kept while
+    /// folding contributions so the 1M claim can use conservative AND semantics.
+    supports_one_m: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexReasoningProfile {
+    pub(crate) levels: &'static [&'static str],
+    pub(crate) default_level: &'static str,
+}
+
+const SOL_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const GPT_6_ASTRA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const TERRA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+/// `gpt-6.1-sol` serves OpenAI Responses upstreams that reject `ultra`
+/// (their enum stops at `max`). The default effort is the last advertised tier,
+/// so this ladder must not carry `ultra` or a fresh account's first request
+/// 400s before the user can change anything.
+const GPT_6_1_SOL_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const LUNA_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const GPT_55_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+const DEFAULT_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
+/// The ladder a DeepSeek‑V4 family model offers once nothing else describes it.
+/// `max` is the top recognised effort and the family carries enough headroom for
+/// it to be a real choice rather than decoration.
+const DEEPSEEK_V4_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "max"];
+
+/// The ladder a model the tables describe ships, or `None` for a model they do
+/// not describe at all.
+///
+/// The distinction is the point: a relay's own model id must keep the
+/// conservative generic ladder, while a model we know — `gpt-6-astra`, say —
+/// has a real one that Codex is already shown.
+pub(crate) fn baseline_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "gpt-6-astra" => Some(GPT_6_ASTRA_REASONING_LEVELS),
+        "gpt-6.1-sol" => Some(GPT_6_1_SOL_REASONING_LEVELS),
+        "gpt-5.6-sol" => Some(SOL_REASONING_LEVELS),
+        "gpt-5.6-terra" => Some(TERRA_REASONING_LEVELS),
+        "gpt-5.6-luna" => Some(LUNA_REASONING_LEVELS),
+        "gpt-5.5" => Some(GPT_55_REASONING_LEVELS),
+        _ => None,
+    }
+}
+
+/// The ladder the tables describe for a model, or `None` when nothing does.
+///
+/// Shared by the Codex catalog and the third-party client configs on purpose.
+/// They used to disagree for DeepSeek‑V4: the catalog answered
+/// `low`/`medium`/`high` while ZCode and WorkBuddy were handed the same three
+/// plus `max`, so one undeclared model offered a different menu depending on
+/// which client asked — and the Codex row silently dropped the tier the user had
+/// just been granted everywhere else.
+pub(crate) fn described_reasoning_levels(model: &str) -> Option<&'static [&'static str]> {
+    baseline_reasoning_levels(model)
+        .or_else(|| is_deepseek_v4_upstream(model).then_some(DEEPSEEK_V4_REASONING_LEVELS))
+}
+
+/// Reasoning ladder advertised to **third-party clients** (ZCode, WorkBuddy,
+/// CodeBuddy) for a model whose account declared no `reasoning_levels`.
+///
+/// The Codex CLI's own catalog falls back to a per-model profile for such models
+/// (see [`codex_reasoning_profile`]); third-party clients deliberately do *not*
+/// invent a per-model profile. But an *empty* control left the user with nothing
+/// but the client's bare on/off toggle — a stepfun model that simply is not in
+/// the built-in profile table ended up with only "enable/disable" and no way to
+/// pick a tier. A minimal ladder restores that choice. `low`/`medium`/`high` are
+/// all in `RECOGNISED_REASONING_EFFORTS`, so the proxy bridges honour them and
+/// nothing is silently dropped from the request.
+/// The generic ladder used when neither the profile table nor a family rule
+/// describes a model. This is also what third-party clients get for an undeclared
+/// model the tables do not know — never an empty list, which would leave the
+/// client with only a bare on/off toggle and no tier to pick.
+///
+/// `DEFAULT_THIRD_PARTY_REASONING_LEVELS` used to be a separate constant holding
+/// the same three values; keeping two names for one statement let one of them
+/// drift without anything failing.
+pub(crate) const DEFAULT_THIRD_PARTY_REASONING_LEVELS: &[&str] = DEFAULT_REASONING_LEVELS;
+
+/// Whether the upstream model is a DeepSeek‑V4 family. Matched on the start of
+/// the mapped‑to name so every dated or sized variant (`deepseek-v4-flash-0731`,
+/// `deepseek-v4.1`, …) is covered; relays namespace by vendor, so the last path
+/// segment is tried too.
+fn is_deepseek_v4_upstream(upstream_model: &str) -> bool {
+    let name = upstream_model.trim().to_ascii_lowercase();
+    let bare = name.rsplit('/').next().unwrap_or(name.as_str());
+    name.starts_with("deepseek-v4") || bare.starts_with("deepseek-v4")
+}
+
+/// Reasoning ladder advertised to **third-party clients** for a model whose
+/// account declared no `reasoning_levels`.
+///
+/// A model the profile table describes advertises **its own** ladder. Codex is
+/// already shown all six of `gpt-6-astra`'s tiers, and a third-party client
+/// offered only the generic three read as "this model has no reasoning control"
+/// — the same model, two different menus, depending on which client asked.
+///
+/// Anything the table does not know — a relay's own model id — keeps the
+/// conservative [`DEFAULT_THIRD_PARTY_REASONING_LEVELS`] (`low`/`medium`/`high`).
+/// DeepSeek‑V4 upstreams additionally get a `max` tier. The family carries enough
+/// headroom that the top recognised effort is a real choice rather than
+/// decoration — the user explicitly asked for it — so the ladder grows to
+/// `low`/`medium`/`high`/`max` for those models. `max` is in
+/// `RECOGNISED_REASONING_EFFORTS`, so the bridges honour it end to end and the
+/// request is not silently stripped.
+///
+/// That DeepSeek‑V4 rule lives in [`described_reasoning_levels`] so the Codex
+/// catalog applies it too: the two used to disagree, and Codex — the client the
+/// per-mapping declaration is actually written for — was the side that lost the
+/// tier.
+pub(crate) fn default_third_party_reasoning_levels(upstream_model: &str) -> Vec<String> {
+    described_reasoning_levels(upstream_model)
+        .unwrap_or(DEFAULT_THIRD_PARTY_REASONING_LEVELS)
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect()
+}
+
+/// Context window written into the Codex catalog when a mapping declares none
+/// and its upstream model is not one of the known 1M families.
+///
+/// Deliberately the conservative number rather than a guess at what a modern
+/// relay serves. The two wrong answers do not cost the same: under-claiming makes
+/// Codex compact earlier than it had to, while over-claiming makes it keep
+/// packing until 95% of a window the upstream does not have and the turn dies on
+/// a 400 the user cannot act on. A mapping that knows better now declares its own
+/// `context_window`, so the default only has to be safe — it is no longer the
+/// only way to describe a large window.
+pub(crate) const CODEX_DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
+/// Decimal 1M on purpose. `1_048_576` is how the CPA transfer format marks a
+/// Claude 1M tier, and reusing it would make a Codex row come back from a round
+/// trip looking like one.
+pub(crate) const CODEX_ONE_M_CONTEXT_WINDOW: u32 = 1_000_000;
+const CLAUDE_ONE_M_CONTEXT_WINDOW: u32 = 1_000_000;
+
+/// Upstream model families that really serve 1M context, matched on the start of
+/// the mapped-to name so every dated or sized variant is covered
+/// (`deepseek-v4-flash-0731`, `glm-5.3-air`, …).
+const CODEX_ONE_M_UPSTREAM_PREFIXES: &[&str] = &[
+    "deepseek-v4",
+    "glm-5.2",
+    "glm-5.3",
+    "qwen-3.8",
+    "kimi-k3",
+    // Claude series served through a `message` (OpenAI-compatible) upstream
+    // also offer 1M context via the `context-1m-2025-08-07` beta; mirror the
+    // `is_claude_route_model` recognizer so Codex is told the full window.
+    "claude-",
+    "anthropic/claude-",
+];
+const CODEX_BASELINE_CONTEXT_WINDOWS: &[(&str, u32)] = &[
+    ("gpt-6-astra", 1_050_000),
+    ("gpt-6.1-sol", CODEX_ONE_M_CONTEXT_WINDOW),
+    ("gpt-5.6-sol", 272_000),
+    ("gpt-5.6-terra", 272_000),
+    ("gpt-5.6-luna", 272_000),
+    ("gpt-5.5", 272_000),
+];
+
+/// The window to advertise for an alias whose mapping declares none.
+///
+/// Relays publish these families under a vendor path as often as bare
+/// (`z-ai/glm-5.3`), so the last path segment is tried too — otherwise the same
+/// model would silently fall back to the generic default on half the relays.
+pub(crate) fn codex_default_context_window(upstream_model: &str) -> u32 {
+    let name = upstream_model.trim().to_ascii_lowercase();
+    let bare = name.rsplit('/').next().unwrap_or(name.as_str());
+    if CODEX_ONE_M_UPSTREAM_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix) || bare.starts_with(prefix))
+    {
+        return CODEX_ONE_M_CONTEXT_WINDOW;
+    }
+    if let Some((_, window)) = CODEX_BASELINE_CONTEXT_WINDOWS
+        .iter()
+        .find(|(model, _)| name == *model || bare == *model)
+    {
+        return *window;
+    }
+    CODEX_DEFAULT_CONTEXT_WINDOW
+}
+
+/// What Codex clients are told, preferring the user's own declaration. Zero is
+/// treated as "not declared": it is not a window anything could serve.
+pub(crate) fn codex_effective_context_window(declared: Option<u32>, upstream_model: &str) -> u32 {
+    declared
+        .filter(|window| *window > 0)
+        .unwrap_or_else(|| codex_default_context_window(upstream_model))
+}
+
+/// Effective context window for a *resolved upstream* model, as the catalog would
+/// advertise it to the client: an explicit per-mapping `context_window` wins,
+/// otherwise the family default (1M for the known `[1m]` families, e.g. Claude).
+///
+/// The proxy uses this to decide whether to send Anthropic's `context-1m-...`
+/// beta marker. A client such as Codex is told the full window through the
+/// catalog, so it packs up to 1M; without the marker the upstream still caps at
+/// 200K and the turn dies on a 400. Codex does not need a `[1m]` model-name
+/// variant — the configured/advertised window alone is the signal.
+pub(crate) fn effective_context_window_for_upstream(
+    mappings: &[ModelMapping],
+    resolved_upstream_model: &str,
+) -> u32 {
+    let stripped = strip_one_m_suffix_for_route_lookup(resolved_upstream_model);
+    let declared = mappings
+        .iter()
+        .find(|m| !is_fallback_mapping(m) && m.to.trim().eq_ignore_ascii_case(stripped))
+        .and_then(|m| m.context_window)
+        .filter(|w| *w > 0);
+    codex_effective_context_window(declared, stripped)
+}
+
+/// Whether the mapping that will serve this request declares the 1M context
+/// window.
+///
+/// The client's own declaration cannot be the only trigger. Claude Code signals
+/// 1M by tagging the model value it sends, and whether the tag reaches us is
+/// decided for the whole pool at config-write time:
+/// `RouteConfigService::resolve_alias_write` writes `alias[1M]` only when
+/// **every** in-pool account declares the alias, so one account that cannot
+/// serve 1M strips the tag from every request of that tier. A request that then
+/// lands on an account which *can* serve 1M arrives with no declaration at all,
+/// and such an upstream refuses it outright — the relay's "please enable 1m
+/// context and retry".
+///
+/// The mapping's own `supports_1m` is therefore the authoritative signal for the
+/// account the request actually lands on. Resolved exactly like the model
+/// rewrite ([`resolve_mapping_target`]) — specific match first, catch-all last —
+/// so the declaration always belongs to the mapping whose `to` the request is
+/// forwarded with.
+pub(crate) fn mapping_declares_one_m_context(
+    mappings: &[ModelMapping],
+    requested_model: &str,
+    mode: ModelMatchMode,
+) -> bool {
+    specific_mapping_for_request(mappings, requested_model, mode)
+        .or_else(|| mappings.iter().find(|mapping| is_fallback_mapping(mapping)))
+        .is_some_and(|mapping| mapping.supports_1m == Some(true))
+}
+
+pub(crate) fn codex_reasoning_profile(model: &str) -> CodexReasoningProfile {
+    let key = model.trim().to_ascii_lowercase();
+    let default_level = match key.as_str() {
+        "gpt-5.6-sol" => "low",
+        _ => "medium",
+    };
+    CodexReasoningProfile {
+        levels: described_reasoning_levels(&key).unwrap_or(DEFAULT_REASONING_LEVELS),
+        default_level,
+    }
+}
+
+/// Normalizes a declared reasoning-effort list: trim, lowercase, drop empty and
+/// unrecognised entries, and dedupe. Returns exactly what the account declared
+/// (after cleanup) with **no profile fallback** — the caller decides what an
+/// empty result means.
+///
+/// Unrecognised efforts are dropped rather than passed through. Keeping them
+/// looked like forward compatibility, but nothing downstream can act on one: the
+/// protocol bridges map an effort to a chat `reasoning_effort`, an Anthropic
+/// thinking budget or a Gemini thinking config by exact match and answer `None`
+/// otherwise, which silently strips reasoning from the request. So advertising
+/// `insane` let the user select a tier that then quietly did nothing — or 400ed
+/// on the direct Responses path. A genuinely new tier has to be taught to the
+/// bridges first, and then it belongs in `RECOGNISED_REASONING_EFFORTS`.
+pub(crate) fn normalize_reasoning_levels(overrides: Option<&[String]>) -> Vec<String> {
+    overrides
+        .map(|levels| {
+            let mut seen = HashSet::new();
+            levels
+                .iter()
+                .map(|level| level.trim().to_ascii_lowercase())
+                .filter(|level| {
+                    !level.is_empty()
+                        && crate::services::route_protocol_bridge::RECOGNISED_REASONING_EFFORTS
+                            .contains(&level.as_str())
+                        && seen.insert(level.clone())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// The efforts advertised for one alias in the **Codex CLI's own catalog**: the
+/// mapping's declared list when it has one, else the baseline profile for that
+/// model id. The Codex CLI expects reasoning metadata for every model, so this
+/// keeps the profile fallback. Third-party client configs (ZCode, the DeepSeek
+/// harness) must NOT invent efforts and use [`normalize_reasoning_levels`]
+/// directly instead — see `resolve_client_models`.
+pub(crate) fn codex_reasoning_levels(model: &str, overrides: Option<&[String]>) -> Vec<String> {
+    let declared = normalize_reasoning_levels(overrides);
+    if !declared.is_empty() {
+        return declared;
+    }
+    codex_reasoning_profile(model)
+        .levels
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect()
+}
+
+pub(crate) fn codex_reasoning_metadata(
+    model: &str,
+    overrides: Option<&[String]>,
+) -> (Vec<Value>, String) {
+    let profile = codex_reasoning_profile(model);
+    let levels = codex_reasoning_levels(model, overrides);
+    // Preselect the highest advertised tier so a model opens at its deepest
+    // reasoning effort rather than a conservative default. The bridge still maps
+    // the name to a budget, so the only thing that changes is which tier the
+    // client shows selected. `levels` is already the effective list — declared
+    // efforts when the account set them, else the profile ladder — so the last
+    // entry is the model's top tier.
+    let default_level = levels
+        .last()
+        .map(String::as_str)
+        .unwrap_or(profile.default_level)
+        .to_string();
+    let levels = levels
+        .into_iter()
+        .map(|effort| {
+            json!({
+                "effort": effort,
+                "description": codex_reasoning_description(&effort),
+            })
+        })
+        .collect();
+    (levels, default_level)
+}
+
+pub(crate) fn codex_model_catalog_payload(
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+) -> Value {
+    codex_model_catalog_payload_with_baseline(members, mode, None)
+}
+
+pub(crate) fn codex_model_catalog_payload_with_baseline(
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+) -> Value {
+    let models = advertised_model_catalog_entries_with_baseline(
+        "codex",
+        members,
+        mode,
+        baseline_models,
+    )
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| {
+            // Keyed by the bare alias: the reasoning table knows `gpt-5.6-sol`,
+            // never `Grox/gpt-5.6-sol`.
+            let (supported_reasoning_levels, default_reasoning_level) =
+                codex_reasoning_metadata(&model.base_id, model.reasoning_levels.as_deref());
+            let context_window =
+                codex_effective_context_window(model.context_window, &model.upstream_model);
+            let input_modalities = if model.supports_image_input {
+                json!(["text", "image"])
+            } else {
+                json!(["text"])
+            };
+            json!({
+                "additional_speed_tiers": [],
+                "availability_nux": null,
+                "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+                "context_window": context_window,
+                "default_reasoning_level": default_reasoning_level,
+                "default_reasoning_summary": "none",
+                "description": model.description,
+                "display_name": model.id,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": input_modalities,
+                "max_context_window": context_window,
+                "priority": index as i32 + 1,
+                "service_tiers": [],
+                "shell_type": "shell_command",
+                "slug": model.id,
+                "support_verbosity": false,
+                "supported_in_api": true,
+                "supported_reasoning_levels": supported_reasoning_levels,
+                "supports_image_detail_original": false,
+                "supports_parallel_tool_calls": false,
+                "supports_reasoning_summaries": true,
+                "supports_search_tool": false,
+                "truncation_policy": { "mode": "bytes", "limit": 10000 },
+                "upgrade": null,
+                "visibility": "list"
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({ "models": models })
+}
+
+fn codex_reasoning_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Maximum reasoning with automatic task delegation",
+        _ => "Reasoning effort",
+    }
+}
+
+pub(crate) fn requested_model_from_body(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+        })
+}
+
+pub(crate) fn parse_model_capability(config_json: &str) -> ModelCapability {
+    let mappings = serde_json::from_str::<Value>(config_json)
+        .ok()
+        .map(|value| parse_model_capability_value(&value))
+        .map(|capability| capability.mappings)
+        .unwrap_or_default();
+
+    ModelCapability { mappings }
+}
+
+pub(crate) fn parse_model_capability_value(config: &Value) -> ModelCapability {
+    // Deserialized one entry at a time on purpose. `from_value::<Vec<ModelMapping>>`
+    // fails the whole array on a single bad field, and `.ok().unwrap_or_default()`
+    // then turns that into "this account has no mappings" — which is not a
+    // degraded state but a different one: an account with no mappings accepts
+    // every model and rewrites nothing. A hand-edited `context_window` of `-1`,
+    // `4e5`, or `"400000"` used to silently reroute every request for that
+    // account. A bad entry now drops alone and its siblings still apply.
+    let mappings = config
+        .get("model_mappings")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value::<ModelMapping>(entry.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|mapping| {
+            !is_placeholder_model(&mapping.from) && !is_placeholder_model(&mapping.to)
+        })
+        .collect();
+
+    ModelCapability { mappings }
+}
+
+pub(crate) fn model_matches(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+) -> bool {
+    model_matches_with_baseline(platform, capability, requested_model, mode, None)
+}
+
+pub(crate) fn model_matches_with_baseline(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+    baseline_models: Option<&[String]>,
+) -> bool {
+    let Some(requested_model) = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return true;
+    };
+
+    if capability.mappings.is_empty() {
+        return effective_baseline_models(platform, baseline_models)
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(requested_model));
+    }
+
+    specific_mapping_for_request(&capability.mappings, requested_model, mode).is_some()
+        || capability.mappings.iter().any(is_fallback_mapping)
+}
+
+pub(crate) fn supports_requested_model(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+) -> bool {
+    supports_requested_model_with_mode(
+        platform,
+        capability,
+        requested_model,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+pub(crate) fn supports_requested_model_with_mode(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+) -> bool {
+    supports_requested_model_with_mode_with_baseline(
+        platform,
+        capability,
+        requested_model,
+        mode,
+        None,
+    )
+}
+
+pub(crate) fn supports_requested_model_with_mode_with_baseline(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    mode: ModelMatchMode,
+    baseline_models: Option<&[String]>,
+) -> bool {
+    model_matches_with_baseline(platform, capability, requested_model, mode, baseline_models)
+}
+
+pub(crate) fn supports_requested_capability(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    requested_capability: &str,
+) -> bool {
+    supports_requested_capability_with_mode(
+        platform,
+        capability,
+        requested_model,
+        requested_capability,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+pub(crate) fn supports_requested_capability_with_mode(
+    platform: &str,
+    capability: &ModelCapability,
+    requested_model: Option<&str>,
+    requested_capability: &str,
+    mode: ModelMatchMode,
+) -> bool {
+    let Some(requested_model) = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return false;
+    };
+    let requested_capability = requested_capability.trim();
+    if requested_capability.is_empty() || capability.mappings.is_empty() {
+        return false;
+    }
+
+    specific_mapping_for_request(&capability.mappings, requested_model, mode).is_some_and(
+        |mapping| {
+            mapping
+                .capabilities
+                .iter()
+                .any(|value| value.trim().eq_ignore_ascii_case(requested_capability))
+        },
+    ) && supports_requested_model_with_mode(platform, capability, Some(requested_model), mode)
+}
+
+/// Picks the upstream model for a request according to the vocabulary used by
+/// the caller. A specific match always beats the catch-all fallback, regardless
+/// of the fallback row's position in a hand-edited mapping list.
+pub(crate) fn resolve_mapping_target(
+    mappings: &[ModelMapping],
+    requested_model: &str,
+    mode: ModelMatchMode,
+) -> Option<String> {
+    specific_mapping_for_request(mappings, requested_model, mode)
+        .or_else(|| mappings.iter().find(|mapping| is_fallback_mapping(mapping)))
+        .map(|mapping| mapping.to.trim().to_string())
+}
+
+fn specific_mapping_for_request<'a>(
+    mappings: &'a [ModelMapping],
+    requested_model: &str,
+    mode: ModelMatchMode,
+) -> Option<&'a ModelMapping> {
+    let requested_model = requested_model.trim();
+    match mode {
+        ModelMatchMode::NativeAlias => mappings.iter().find(|mapping| {
+            !is_fallback_mapping(mapping) && mapping_from_matches(&mapping.from, requested_model)
+        }),
+        ModelMatchMode::ClientFacing => mappings
+            .iter()
+            .find(|mapping| {
+                !is_fallback_mapping(mapping)
+                    && mapping_from_matches(&mapping.from, requested_model)
+            })
+            .or_else(|| {
+                mappings.iter().find(|mapping| {
+                    !is_fallback_mapping(mapping)
+                        && mapping_to_matches(&mapping.to, requested_model)
+                })
+            }),
+        ModelMatchMode::Upstream => mappings.iter().find(|mapping| {
+            !is_fallback_mapping(mapping) && mapping_to_matches(&mapping.to, requested_model)
+        }),
+    }
+}
+
+/// The key a `(account, model)` failure state is recorded under.
+///
+/// For `api` accounts this is the upstream model the request is rewritten to, so
+/// a relay that rate-limits one upstream model parks exactly that one — and a
+/// catch-all mapping funnels every client alias onto a single key instead of
+/// letting each alias hit the wall separately.
+///
+pub(crate) fn model_state_key(
+    platform: &str,
+    capability: &ModelCapability,
+    kind: &str,
+    requested_model: &str,
+) -> String {
+    model_state_key_with_mode(
+        platform,
+        capability,
+        kind,
+        requested_model,
+        ModelMatchMode::ClientFacing,
+    )
+}
+
+pub(crate) fn model_state_key_with_mode(
+    platform: &str,
+    capability: &ModelCapability,
+    _kind: &str,
+    requested_model: &str,
+    mode: ModelMatchMode,
+) -> String {
+    let requested = strip_one_m_suffix_for_route_lookup(requested_model);
+    let _ = platform;
+    resolve_mapping_target(&capability.mappings, requested, mode)
+        .map(|target| strip_one_m_suffix_for_route_lookup(&target).to_string())
+        .unwrap_or_else(|| requested.to_string())
+}
+
+/// Map an upstream model key back to a client-facing alias, for places that must
+/// speak the request vocabulary (the model test takes `mapping.from`).
+pub(crate) fn alias_for_model_key(capability: &ModelCapability, model_key: &str) -> Option<String> {
+    aliases_for_model_key(capability, model_key)
+        .into_iter()
+        .next()
+}
+
+/// Every client-facing alias pointing at this upstream model. A relay config can
+/// route two aliases to one upstream model, and the UI shows them all so users
+/// recognise the row by the name they typed.
+pub(crate) fn aliases_for_model_key(capability: &ModelCapability, model_key: &str) -> Vec<String> {
+    capability
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            !is_fallback_mapping(mapping)
+                && strip_one_m_suffix_for_route_lookup(&mapping.to) == model_key
+        })
+        .map(|mapping| mapping.from.trim().to_string())
+        .collect()
+}
+
+/// Every model key this account could ever produce. Used as the denominator when
+/// deciding whether an account-level escalation is due, and to list models the
+/// user may pause before any of them has failed.
+pub(crate) fn known_upstream_models(
+    platform: &str,
+    capability: &ModelCapability,
+    kind: &str,
+) -> Vec<String> {
+    known_upstream_models_with_baseline(platform, capability, kind, None)
+}
+
+pub(crate) fn known_upstream_models_with_baseline(
+    platform: &str,
+    capability: &ModelCapability,
+    _kind: &str,
+    baseline_models: Option<&[String]>,
+) -> Vec<String> {
+    if capability.mappings.is_empty() {
+        return effective_baseline_models(platform, baseline_models);
+    }
+
+    let mut models = Vec::new();
+    for mapping in &capability.mappings {
+        let target = strip_one_m_suffix_for_route_lookup(&mapping.to);
+        if target.is_empty() || models.iter().any(|model| model == target) {
+            continue;
+        }
+        models.push(target.to_string());
+    }
+    models
+}
+
+/// 能力过滤的判定：`None` 表示不过滤（文本平台）。
+fn mapping_declares(mapping: &ModelMapping, capability: Option<&str>) -> bool {
+    match capability {
+        None => true,
+        Some(capability) => mapping
+            .capabilities
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(capability)),
+    }
+}
+
+pub(crate) fn advertised_model_ids(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+) -> Vec<String> {
+    advertised_model_ids_with_baseline(platform, members, mode, None)
+}
+
+pub(crate) fn advertised_model_ids_with_baseline(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+) -> Vec<String> {
+    advertised_model_catalog_entries_with_baseline(platform, members, mode, baseline_models)
+        .into_iter()
+        .map(|model| model.id)
+        .collect()
+}
+
+/// The pool's client-facing word list.
+///
+/// In [`PoolModelMode::Aggregate`] every member contributes into one shared,
+/// de-duplicated list — two accounts offering `gpt-5.6-sol` produce one entry and
+/// the router rotates between them. In [`PoolModelMode::Precise`] each entry id is
+/// prefixed with its member's prefix, so the ids no longer collide across API
+/// accounts and each one addresses exactly the account that declared it. Official
+/// members all carry the reserved prefix, so they still merge into one entry set
+/// and still rotate.
+pub(crate) fn advertised_model_catalog_entries(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+) -> Vec<AdvertisedModel> {
+    advertised_model_catalog_entries_with_capability(platform, members, mode, None)
+}
+
+pub(crate) fn advertised_model_catalog_entries_with_baseline(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+) -> Vec<AdvertisedModel> {
+    advertised_model_catalog_entries_with_baseline_and_capability(
+        platform,
+        members,
+        mode,
+        baseline_models,
+        None,
+    )
+}
+
+/// 与 [`advertised_model_catalog_entries`] 相同，但可以只保留**显式声明了某个能力**
+/// 的映射。
+///
+/// 为什么需要：视频端点在选账号时强制要求映射声明 `video.generate`
+/// （`requested_video_capability` → `filter_candidates_for_capability_with_mode`），
+/// 所以 `/v1/models` 若把没声明该能力的模型也列出来，就会出现「列表里有、提交必 400」。
+/// 文本端点没有这一层（能力过滤只对图像/视频生效），那里传 `None` 保持原行为。
+pub(crate) fn advertised_model_catalog_entries_with_capability(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+    capability_filter: Option<&str>,
+) -> Vec<AdvertisedModel> {
+    advertised_model_catalog_entries_with_baseline_and_capability(
+        platform,
+        members,
+        mode,
+        None,
+        capability_filter,
+    )
+}
+
+pub(crate) fn advertised_model_catalog_entries_with_baseline_and_capability(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+    baseline_models: Option<&[String]>,
+    capability_filter: Option<&str>,
+) -> Vec<AdvertisedModel> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    // A fallback-carrying account accepts any model, so it advertises the
+    // platform baseline exactly like an empty-mapping wildcard does. Walked per
+    // account rather than once for the pool: two catch-all accounts can rewrite
+    // the same baseline alias to different upstream models, and the merge needs
+    // to see both claims to pick the larger window.
+    for member in members {
+        let capability = &member.capability;
+        let fallback_target = capability
+            .mappings
+            .iter()
+            .find(|mapping| is_fallback_mapping(mapping))
+            .filter(|mapping| mapping_declares(mapping, capability_filter))
+            .map(|mapping| mapping.to.trim())
+            .filter(|to| !to.is_empty());
+        if !capability.mappings.is_empty() && fallback_target.is_none() {
+            continue;
+        }
+        for model in effective_baseline_models(platform, baseline_models) {
+            let model = model.as_str();
+            let id = catalog_entry_id(mode, member, model);
+            push_unique_model(
+                platform,
+                &mut models,
+                &mut seen,
+                ModelContribution {
+                    id: &id,
+                    base_id: model,
+                    description: model,
+                    // A catch-all rewrites every alias to one upstream model, so
+                    // that is what serves this baseline entry and what its
+                    // window has to be read off. An empty-mapping account
+                    // rewrites nothing, so the baseline model is its own
+                    // upstream.
+                    upstream_model: fallback_target.unwrap_or(model),
+                    context_window: None,
+                    reasoning_levels: None,
+                    supports_one_m: None,
+                    supports_image_input: default_supports_image_input(
+                        fallback_target.unwrap_or(model),
+                    ),
+                },
+            );
+        }
+    }
+
+    for member in members {
+        for mapping in &member.capability.mappings {
+            // The catch-all sentinel is not a model id — advertising it would put
+            // `FALLBACK_MODEL_ALIAS` in front of users as if it were something
+            // they could pick. Its baseline contribution is handled above.
+            if is_fallback_mapping(mapping) {
+                continue;
+            }
+            if !mapping_declares(mapping, capability_filter) {
+                continue;
+            }
+            let from = mapping.from.trim();
+            let to = mapping.to.trim();
+            let description = if from.eq_ignore_ascii_case(to) {
+                from.to_string()
+            } else {
+                format!("映射的上游模型：{to}")
+            };
+            let id = catalog_entry_id(mode, member, from);
+            let contribution = ModelContribution {
+                id: &id,
+                base_id: from,
+                description: &description,
+                upstream_model: to,
+                context_window: mapping.context_window,
+                reasoning_levels: mapping.reasoning_levels.as_deref(),
+                supports_one_m: None,
+                supports_image_input: mapping
+                    .supports_image_input
+                    .unwrap_or_else(|| default_supports_image_input(to)),
+            };
+            push_unique_model(platform, &mut models, &mut seen, contribution);
+
+            if platform == "claude" && mapping.supports_1m == Some(true) {
+                let base = strip_one_m_suffix_for_route_lookup(&mapping.from);
+                if is_claude_route_model(base) {
+                    let one_m = format!("{base}[1m]");
+                    let one_m_id = catalog_entry_id(mode, member, &one_m);
+                    push_unique_model(
+                        platform,
+                        &mut models,
+                        &mut seen,
+                        ModelContribution {
+                            id: &one_m_id,
+                            base_id: &one_m,
+                            ..contribution
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    models
+}
+
+/// Model catalog entries for **third-party client config writes** (ZCode,
+/// WorkBuddy, Qoder CLI, DeepSeek Harness).
+///
+/// Unlike [`advertised_model_catalog_entries`] — which outputs the `from` alias
+/// because Claude Code's native config needs it — this function outputs the
+/// `to` (upstream model name) as the model id.  Third-party clients have no
+/// Claude Code alias limitation; they show real upstream model names so users
+/// recognise what they are selecting.
+///
+/// Key differences from [`advertised_model_catalog_entries`]:
+/// - **Aggregate mode**: `to` is the model id, deduplicated across accounts.
+/// - **Precise mode**: `{prefix}/{to}` is the model id.
+/// - Skips fallback mappings (`claude-model`) and baseline aliases
+///   (`claude-sonnet-alias` etc.) — only real `from -> to` mappings produce
+///   entries.
+/// - No `[1m]` variant expansion: third-party clients do not use the Claude
+///   1M marker.
+/// - `base_id` is `to` (the upstream model name), so context-window lookup
+///   keys on the real model.
+/// - `supports_image_input` and `context_window` merge logic is identical
+///   (AND-merge for images, max-merge for windows).
+pub(crate) fn client_facing_model_catalog_entries(
+    platform: &str,
+    members: &[ModelCatalogMember],
+    mode: PoolModelMode,
+) -> Vec<AdvertisedModel> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    for member in members {
+        for mapping in &member.capability.mappings {
+            // Skip fallback mappings (claude-model) — they are catch-all
+            // sentinels, not real model entries.
+            if is_fallback_mapping(mapping) {
+                continue;
+            }
+            let to = mapping.to.trim();
+            if to.is_empty() {
+                continue;
+            }
+            let id = catalog_entry_id(mode, member, to);
+            let description = to.to_string();
+            push_unique_model(
+                platform,
+                &mut models,
+                &mut seen,
+                ModelContribution {
+                    id: &id,
+                    base_id: to,
+                    description: &description,
+                    upstream_model: to,
+                    context_window: mapping.context_window,
+                    reasoning_levels: mapping.reasoning_levels.as_deref(),
+                    supports_one_m: (platform == "claude")
+                        .then_some(mapping.supports_1m == Some(true)),
+                    supports_image_input: mapping
+                        .supports_image_input
+                        .unwrap_or_else(|| default_supports_image_input(to)),
+                },
+            );
+        }
+    }
+
+    models
+}
+
+/// The id one member contributes for one alias. Precise mode is the only place a
+/// prefix appears, so aggregate output stays byte-identical to what the pool
+/// advertised before the mode existed.
+fn catalog_entry_id(mode: PoolModelMode, member: &ModelCatalogMember, alias: &str) -> String {
+    match mode {
+        PoolModelMode::Aggregate => alias.to_string(),
+        PoolModelMode::Precise => format!("{}/{}", member.prefix, alias),
+    }
+}
+
+/// Resolve the baseline list for a call site. An absent or empty override keeps
+/// the platform's built-in defaults, so legacy callers and unconfigured pools
+/// behave exactly as before.
+fn effective_baseline_models(platform: &str, baseline_models: Option<&[String]>) -> Vec<String> {
+    match baseline_models.filter(|models| !models.is_empty()) {
+        Some(models) => models.to_vec(),
+        None => default_client_models(platform)
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect(),
+    }
+}
+
+fn default_client_models(platform: &str) -> &'static [&'static str] {
+    match platform {
+        "codex" => &[
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+        ],
+        "claude" => &[
+            "claude-sonnet-alias",
+            "claude-opus-alias",
+            "claude-fable-alias",
+            "claude-haiku-alias",
+        ],
+        "gemini" => &["gemini-2.5-flash"],
+        "grok" => &["grok-4.5"],
+        _ => &[],
+    }
+}
+
+/// One account's claim on a model id, before the ids are deduped across the
+/// pool.
+#[derive(Clone, Copy)]
+struct ModelContribution<'a> {
+    id: &'a str,
+    /// `id` without the account prefix — the name any model-name table is keyed
+    /// by.
+    base_id: &'a str,
+    description: &'a str,
+    upstream_model: &'a str,
+    context_window: Option<u32>,
+    reasoning_levels: Option<&'a [String]>,
+    supports_image_input: bool,
+    supports_one_m: Option<bool>,
+}
+
+/// One source's claim on this alias's window, with the Codex per-upstream
+/// default already filled in.
+///
+/// Resolving the default *before* the maximum is what makes the maximum mean
+/// anything on Codex: two accounts can disagree about an alias without either
+/// declaring a number, because the Codex default is read off the model the alias
+/// is mapped *to* and each account maps it somewhere different. Left to the
+/// single late resolution in the catalog, whichever account happened to put its
+/// `upstream_model` in the entry first decided the window for the whole pool.
+///
+/// Other platforms derive their default from the alias itself (the `[1m]`
+/// suffix), which every source spells the same way, so `None` still means "let
+/// the client's own default apply".
+fn contribution_context_window(
+    platform: &str,
+    contribution: &ModelContribution<'_>,
+) -> Option<u32> {
+    let declared = contribution.context_window.filter(|window| *window > 0);
+    if let Some(supports_one_m) = contribution.supports_one_m {
+        return supports_one_m.then_some(CLAUDE_ONE_M_CONTEXT_WINDOW);
+    }
+    if platform != "codex" {
+        return declared;
+    }
+    Some(codex_effective_context_window(
+        declared,
+        contribution.upstream_model,
+    ))
+}
+
+fn push_unique_model(
+    platform: &str,
+    models: &mut Vec<AdvertisedModel>,
+    seen: &mut HashSet<String>,
+    contribution: ModelContribution<'_>,
+) {
+    let trimmed = contribution.id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let claimed_window = contribution_context_window(platform, &contribution);
+    let key = trimmed.to_ascii_lowercase();
+    if seen.insert(key) {
+        models.push(AdvertisedModel {
+            id: trimmed.to_string(),
+            base_id: contribution.base_id.trim().to_string(),
+            description: contribution.description.to_string(),
+            upstream_model: contribution.upstream_model.trim().to_string(),
+            context_window: claimed_window,
+            reasoning_levels: contribution.reasoning_levels.map(<[String]>::to_vec),
+            supports_image_input: contribution.supports_image_input,
+            supports_one_m: contribution.supports_one_m,
+        });
+    } else if let Some(existing) = models
+        .iter_mut()
+        .find(|entry| entry.id.eq_ignore_ascii_case(trimmed))
+    {
+        if existing.description == existing.base_id && contribution.description != trimmed {
+            existing.description = contribution.description.to_string();
+        }
+        // A baseline contribution names itself as its own upstream, because a
+        // baseline model is forwarded unrewritten. That placeholder gives way to
+        // a real mapping so the entry names the model that actually serves the
+        // request. The advertised window no longer rides on winning this race:
+        // every contribution resolves its own default before the merge.
+        //
+        // Compared against `base_id` rather than `id` so precise mode behaves the
+        // same: there the id carries an account prefix the upstream name never has.
+        if existing
+            .upstream_model
+            .eq_ignore_ascii_case(&existing.base_id)
+            && !contribution
+                .upstream_model
+                .eq_ignore_ascii_case(contribution.base_id)
+        {
+            existing.upstream_model = contribution.upstream_model.trim().to_string();
+        }
+        // Two accounts can advertise one alias, and routing alternates between
+        // them. Claude third-party 1M claims merge conservatively (AND); every
+        // other context window keeps the existing largest-claim behavior.
+        // Reconciling downward instead capped the alias at the smallest account
+        // in the pool, so adding one 128K relay silently shrank a 1M model on
+        // every turn — a permanent cost, paid whichever account the request
+        // lands on. Going up costs a turn that overflows the smaller account and
+        // comes back 400, which points at the account whose window needs fixing.
+        existing.supports_one_m = match (existing.supports_one_m, contribution.supports_one_m) {
+            (Some(current), Some(incoming)) => Some(current && incoming),
+            (current, incoming) => current.or(incoming),
+        };
+        existing.context_window = if let Some(supports_one_m) = existing.supports_one_m {
+            supports_one_m.then_some(CLAUDE_ONE_M_CONTEXT_WINDOW)
+        } else {
+            match (existing.context_window, claimed_window) {
+                (Some(current), Some(incoming)) => Some(current.max(incoming)),
+                (current, incoming) => current.or(incoming),
+            }
+        };
+        existing.supports_image_input =
+            existing.supports_image_input && contribution.supports_image_input;
+        existing.reasoning_levels = match (
+            existing.reasoning_levels.take(),
+            contribution.reasoning_levels,
+        ) {
+            // Both declared: only the efforts every account offers survive. An
+            // empty intersection falls back to the profile rather than
+            // advertising a model with no reasoning tier at all.
+            (Some(current), Some(incoming)) => {
+                let intersection = current
+                    .iter()
+                    .filter(|level| incoming.iter().any(|other| other == *level))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if intersection.is_empty() {
+                    None
+                } else {
+                    Some(intersection)
+                }
+            }
+            (current, incoming) => current.or_else(|| incoming.map(<[String]>::to_vec)),
+        };
+    }
+}
+
+fn is_placeholder_model(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value == "upstream-model"
+}
+
+fn mapping_from_matches(mapping_from: &str, requested_model: &str) -> bool {
+    let mapping_from = mapping_from.trim();
+    let requested_model = requested_model.trim();
+    if mapping_from == requested_model {
+        return true;
+    }
+
+    match (
+        claude_route_lookup_model(mapping_from),
+        claude_route_lookup_model(requested_model),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn mapping_to_matches(mapping_to: &str, requested_model: &str) -> bool {
+    let mapping_to = mapping_to.trim();
+    !mapping_to.is_empty() && mapping_to.eq_ignore_ascii_case(requested_model.trim())
+}
+
+fn claude_route_lookup_model(model: &str) -> Option<&str> {
+    let stripped = strip_one_m_suffix_for_route_lookup(model);
+    if is_claude_route_model(stripped) {
+        Some(stripped)
+    } else {
+        None
+    }
+}
+
+fn strip_one_m_suffix_for_route_lookup(model: &str) -> &str {
+    const ONE_M_CONTEXT_MARKER: &str = "[1m]";
+    let trimmed = model.trim();
+    let marker = ONE_M_CONTEXT_MARKER.as_bytes();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= marker.len()
+        && bytes[bytes.len() - marker.len()..].eq_ignore_ascii_case(marker)
+    {
+        return trimmed[..trimmed.len() - marker.len()].trim_end();
+    }
+    trimmed
+}
+
+fn is_claude_route_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.starts_with("claude-") || lower.starts_with("anthropic/claude-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        alias_for_model_key, catalog_members, codex_default_context_window,
+        codex_effective_context_window, codex_reasoning_levels, codex_reasoning_metadata,
+        codex_reasoning_profile, default_third_party_reasoning_levels, known_upstream_models,
+        mapping_declares_one_m_context, model_matches, model_state_key, parse_model_capability,
+        requested_model_from_body, resolve_mapping_target, supports_requested_capability,
+        supports_requested_model, AdvertisedModel, CatalogMemberInput, ModelCapability,
+        ModelCatalogMember, ModelMatchMode, CODEX_ONE_M_CONTEXT_WINDOW,
+    };
+    use crate::models::route_credential::{ModelMapping, FALLBACK_MODEL_ALIAS};
+    use crate::services::route_pool_model_mode::PoolModelMode;
+    use serde_json::{json, Value};
+
+    /// Each capability as its own API account. Aggregate mode ignores kinds and
+    /// prefixes, so this describes exactly the pool the pre-mode tests meant.
+    fn api_members(capabilities: &[ModelCapability]) -> Vec<ModelCatalogMember> {
+        capabilities
+            .iter()
+            .map(|capability| ModelCatalogMember {
+                kind: "api".to_string(),
+                prefix: "acct".to_string(),
+                capability: capability.clone(),
+            })
+            .collect()
+    }
+
+    // The pre-mode signatures, kept so every assertion written against the
+    // aggregated word list keeps proving that list did not move.
+    fn advertised_model_ids(platform: &str, capabilities: &[ModelCapability]) -> Vec<String> {
+        super::advertised_model_ids(
+            platform,
+            &api_members(capabilities),
+            PoolModelMode::Aggregate,
+        )
+    }
+
+    fn advertised_model_catalog_entries(
+        platform: &str,
+        capabilities: &[ModelCapability],
+    ) -> Vec<AdvertisedModel> {
+        super::advertised_model_catalog_entries(
+            platform,
+            &api_members(capabilities),
+            PoolModelMode::Aggregate,
+        )
+    }
+
+    fn codex_model_catalog_payload(capabilities: &[ModelCapability]) -> Value {
+        super::codex_model_catalog_payload(&api_members(capabilities), PoolModelMode::Aggregate)
+    }
+    #[test]
+    fn configured_baseline_models_match_requests_without_mappings() {
+        let capability = parse_model_capability("{}");
+        let configured = vec!["custom-z".to_string()];
+
+        assert!(super::supports_requested_model_with_mode_with_baseline(
+            "codex",
+            &capability,
+            Some("custom-z"),
+            ModelMatchMode::ClientFacing,
+            Some(&configured),
+        ));
+        assert!(!super::supports_requested_model_with_mode_with_baseline(
+            "codex",
+            &capability,
+            Some("gpt-5.5"),
+            ModelMatchMode::ClientFacing,
+            Some(&configured),
+        ));
+    }
+
+    #[test]
+    fn configured_codex_baseline_models_replace_the_hardcoded_defaults() {
+        let capability = parse_model_capability("{}");
+        let members = api_members(&[capability.clone()]);
+        let configured = vec!["custom-z".to_string(), "custom-a".to_string()];
+
+        assert_eq!(
+            super::advertised_model_ids_with_baseline(
+                "codex",
+                &members,
+                PoolModelMode::Aggregate,
+                Some(&configured),
+            ),
+            vec!["custom-z", "custom-a"]
+        );
+        assert_eq!(
+            super::known_upstream_models_with_baseline(
+                "codex",
+                &capability,
+                "api",
+                Some(&configured),
+            ),
+            vec!["custom-z", "custom-a"]
+        );
+        assert_eq!(
+            super::advertised_model_ids_with_baseline(
+                "codex",
+                &members,
+                PoolModelMode::Aggregate,
+                None,
+            ),
+            vec![
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+            ]
+        );
+    }
+
+    /// One pool member for the precise-mode tests, which do care about kinds.
+    fn member(id: &str, display_name: &str, kind: &str, config_json: &str) -> ModelCatalogMember {
+        catalog_members(&[CatalogMemberInput {
+            id,
+            display_name,
+            kind,
+            config_json,
+        }])
+        .remove(0)
+    }
+
+    #[test]
+    fn codex_baseline_models_use_distinct_reasoning_profiles() {
+        let astra = codex_reasoning_profile("gpt-6-astra");
+        assert_eq!(astra.default_level, "medium");
+        assert_eq!(
+            astra.levels,
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+
+        let sol = codex_reasoning_profile("gpt-5.6-sol");
+        assert_eq!(sol.default_level, "low");
+        assert_eq!(
+            sol.levels,
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+
+        let terra = codex_reasoning_profile("gpt-5.6-terra");
+        assert_eq!(terra.default_level, "medium");
+        assert_eq!(terra.levels, sol.levels);
+
+        let luna = codex_reasoning_profile("gpt-5.6-luna");
+        assert_eq!(luna.levels, &["low", "medium", "high", "xhigh", "max"]);
+
+        let gpt_55 = codex_reasoning_profile("gpt-5.5");
+        assert_eq!(gpt_55.levels, &["low", "medium", "high", "xhigh"]);
+    }
+
+    #[test]
+    fn requested_model_reads_only_a_non_empty_top_level_model() {
+        assert_eq!(
+            requested_model_from_body(br#"{"model":"gpt-5.6-sol","input":"hi"}"#),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            requested_model_from_body(br#"{"nested":{"model":"gpt-5"}}"#),
+            None
+        );
+        assert_eq!(requested_model_from_body(br#"{"model":""}"#), None);
+        assert_eq!(requested_model_from_body(b"not-json"), None);
+    }
+
+    #[test]
+    fn empty_mappings_are_wildcard_and_non_empty_mappings_are_restricted() {
+        let wildcard = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let limited = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+
+        assert!(supports_requested_model(
+            "codex",
+            &wildcard,
+            Some("gpt-5.6-luna")
+        ));
+        assert!(!supports_requested_model(
+            "codex",
+            &wildcard,
+            Some("deepseek")
+        ));
+        assert!(supports_requested_model(
+            "codex",
+            &limited,
+            Some("gpt-5.6-sol")
+        ));
+        assert!(!supports_requested_model(
+            "codex",
+            &limited,
+            Some("gpt-5.6-luna")
+        ));
+        assert!(supports_requested_model("codex", &limited, None));
+    }
+
+    #[test]
+    fn image_capabilities_require_an_explicit_mapping_declaration() {
+        let legacy = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-image","to":"gpt-image-2.5"}]}"#,
+        );
+        let image = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-image","to":"gpt-image-2.5","capabilities":["image.generate","image.edit"]}]}"#,
+        );
+
+        assert!(!supports_requested_capability(
+            "codex",
+            &legacy,
+            Some("gpt-image"),
+            "image.generate",
+        ));
+        assert!(supports_requested_capability(
+            "codex",
+            &image,
+            Some("gpt-image"),
+            "image.generate",
+        ));
+        assert!(supports_requested_capability(
+            "codex",
+            &image,
+            Some("gpt-image"),
+            "image.edit",
+        ));
+        assert!(!supports_requested_capability(
+            "codex",
+            &image,
+            Some("gpt-image"),
+            "text.generate",
+        ));
+    }
+
+    #[test]
+    fn image_input_defaults_follow_the_upstream_model_and_explicit_overrides_survive() {
+        let supported = parse_model_capability(
+            r#"{"model_mappings":[{"from":"image-alias","to":"deepseek-v4.1"}]}"#,
+        );
+        let unsupported = parse_model_capability(
+            r#"{"model_mappings":[{"from":"no-image-alias","to":"deepseek-v4.1","supports_image_input":false}]}"#,
+        );
+        let text_only =
+            parse_model_capability(r#"{"model_mappings":[{"from":"glm-5.3","to":"glm-5.3"}]}"#);
+
+        let entries =
+            advertised_model_catalog_entries("codex", &[supported, unsupported, text_only]);
+
+        assert_eq!(entries[0].supports_image_input, true);
+        assert_eq!(entries[1].supports_image_input, false);
+        assert_eq!(entries[2].supports_image_input, false);
+    }
+
+    #[test]
+    fn codex_catalog_advertises_image_input_only_when_the_model_supports_it() {
+        let image_model =
+            parse_model_capability(r#"{"model_mappings":[{"from":"gpt-5.5","to":"gpt-5.5"}]}"#);
+        let text_model =
+            parse_model_capability(r#"{"model_mappings":[{"from":"glm-5.3","to":"glm-5.3"}]}"#);
+
+        let payload = codex_model_catalog_payload(&[image_model, text_model]);
+
+        assert_eq!(
+            payload["models"][0]["input_modalities"],
+            json!(["text", "image"])
+        );
+        assert_eq!(payload["models"][1]["input_modalities"], json!(["text"]));
+    }
+
+    #[test]
+    fn codex_advertised_models_add_baseline_only_for_wildcards() {
+        let wildcard = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let sol = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"},{"from":"custom","to":"custom-upstream"}]}"#,
+        );
+        let limited = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"sol-upstream"}]}"#,
+        );
+
+        assert_eq!(
+            advertised_model_ids("codex", &[wildcard, sol]),
+            vec![
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "custom"
+            ]
+        );
+        assert_eq!(
+            advertised_model_ids("codex", &[limited]),
+            vec!["gpt-5.6-sol"]
+        );
+    }
+
+    #[test]
+    fn codex_catalog_describes_upstream_model_for_mappings() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"deepseek-v4-flash-0731"},{"from":"gpt-5.5","to":"gpt-5.5"}]}"#,
+        );
+        let catalog = codex_model_catalog_payload(&[capability]);
+        let models = catalog["models"].as_array().expect("catalog models");
+
+        assert_eq!(models[0]["slug"], "gpt-5.6-sol");
+        assert_eq!(
+            models[0]["description"],
+            "映射的上游模型：deepseek-v4-flash-0731"
+        );
+        assert_eq!(models[1]["slug"], "gpt-5.5");
+        assert_eq!(models[1]["description"], "gpt-5.5");
+    }
+
+    #[test]
+    fn codex_reasoning_levels_fall_back_to_the_baseline_profile() {
+        // An absent list is what every mapping written before the field existed
+        // carries, so it has to keep meaning "the profile for this model id".
+        assert_eq!(
+            codex_reasoning_levels("gpt-5.6-luna", None),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            codex_reasoning_levels("some-relay-model", None),
+            vec!["low", "medium", "high"]
+        );
+        // An empty list is the same statement as no list: the UI writes one when
+        // the user unticks every box, and an empty menu would strand the client.
+        assert_eq!(
+            codex_reasoning_levels("gpt-5.5", Some(&[])),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn third_party_default_ladder_adds_max_for_deepseek_v4() {
+        // An unmatched relay model gets the conservative low/medium/high ladder.
+        assert_eq!(
+            default_third_party_reasoning_levels("some-audio-model"),
+            vec!["low", "medium", "high"]
+        );
+        // DeepSeek‑V4 upstreams additionally offer `max` — every dated or sized
+        // variant and every vendor-namespaced path is covered.
+        for upstream in [
+            "deepseek-v4",
+            "deepseek-v4-flash-0731",
+            "DeepSeek-V4.1",
+            "z-ai/deepseek-v4-flash",
+        ] {
+            assert_eq!(
+                default_third_party_reasoning_levels(upstream),
+                vec!["low", "medium", "high", "max"],
+                "upstream={upstream}"
+            );
+        }
+        // Other 1M families keep the conservative ladder — only deepseek-v4 gets
+        // the extra `max` tier, per the user's request.
+        assert_eq!(
+            default_third_party_reasoning_levels("glm-5.3"),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn a_known_baseline_model_advertises_its_own_ladder_to_third_party_clients() {
+        // Codex is shown all six of astra's tiers; a third-party client that only
+        // ever saw the generic three read as "this model has no reasoning
+        // control" — one model, two menus, depending on who asked.
+        assert_eq!(
+            default_third_party_reasoning_levels("gpt-6-astra"),
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(
+            default_third_party_reasoning_levels("gpt-5.6-luna"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // A relay's own id is still unknown, so it keeps the conservative three.
+        assert_eq!(
+            default_third_party_reasoning_levels("some-relay-model"),
+            vec!["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn codex_reasoning_levels_normalize_a_custom_list() {
+        let declared = [
+            " High ".to_string(),
+            "high".to_string(),
+            String::new(),
+            "ultra".to_string(),
+        ];
+        assert_eq!(
+            codex_reasoning_levels("gpt-5.6-sol", Some(&declared)),
+            vec!["high", "ultra"]
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_levels_never_falls_back_to_a_profile() {
+        use super::normalize_reasoning_levels;
+        // No declaration and an empty declaration both mean "the account
+        // configured nothing" — the third-party client writer must get an empty
+        // list back so it can omit the reasoning control, not a baseline
+        // low/medium/high the user never asked for.
+        assert!(normalize_reasoning_levels(None).is_empty());
+        assert!(normalize_reasoning_levels(Some(&[])).is_empty());
+        // Cleanup still applies: trim, lowercase, drop unrecognised, dedupe,
+        // preserve declared order.
+        let declared = [
+            " High ".to_string(),
+            "high".to_string(),
+            "insane".to_string(),
+            "low".to_string(),
+        ];
+        assert_eq!(
+            normalize_reasoning_levels(Some(&declared)),
+            vec!["high", "low"]
+        );
+    }
+
+    #[test]
+    fn codex_reasoning_metadata_preselects_the_highest_tier_in_a_custom_list() {
+        // A declared list no longer preselects the profile default (medium for
+        // gpt-5.5) when that effort is absent — it preselects the highest tier
+        // the list actually offers.
+        let (levels, default_level) =
+            codex_reasoning_metadata("gpt-5.5", Some(&["xhigh".to_string(), "max".to_string()]));
+        assert_eq!(
+            levels
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["xhigh", "max"]
+        );
+        assert_eq!(default_level, "max");
+
+        let (_, kept) =
+            codex_reasoning_metadata("gpt-5.5", Some(&["high".to_string(), "medium".to_string()]));
+        assert_eq!(kept, "medium");
+    }
+
+    #[test]
+    fn gpt_6_1_sol_defaults_to_max_because_its_upstream_rejects_ultra() {
+        // OpenAI Responses upstreams accept 'none','minimal','low','medium',
+        // 'high','xhigh','max' — `ultra` 400s. The default effort is the last
+        // advertised tier, so the baseline ladder must stop at `max`.
+        let (levels, default_level) = codex_reasoning_metadata("gpt-6.1-sol", None);
+        let efforts: Vec<&str> = levels
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect();
+        assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(default_level, "max");
+        assert!(!efforts.contains(&"ultra"));
+        assert_eq!(
+            default_third_party_reasoning_levels("gpt-6.1-sol"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn codex_catalog_honours_per_mapping_context_and_reasoning_overrides() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[
+                {"from":"gpt-5.6-sol","to":"upstream-sol","context_window":400000,"reasoning_levels":["medium","max"]},
+                {"from":"glm-5.3","to":"upstream-glm"}
+            ]}"#,
+        );
+        let catalog = codex_model_catalog_payload(&[capability]);
+        let models = catalog["models"].as_array().expect("catalog models");
+
+        assert_eq!(models[0]["context_window"], 400_000);
+        assert_eq!(models[0]["max_context_window"], 400_000);
+        assert_eq!(
+            models[0]["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["medium", "max"]
+        );
+        assert_eq!(models[0]["default_reasoning_level"], "max");
+
+        // An untouched row keeps the shipped defaults.
+        assert_eq!(models[1]["context_window"], 128_000);
+        assert_eq!(
+            models[1]["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_declaring_account_fills_the_overrides_a_wildcard_left_empty() {
+        // The wildcard contributes gpt-5.6-sol from the baseline with no
+        // overrides; the mapping that follows must still get its own numbers in.
+        let wildcard = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let declaring = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol","context_window":256000,"reasoning_levels":["high"]}]}"#,
+        );
+        let entries = advertised_model_catalog_entries("codex", &[wildcard, declaring]);
+        let sol = entries
+            .iter()
+            .find(|entry| entry.id == "gpt-5.6-sol")
+            .expect("sol entry");
+
+        // The existing maximum merge applies: the baseline account claims 272K
+        // while the mapped account declares 256K, so the advertised alias is 272K.
+        assert_eq!(sol.context_window, Some(272_000));
+        assert_eq!(
+            sol.reasoning_levels.as_deref(),
+            Some(&["high".to_string()][..])
+        );
+        // And the baseline's self-referential upstream gives way to the real one,
+        // so the default window is derived from what actually serves the request.
+        assert_eq!(sol.upstream_model, "upstream-sol");
+    }
+
+    /// A wildcard account contributes every baseline model naming *itself* as its
+    /// own upstream, because a baseline model is forwarded unrewritten. If that
+    /// placeholder survived the merge, one such account anywhere in the pool was
+    /// enough to size every alias off its own id — undoing the whole point of
+    /// reading the default window off the upstream.
+    #[test]
+    fn a_wildcard_account_does_not_pin_the_upstream_to_the_alias() {
+        let wildcard = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let declaring =
+            parse_model_capability(r#"{"model_mappings":[{"from":"gpt-5.5","to":"glm-5.3"}]}"#);
+        let entries = advertised_model_catalog_entries("codex", &[wildcard, declaring]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "gpt-5.5")
+            .expect("gpt-5.5 entry");
+
+        assert_eq!(entry.upstream_model, "glm-5.3");
+        // glm-5.3 is a known 1M family, so the advertised window follows it rather
+        // than the generic default the alias name would have produced.
+        assert_eq!(
+            codex_effective_context_window(entry.context_window, &entry.upstream_model),
+            CODEX_ONE_M_CONTEXT_WINDOW
+        );
+    }
+
+    /// Routing alternates between accounts that advertise the same alias, so the
+    /// pool has to pick one number for it. It picks the largest: capping the
+    /// alias at the smallest account in the pool made one 128K relay shrink a 1M
+    /// model on every turn, including the turns that landed on an account which
+    /// could have served the full window.
+    #[test]
+    fn accounts_disagreeing_about_one_alias_are_reconciled_upward() {
+        let generous = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.5","to":"up-a","context_window":1000000,"reasoning_levels":["low","medium","high","xhigh"]}]}"#,
+        );
+        let modest = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.5","to":"up-b","context_window":128000,"reasoning_levels":["medium","high"]}]}"#,
+        );
+
+        for order in [
+            vec![generous.clone(), modest.clone()],
+            vec![modest, generous],
+        ] {
+            let entries = advertised_model_catalog_entries("codex", &order);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == "gpt-5.5")
+                .expect("gpt-5.5 entry");
+
+            // The larger window regardless of which account came first.
+            assert_eq!(entry.context_window, Some(1_000_000));
+            // Reasoning still narrows to what both accounts offer: an effort the
+            // upstream cannot express is silently dropped from the request rather
+            // than reported, so there is nothing for the user to act on.
+            let levels = entry.reasoning_levels.clone().expect("levels");
+            assert!(levels.contains(&"medium".to_string()));
+            assert!(levels.contains(&"high".to_string()));
+            assert!(!levels.contains(&"low".to_string()));
+            assert!(!levels.contains(&"xhigh".to_string()));
+        }
+    }
+
+    /// The Codex default is read off the model an alias is mapped *to*, so two
+    /// accounts can disagree about the window without either declaring one. The
+    /// maximum has to see both defaults, not just both declarations — otherwise
+    /// the account whose `upstream_model` landed in the entry first decided the
+    /// window for the pool.
+    #[test]
+    fn undeclared_accounts_disagreeing_through_their_upstreams_still_take_the_larger() {
+        let one_m =
+            parse_model_capability(r#"{"model_mappings":[{"from":"gpt-5.5","to":"glm-5.3"}]}"#);
+        let generic = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.5","to":"some-relay-model"}]}"#,
+        );
+
+        for order in [vec![one_m.clone(), generic.clone()], vec![generic, one_m]] {
+            let entries = advertised_model_catalog_entries("codex", &order);
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == "gpt-5.5")
+                .expect("gpt-5.5 entry");
+
+            assert_eq!(entry.context_window, Some(CODEX_ONE_M_CONTEXT_WINDOW));
+        }
+    }
+
+    /// A catch-all account rewrites *every* alias to one upstream model, so the
+    /// baseline models it contributes are served by that model — not by the
+    /// gpt id the client asked for. Sizing them off their own id told Codex 128K
+    /// for a pool serving 1M.
+    #[test]
+    fn a_catch_all_account_sizes_the_baseline_off_its_rewrite_target() {
+        let capability = parse_model_capability(&format!(
+            r#"{{"model_mappings":[{{"from":"{FALLBACK_MODEL_ALIAS}","to":"deepseek-v4-flash"}}]}}"#
+        ));
+        let entries = advertised_model_catalog_entries("codex", &[capability]);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol entry");
+
+        assert_eq!(entry.upstream_model, "deepseek-v4-flash");
+        assert_eq!(entry.context_window, Some(CODEX_ONE_M_CONTEXT_WINDOW));
+    }
+
+    /// Binds this file's tables to the TypeScript copy in
+    /// `src/lib/codexModelCapability.ts` through a checked-in fixture.
+    ///
+    /// The editor has to know the same ladders in order to preselect and label
+    /// them before the account is saved, so the two exist in parallel. They were
+    /// consistent by luck: nothing failed when one moved. A drift is not cosmetic
+    /// either — the editor would offer an effort the catalog then filters out, or
+    /// show "default" for a window the catalog sizes differently.
+    #[test]
+    fn the_capability_tables_match_the_shared_fixture() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("codex-model-capability.json"),
+        )
+        .expect("read fixture");
+        let fixture: Value = serde_json::from_str(&raw).expect("fixture json");
+        let as_json = |value: &[&str]| Value::from(value.to_vec());
+
+        assert_eq!(
+            fixture["recognised_reasoning_efforts"],
+            as_json(crate::services::route_protocol_bridge::RECOGNISED_REASONING_EFFORTS)
+        );
+        for (model, levels) in fixture["baseline_reasoning_profiles"]
+            .as_object()
+            .expect("profiles")
+        {
+            assert_eq!(
+                as_json(codex_reasoning_profile(model).levels),
+                *levels,
+                "{model}"
+            );
+        }
+        // A model the profile table does not name falls back to this ladder.
+        assert_eq!(
+            as_json(codex_reasoning_profile("some-relay-model").levels),
+            fixture["default_reasoning_levels"]
+        );
+        // The third-party client ladder: conservative by default, with DeepSeek‑V4
+        // getting the extra `max` tier. Mirrors `thirdPartyDefaultReasoningLevels`
+        // on the TypeScript side.
+        assert_eq!(
+            Value::from(default_third_party_reasoning_levels("some-relay-model")),
+            fixture["third_party_default_reasoning_levels"]
+        );
+        let ladder = default_third_party_reasoning_levels("deepseek-v4-flash");
+        let extra = ladder.last().expect("a tier");
+        let expected_extra = fixture["third_party_deepseek_v4_extra_reasoning_level"]
+            .as_str()
+            .expect("extra tier");
+        assert_eq!(extra.as_str(), expected_extra);
+        assert_eq!(
+            fixture["default_context_window"],
+            Value::from(super::CODEX_DEFAULT_CONTEXT_WINDOW)
+        );
+        assert_eq!(
+            fixture["one_m_context_window"],
+            Value::from(CODEX_ONE_M_CONTEXT_WINDOW)
+        );
+        for (model, window) in fixture["baseline_context_windows"]
+            .as_object()
+            .expect("baseline context windows")
+        {
+            let window = window.as_u64().expect("context window");
+            assert_eq!(
+                codex_default_context_window(model) as u64,
+                window,
+                "{model}"
+            );
+        }
+        for prefix in fixture["one_m_upstream_prefixes"]
+            .as_array()
+            .expect("prefixes")
+        {
+            let prefix: &str = prefix.as_str().expect("prefix string");
+            assert_eq!(
+                codex_default_context_window(prefix),
+                CODEX_ONE_M_CONTEXT_WINDOW,
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_one_m_upstream_families_default_to_one_m() {
+        for upstream in [
+            "deepseek-v4",
+            "deepseek-v4-flash-0731",
+            "glm-5.2",
+            "glm-5.3-air",
+            "qwen-3.8-plus",
+            "kimi-k3-turbo",
+            // Relays that namespace by vendor must resolve the same way.
+            "z-ai/glm-5.3",
+            "moonshotai/kimi-k3",
+            // Case is the relay's choice, not a different model.
+            "DeepSeek-V4-Flash",
+        ] {
+            assert_eq!(
+                codex_default_context_window(upstream),
+                1_000_000,
+                "upstream={upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_serving_mapping_owns_the_one_m_declaration() {
+        // The declaration is per account, while the `[1M]` tag the client sends
+        // is written pool-wide and withheld from every account as soon as one of
+        // them lacks it. So the account that actually serves the request has to
+        // be the one whose `supports_1m` decides.
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-haiku-alias","to":"upstream-haiku"},{"from":"claude-model","to":"upstream-any","supports_1m":true}]}"#,
+        );
+
+        // The catch-all declares it, so an alias with no row of its own inherits
+        // the declaration.
+        assert!(mapping_declares_one_m_context(
+            &capability.mappings,
+            "claude-not-configured",
+            ModelMatchMode::ClientFacing
+        ));
+        // A row of its own wins over the catch-all — including when it declares
+        // nothing, which is the account that cannot serve 1M.
+        assert!(!mapping_declares_one_m_context(
+            &capability.mappings,
+            "claude-haiku-alias",
+            ModelMatchMode::ClientFacing
+        ));
+        // The `[1M]` suffix is the client's spelling of the same alias, not a
+        // second row: the lookup strips it before matching.
+        assert!(!mapping_declares_one_m_context(
+            &capability.mappings,
+            "claude-haiku-alias[1M]",
+            ModelMatchMode::ClientFacing
+        ));
+    }
+
+    #[test]
+    fn codex_baseline_models_carry_their_own_context_window() {
+        // 128K was a generic fallback, not the shipped baseline. Codex displays
+        // 95% of the declared window, which is where the old table's 121.6K came
+        // from.
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"] {
+            assert_eq!(
+                codex_default_context_window(model),
+                272_000,
+                "model={model}"
+            );
+        }
+        assert_eq!(codex_default_context_window("gpt-6-astra"), 1_050_000);
+        // 1M on the nose, unlike astra's slightly larger 1.05M window.
+        assert_eq!(codex_default_context_window("gpt-6.1-sol"), 1_000_000);
+    }
+
+    #[test]
+    fn a_wildcard_account_advertises_the_baseline_context_window() {
+        let wildcard = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let catalog = codex_model_catalog_payload(&[wildcard]);
+        let model = catalog["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .expect("baseline model");
+
+        assert_eq!(model["context_window"], 272_000);
+        assert_eq!(model["max_context_window"], 272_000);
+    }
+
+    #[test]
+    fn other_upstream_models_default_to_the_generic_window() {
+        for upstream in [
+            "some-relay-model",
+            // An older generation of the same family is not in the table.
+            "deepseek-v3-chat",
+            "glm-5.1",
+            "qwen-3.7",
+            "kimi-k2",
+            // A vendor path whose model half does not match either.
+            "openai/other-model",
+            "",
+        ] {
+            assert_eq!(
+                codex_default_context_window(upstream),
+                128_000,
+                "upstream={upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_window_outranks_the_upstream_default() {
+        assert_eq!(
+            codex_effective_context_window(Some(400_000), "deepseek-v4-flash"),
+            400_000
+        );
+        // Zero is not a window anything could serve, so the default still applies.
+        assert_eq!(
+            codex_effective_context_window(Some(0), "deepseek-v4-flash"),
+            1_000_000
+        );
+        assert_eq!(codex_effective_context_window(None, "gpt-5.5"), 272_000);
+        // A declaration still outranks the shipped baseline window.
+        assert_eq!(
+            codex_effective_context_window(Some(256_000), "gpt-5.5"),
+            256_000
+        );
+    }
+
+    #[test]
+    fn the_catalog_reads_the_default_off_the_upstream_not_the_alias() {
+        // The alias is a plain gpt id; only the mapped-to name says 1M. Reading
+        // the alias instead would advertise 256K for a model serving 1M.
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[
+                {"from":"gpt-5.6-sol","to":"deepseek-v4-flash-0731"},
+                {"from":"gpt-5.5","to":"gpt-5.5"}
+            ]}"#,
+        );
+        let catalog = codex_model_catalog_payload(&[capability]);
+        let models = catalog["models"].as_array().expect("catalog models");
+
+        assert_eq!(models[0]["slug"], "gpt-5.6-sol");
+        assert_eq!(models[0]["context_window"], 1_000_000);
+        assert_eq!(models[0]["max_context_window"], 1_000_000);
+        assert_eq!(models[1]["slug"], "gpt-5.5");
+        assert_eq!(models[1]["context_window"], 272_000);
+    }
+
+    #[test]
+    fn a_passthrough_one_m_mapping_is_advertised_at_one_m() {
+        // What the relay presets actually produce: from == to == the real model.
+        let capability =
+            parse_model_capability(r#"{"model_mappings":[{"from":"glm-5.3","to":"glm-5.3"}]}"#);
+        let catalog = codex_model_catalog_payload(&[capability]);
+
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
+    }
+
+    #[test]
+    fn claude_advertised_models_expand_one_m_and_dedupe_case_insensitively() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"sonnet","supports_1m":true},{"from":"CLAUDE-SONNET-ALIAS","to":"other"}]}"#,
+        );
+
+        assert_eq!(
+            advertised_model_ids("claude", &[capability]),
+            vec!["claude-sonnet-alias", "claude-sonnet-alias[1m]"]
+        );
+    }
+
+    #[test]
+    fn fallback_mapping_makes_any_model_supported() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"x"},{"from":"claude-model","to":"y"}]}"#,
+        );
+
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("claude-opus-alias")
+        ));
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("anything-at-all")
+        ));
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("claude-sonnet-alias")
+        ));
+        assert!(supports_requested_model("claude", &capability, None));
+    }
+
+    #[test]
+    fn fallback_mapping_is_never_advertised_but_contributes_baseline() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"x"},{"from":"claude-model","to":"y"}]}"#,
+        );
+        let advertised = advertised_model_ids("claude", &[capability]);
+
+        // A fallback account genuinely accepts anything, so it advertises the
+        // platform baseline just like an empty-mapping wildcard would.
+        assert_eq!(
+            advertised,
+            vec![
+                "claude-sonnet-alias",
+                "claude-opus-alias",
+                "claude-fable-alias",
+                "claude-haiku-alias"
+            ]
+        );
+        assert!(!advertised.iter().any(|model| model == FALLBACK_MODEL_ALIAS));
+    }
+
+    #[test]
+    fn fallback_only_capability_advertises_baseline_and_matches_everything() {
+        let capability =
+            parse_model_capability(r#"{"model_mappings":[{"from":"claude-model","to":"y"}]}"#);
+
+        assert_eq!(
+            advertised_model_ids("codex", &[capability.clone()]),
+            vec![
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5"
+            ]
+        );
+        assert!(supports_requested_model(
+            "codex",
+            &capability,
+            Some("deepseek")
+        ));
+    }
+
+    #[test]
+    fn resolve_mapping_target_prefers_specific_entries_regardless_of_order() {
+        // Fallback deliberately sits FIRST: a single-pass `.find()` would let it
+        // swallow every request, which is the bug this ordering guards against.
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-model","to":"fallback-upstream"},{"from":"claude-sonnet-alias","to":"sonnet-upstream","supports_1m":true}]}"#,
+        );
+        let mappings = &capability.mappings;
+
+        assert_eq!(
+            resolve_mapping_target(
+                mappings,
+                "claude-sonnet-alias",
+                ModelMatchMode::ClientFacing
+            ),
+            Some("sonnet-upstream".to_string())
+        );
+        assert_eq!(
+            resolve_mapping_target(mappings, "claude-haiku-alias", ModelMatchMode::ClientFacing),
+            Some("fallback-upstream".to_string())
+        );
+        assert_eq!(
+            resolve_mapping_target(
+                mappings,
+                "claude-sonnet-alias[1m]",
+                ModelMatchMode::ClientFacing
+            ),
+            Some("sonnet-upstream".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_mapping_target_returns_none_without_a_fallback() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"sonnet-upstream"}]}"#,
+        );
+
+        assert_eq!(
+            resolve_mapping_target(
+                &capability.mappings,
+                "claude-haiku-alias",
+                ModelMatchMode::ClientFacing,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_one_m_catch_all_row_is_not_advertised_under_either_name() {
+        // The catch-all alias now shares the `claude-` prefix with the real role
+        // aliases, so `is_claude_route_model` accepts it and no longer acts as a
+        // second line of defense in the 1M-variant expansion. Only the
+        // `is_fallback_mapping` guard keeps `claude-model[1m]` out of the catalog.
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"sonnet-upstream"},{"from":"claude-model","to":"fallback-upstream","supports_1m":true}]}"#,
+        );
+
+        let advertised = advertised_model_ids("claude", &[capability.clone()]);
+        assert!(
+            !advertised
+                .iter()
+                .any(|model| model.to_ascii_lowercase().starts_with(FALLBACK_MODEL_ALIAS)),
+            "advertised={advertised:?}"
+        );
+
+        // And the alias still routes when a client requests it verbatim —
+        // `ANTHROPIC_MODEL` is written as exactly this value.
+        for requested in [FALLBACK_MODEL_ALIAS, "claude-model[1M]"] {
+            assert!(supports_requested_model(
+                "claude",
+                &capability,
+                Some(requested)
+            ));
+            assert_eq!(
+                resolve_mapping_target(
+                    &capability.mappings,
+                    requested,
+                    ModelMatchMode::ClientFacing,
+                ),
+                Some("fallback-upstream".to_string()),
+                "requested={requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentinels_are_not_placeholder_models() {
+        // `is_placeholder_model` must keep ignoring the route sentinels: filtering
+        // them here would silently delete both features at parse time.
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-model","to":"y"},{"from":"claude-subagent","to":"z"}]}"#,
+        );
+
+        assert_eq!(capability.mappings.len(), 2);
+    }
+
+    #[test]
+    fn catalog_entries_are_shared_with_client_config_writers() {
+        let mapping = ModelMapping {
+            from: "gpt-5.6-sol".to_string(),
+            to: "gpt-5.6-sol".to_string(),
+            label: None,
+            supports_1m: None,
+            ..Default::default()
+        };
+        let capability = ModelCapability {
+            mappings: vec![mapping],
+        };
+
+        // Same source of truth the Codex catalog uses, so a client config and
+        // the catalog can never advertise different models.
+        let entries = advertised_model_catalog_entries("codex", &[capability]);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol"]
+        );
+    }
+
+    #[test]
+    fn subagent_alias_is_advertised_and_matched_without_special_casing() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-subagent","to":"provider-haiku"}]}"#,
+        );
+
+        assert_eq!(
+            advertised_model_ids("claude", &[capability.clone()]),
+            vec!["claude-subagent"]
+        );
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("claude-subagent")
+        ));
+        assert_eq!(
+            resolve_mapping_target(
+                &capability.mappings,
+                "claude-subagent",
+                ModelMatchMode::ClientFacing,
+            ),
+            Some("provider-haiku".to_string())
+        );
+    }
+
+    #[test]
+    fn model_state_key_uses_the_mapped_upstream_model_for_api_accounts() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol"}]}"#,
+        );
+        assert_eq!(
+            model_state_key("codex", &capability, "api", "gpt-5.6-sol"),
+            "upstream-sol"
+        );
+    }
+
+    #[test]
+    fn model_state_key_collapses_catch_all_aliases_onto_one_key() {
+        let capability = parse_model_capability(&format!(
+            r#"{{"model_mappings":[{{"from":"{FALLBACK_MODEL_ALIAS}","to":"upstream-any"}}]}}"#
+        ));
+        // Every client-side name funnels into the same upstream model, so one
+        // failure parks it for all of them instead of once per alias.
+        assert_eq!(
+            model_state_key("claude", &capability, "api", "claude-sonnet-alias"),
+            "upstream-any"
+        );
+        assert_eq!(
+            model_state_key("claude", &capability, "api", "whatever-else"),
+            "upstream-any"
+        );
+    }
+
+    #[test]
+    fn model_state_key_uses_the_mapped_upstream_model_for_official_accounts() {
+        let empty = parse_model_capability(r#"{"model_mappings":[]}"#);
+        assert_eq!(
+            model_state_key("codex", &empty, "api", "gpt-5.6-sol"),
+            "gpt-5.6-sol"
+        );
+
+        let official = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol"}]}"#,
+        );
+        assert_eq!(
+            model_state_key("codex", &official, "official", "gpt-5.6-sol"),
+            "upstream-sol"
+        );
+    }
+
+    #[test]
+    fn model_state_key_strips_the_one_m_suffix() {
+        let empty = parse_model_capability(r#"{"model_mappings":[]}"#);
+        // Same upstream model, only a different beta header — one cooldown.
+        assert_eq!(
+            model_state_key("claude", &empty, "api", "claude-sonnet-alias[1m]"),
+            model_state_key("claude", &empty, "api", "claude-sonnet-alias")
+        );
+    }
+
+    #[test]
+    fn known_upstream_models_returns_the_platform_baseline_without_mappings() {
+        let empty = parse_model_capability(r#"{"model_mappings":[]}"#);
+        let models = known_upstream_models("codex", &empty, "api");
+        assert!(models.contains(&"gpt-5.6-sol".to_string()));
+        assert!(models.contains(&"gpt-5.5".to_string()));
+    }
+
+    #[test]
+    fn known_upstream_models_dedupes_targets_and_includes_the_catch_all_target() {
+        let capability = parse_model_capability(&format!(
+            r#"{{"model_mappings":[
+                {{"from":"gpt-5.6-sol","to":"upstream-a"}},
+                {{"from":"glm-5.3","to":"upstream-a"}},
+                {{"from":"gpt-5.5","to":"upstream-b"}},
+                {{"from":"{FALLBACK_MODEL_ALIAS}","to":"upstream-any"}}
+            ]}}"#
+        ));
+        let mut models = known_upstream_models("codex", &capability, "api");
+        models.sort();
+        assert_eq!(models, vec!["upstream-a", "upstream-any", "upstream-b"]);
+    }
+
+    #[test]
+    fn known_upstream_models_uses_mappings_for_official_accounts() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol"}]}"#,
+        );
+        let models = known_upstream_models("codex", &capability, "official");
+        assert_eq!(models, vec!["upstream-sol".to_string()]);
+    }
+
+    #[test]
+    fn alias_for_model_key_maps_upstream_names_back_to_client_aliases() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol"}]}"#,
+        );
+        assert_eq!(
+            alias_for_model_key(&capability, "upstream-sol").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert!(alias_for_model_key(&capability, "unknown").is_none());
+    }
+
+    #[test]
+    fn precise_mode_keeps_each_api_account_separate() {
+        let grox = member(
+            "id-grox",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"deepseek-v4-flash-0731"}]}"#,
+        );
+        let kan = member(
+            "id-kan",
+            "247Kan",
+            "api",
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"relay-sol","context_window":200000}]}"#,
+        );
+
+        let entries =
+            super::advertised_model_catalog_entries("codex", &[grox, kan], PoolModelMode::Precise);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Grox/gpt-5.6-sol", "247Kan/gpt-5.6-sol"]
+        );
+        // No cross-account merge, so no maximum is taken: each entry advertises
+        // the window its own account actually serves.
+        assert_eq!(entries[0].context_window, Some(CODEX_ONE_M_CONTEXT_WINDOW));
+        assert_eq!(entries[1].context_window, Some(200_000));
+        // The bare alias travels along for every table keyed by a model name.
+        assert!(entries.iter().all(|entry| entry.base_id == "gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn precise_mode_merges_official_accounts_under_the_reserved_prefix() {
+        let first = member(
+            "id-one",
+            "ChatGPT 一号",
+            "official",
+            r#"{"model_mappings":[]}"#,
+        );
+        let second = member(
+            "id-two",
+            "ChatGPT 二号",
+            "official",
+            r#"{"model_mappings":[]}"#,
+        );
+
+        let ids = super::advertised_model_ids("codex", &[first, second], PoolModelMode::Precise);
+
+        // One entry set for the whole official group: they are pooled for quota
+        // rotation, so expanding them per account would be N identical rows.
+        assert_eq!(
+            ids,
+            vec![
+                "official/gpt-6-astra",
+                "official/gpt-5.6-sol",
+                "official/gpt-5.6-terra",
+                "official/gpt-5.6-luna",
+                "official/gpt-5.5",
+            ]
+        );
+    }
+
+    #[test]
+    fn official_members_advertise_a_configured_synthetic_alias() {
+        // `claude-subagent` is ours, not the vendor's; a configured mapping is
+        // what makes the alias safe for an official account to serve.
+        let official = member(
+            "id-one",
+            "Claude 官方",
+            "official",
+            r#"{"model_mappings":[{"from":"claude-subagent","to":"claude-sonnet-5"}]}"#,
+        );
+
+        let ids = super::advertised_model_ids("claude", &[official], PoolModelMode::Aggregate);
+
+        assert_eq!(ids, vec!["claude-subagent"]);
+    }
+
+    #[test]
+    fn precise_mode_prefixes_the_claude_one_m_twin() {
+        let account = member(
+            "id-one",
+            "TaBiAI",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-opus-alias","to":"claude-opus-5","supports_1m":true}]}"#,
+        );
+
+        let ids = super::advertised_model_ids("claude", &[account], PoolModelMode::Precise);
+
+        assert_eq!(
+            ids,
+            vec!["TaBiAI/claude-opus-alias", "TaBiAI/claude-opus-alias[1m]"]
+        );
+    }
+
+    #[test]
+    fn precise_mode_prefixes_the_baseline_a_wildcard_account_contributes() {
+        let wildcard = member("id-one", "Grox", "api", r#"{"model_mappings":[]}"#);
+        let catch_all = member(
+            "id-two",
+            "sink",
+            "api",
+            &format!(
+                r#"{{"model_mappings":[{{"from":"{FALLBACK_MODEL_ALIAS}","to":"catch-all-upstream"}}]}}"#
+            ),
+        );
+
+        let ids =
+            super::advertised_model_ids("grok", &[wildcard, catch_all], PoolModelMode::Precise);
+
+        assert_eq!(ids, vec!["Grox/grok-4.5", "sink/grok-4.5"]);
+    }
+
+    #[test]
+    fn same_named_api_accounts_get_distinct_precise_ids() {
+        let members = catalog_members(&[
+            CatalogMemberInput {
+                id: "aaaaaa1111",
+                display_name: "TaBiAI",
+                kind: "api",
+                config_json: r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"a"}]}"#,
+            },
+            CatalogMemberInput {
+                id: "bbbbbb2222",
+                display_name: "TaBiAI",
+                kind: "api",
+                config_json: r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"b"}]}"#,
+            },
+        ]);
+
+        let ids = super::advertised_model_ids("codex", &members, PoolModelMode::Precise);
+
+        // Both suffixed, so neither id depends on which sibling happens to be
+        // healthy when the catalog is written.
+        assert_eq!(
+            ids,
+            vec!["TaBiAI-aaaaaa/gpt-5.6-sol", "TaBiAI-bbbbbb/gpt-5.6-sol"]
+        );
+    }
+
+    // --- client_facing_model_catalog_entries tests ---
+
+    fn client_facing_ids(
+        platform: &str,
+        members: &[ModelCatalogMember],
+        mode: PoolModelMode,
+    ) -> Vec<String> {
+        super::client_facing_model_catalog_entries(platform, members, mode)
+            .into_iter()
+            .map(|model| model.id)
+            .collect()
+    }
+
+    #[test]
+    fn client_facing_uses_upstream_model_name_not_alias() {
+        let account = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}]}"#,
+        );
+
+        let ids = client_facing_ids("claude", &[account], PoolModelMode::Aggregate);
+        assert_eq!(ids, vec!["deepseek-v4.1"]);
+    }
+
+    #[test]
+    fn client_facing_deduplicates_by_upstream_model() {
+        let a = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}]}"#,
+        );
+        let b = member(
+            "id-two",
+            "sink",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-opus-alias","to":"deepseek-v4.1"}]}"#,
+        );
+
+        let ids = client_facing_ids("claude", &[a, b], PoolModelMode::Aggregate);
+        // Two accounts mapping different aliases to the same upstream model
+        // produce one deduplicated entry.
+        assert_eq!(ids, vec!["deepseek-v4.1"]);
+    }
+
+    #[test]
+    fn client_facing_and_merges_image_input() {
+        let a = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1","supports_image_input":true}]}"#,
+        );
+        let b = member(
+            "id-two",
+            "sink",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-opus-alias","to":"deepseek-v4.1","supports_image_input":false}]}"#,
+        );
+
+        let entries =
+            super::client_facing_model_catalog_entries("claude", &[a, b], PoolModelMode::Aggregate);
+        assert_eq!(entries.len(), 1);
+        // AND-merge: one text-only account means no image input.
+        assert!(!entries[0].supports_image_input);
+    }
+
+    #[test]
+    fn client_facing_precise_mode_prefixes_upstream_model() {
+        let account = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}]}"#,
+        );
+
+        let ids = client_facing_ids("claude", &[account], PoolModelMode::Precise);
+        assert_eq!(ids, vec!["Grox/deepseek-v4.1"]);
+    }
+
+    #[test]
+    fn client_facing_skips_fallback_mapping() {
+        let account = member(
+            "id-one",
+            "Grox",
+            "api",
+            &format!(
+                r#"{{"model_mappings":[{{"from":"{FALLBACK_MODEL_ALIAS}","to":"catch-all-upstream"}},{{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}}]}}"#
+            ),
+        );
+
+        let ids = client_facing_ids("claude", &[account], PoolModelMode::Aggregate);
+        // The fallback mapping is skipped; only the real mapping appears.
+        assert_eq!(ids, vec!["deepseek-v4.1"]);
+    }
+
+    #[test]
+    fn client_facing_skips_baseline_aliases() {
+        // An account with empty mappings contributes nothing — no baseline
+        // aliases like claude-sonnet-alias appear.
+        let account = member("id-one", "Grox", "api", r#"{"model_mappings":[]}"#);
+
+        let ids = client_facing_ids("claude", &[account], PoolModelMode::Aggregate);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn native_alias_does_not_treat_an_upstream_to_as_a_client_alias() {
+        let capability = parse_model_capability(r#"{"model_mappings":[{"from":"A","to":"B"}]}"#);
+
+        assert!(model_matches(
+            "claude",
+            &capability,
+            Some("A"),
+            ModelMatchMode::NativeAlias,
+        ));
+        assert!(!model_matches(
+            "claude",
+            &capability,
+            Some("B"),
+            ModelMatchMode::NativeAlias,
+        ));
+        assert_eq!(
+            resolve_mapping_target(&capability.mappings, "B", ModelMatchMode::NativeAlias),
+            None
+        );
+    }
+
+    #[test]
+    fn client_facing_prefers_explicit_from_over_an_earlier_to_match() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[
+                {"from":"A","to":"B"},
+                {"from":"B","to":"C"}
+            ]}"#,
+        );
+
+        assert_eq!(
+            resolve_mapping_target(&capability.mappings, "B", ModelMatchMode::ClientFacing,),
+            Some("C".to_string())
+        );
+    }
+
+    #[test]
+    fn saas_upstream_preserves_a_real_to_and_only_uses_fallback_when_needed() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[
+                {"from":"A","to":"B"},
+                {"from":"claude-model","to":"catch-all"}
+            ]}"#,
+        );
+
+        assert!(model_matches(
+            "claude",
+            &capability,
+            Some("B"),
+            ModelMatchMode::Upstream,
+        ));
+        assert_eq!(
+            resolve_mapping_target(&capability.mappings, "B", ModelMatchMode::Upstream,),
+            Some("B".to_string())
+        );
+        assert_eq!(
+            resolve_mapping_target(
+                &capability.mappings,
+                "unknown-model",
+                ModelMatchMode::Upstream,
+            ),
+            Some("catch-all".to_string())
+        );
+    }
+
+    #[test]
+    fn client_facing_one_m_context_requires_every_aggregate_contributor() {
+        let supporting = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"provider-sonnet","supports_1m":true}]}"#,
+        );
+        let supporting_too = member(
+            "id-two",
+            "Kan",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-opus-alias","to":"provider-sonnet","supports_1m":true}]}"#,
+        );
+        let text_window_only = member(
+            "id-three",
+            "Sink",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-fable-alias","to":"provider-sonnet","supports_1m":false}]}"#,
+        );
+
+        let all_support = super::client_facing_model_catalog_entries(
+            "claude",
+            &[supporting.clone(), supporting_too],
+            PoolModelMode::Aggregate,
+        );
+        assert_eq!(all_support.len(), 1);
+        assert_eq!(all_support[0].id, "provider-sonnet");
+        assert_eq!(all_support[0].context_window, Some(1_000_000));
+        assert!(!all_support[0].id.contains("[1m]"));
+
+        let mixed = super::client_facing_model_catalog_entries(
+            "claude",
+            &[supporting, text_window_only],
+            PoolModelMode::Aggregate,
+        );
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].context_window, None);
+    }
+
+    #[test]
+    fn client_facing_precise_mode_keeps_one_m_context_per_member() {
+        let supporting = member(
+            "id-one",
+            "Grox",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"provider-sonnet","supports_1m":true}]}"#,
+        );
+        let standard = member(
+            "id-two",
+            "Kan",
+            "api",
+            r#"{"model_mappings":[{"from":"claude-opus-alias","to":"provider-sonnet","supports_1m":false}]}"#,
+        );
+
+        let entries = super::client_facing_model_catalog_entries(
+            "claude",
+            &[supporting, standard],
+            PoolModelMode::Precise,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "Grox/provider-sonnet");
+        assert_eq!(entries[0].context_window, Some(1_000_000));
+        assert_eq!(entries[1].id, "Kan/provider-sonnet");
+        assert_eq!(entries[1].context_window, None);
+    }
+
+    // --- client-facing `to` matching tests ---
+
+    #[test]
+    fn supports_requested_model_matches_upstream_to_name() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}]}"#,
+        );
+
+        // A third-party client sends the upstream model name directly.
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("deepseek-v4.1")
+        ));
+        // The alias still matches (Claude Code native).
+        assert!(supports_requested_model(
+            "claude",
+            &capability,
+            Some("claude-sonnet-alias")
+        ));
+        // An unrelated model does not match.
+        assert!(!supports_requested_model(
+            "claude",
+            &capability,
+            Some("gpt-5.6-sol")
+        ));
+    }
+
+    #[test]
+    fn resolve_mapping_target_returns_to_when_requested_by_upstream_name() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"claude-sonnet-alias","to":"deepseek-v4.1"}]}"#,
+        );
+
+        // When the client sends the upstream name, the target is the same
+        // upstream name — no rewrite needed.
+        let target = resolve_mapping_target(
+            &capability.mappings,
+            "deepseek-v4.1",
+            ModelMatchMode::ClientFacing,
+        );
+        assert_eq!(target, Some("deepseek-v4.1".to_string()));
+
+        // The alias still resolves to the upstream model.
+        let target = resolve_mapping_target(
+            &capability.mappings,
+            "claude-sonnet-alias",
+            ModelMatchMode::ClientFacing,
+        );
+        assert_eq!(target, Some("deepseek-v4.1".to_string()));
+    }
+}

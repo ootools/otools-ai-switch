@@ -1,0 +1,451 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { motion } from "motion/react";
+import {
+  Bell,
+  Layers3,
+  LockKeyhole,
+  Network,
+} from "lucide-react";
+import type { ComponentType } from "react";
+import { getCodexLoginState, getSettings, saveSettings } from "../lib/api/client";
+import { isDesktop } from "../lib/transport";
+import { normalizeLanguage, supportedLanguages, useI18n, type Language } from "../lib/i18n";
+import { normalizeThemePreference, type ThemePreference } from "../lib/theme";
+import { RouteProxyHttpsSettings } from "../components/settings/route-proxy-https-settings";
+import { NotificationSettings } from "../components/settings/notification-settings";
+import { UsageStorageSettings } from "../components/settings/usage-storage-settings";
+import { useState } from "react";
+import { MotionPresence } from "../components/motion/MotionPrimitives";
+import {
+  accountModalities,
+  createDefaultModalityVisibility,
+  modalityLabelKeys,
+  type AccountModality,
+  type ModalityVisibility,
+} from "../lib/accountModalities";
+
+type FeatureEntry = {
+  screen?: string;
+  section?: "https" | "notification";
+  titleKey:
+    | "nav.sessions"
+    | "nav.log"
+    | "settings.https.title"
+    | "notification.title";
+  descriptionKey:
+    | "settings.feature.sessions"
+    | "settings.feature.log"
+    | "settings.feature.https"
+    | "notification.subtitle";
+  icon: ComponentType<{ className?: string }>;
+};
+
+// Keep only shipped utility entries here. Agent-facing workflows stay in the agent tabs.
+const featureEntries: FeatureEntry[] = [
+  {
+    screen: "Sessions",
+    titleKey: "nav.sessions",
+    descriptionKey: "settings.feature.sessions",
+    icon: Network,
+  },
+  {
+    screen: "Log",
+    titleKey: "nav.log",
+    descriptionKey: "settings.feature.log",
+    icon: Layers3,
+  },
+  {
+    section: "https",
+    titleKey: "settings.https.title",
+    descriptionKey: "settings.feature.https",
+    icon: LockKeyhole,
+  },
+  {
+    section: "notification",
+    titleKey: "notification.title",
+    descriptionKey: "notification.subtitle",
+    icon: Bell,
+  },
+];
+
+type SettingsScreenProps = {
+  onOpenFeature?: (screen: string) => void;
+  modalityVisibility?: ModalityVisibility;
+  onModalityVisibilityChange?: (modality: AccountModality, visible: boolean) => void;
+};
+
+const themeOptions: {
+  value: ThemePreference;
+  labelKey: "settings.theme.system" | "settings.theme.light" | "settings.theme.dark";
+}[] = [
+  { value: "system", labelKey: "settings.theme.system" },
+  { value: "light", labelKey: "settings.theme.light" },
+  { value: "dark", labelKey: "settings.theme.dark" },
+];
+
+export function SettingsScreen({
+  onOpenFeature,
+  modalityVisibility,
+  onModalityVisibilityChange,
+}: SettingsScreenProps) {
+  const queryClient = useQueryClient();
+  const { language, setLanguage, t } = useI18n();
+  const [activeSection, setActiveSection] = useState<"https" | "notification">("notification");
+  const [localModalityVisibility, setLocalModalityVisibility] = useState(createDefaultModalityVisibility);
+  // Proxy drafts as `null` = "follow the loaded settings"; they overlay the
+  // settings while the user edits. Hooks stay above the loading early-returns.
+  const [proxyEnabledDraft, setProxyEnabledDraft] = useState<boolean | null>(null);
+  const [proxyUrlDraft, setProxyUrlDraft] = useState<string | null>(null);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  const [requestBodyLimitDraft, setRequestBodyLimitDraft] = useState<string | null>(null);
+  const [requestBodyLimitError, setRequestBodyLimitError] = useState(false);
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
+  // Only loaded for the Codex-login card: enabling that switch without a ChatGPT
+  // login leaves Codex unable to authenticate, so the card warns first instead of
+  // letting the user find out when a config write is refused. A failure here
+  // must not prevent editing other settings.
+  const codexLoginQuery = useQuery({
+    queryKey: ["codex-login-state"],
+    queryFn: getCodexLoginState,
+    // OTools resolves file operations on the host for desktop and remote views.
+    enabled: isDesktop(),
+    retry: false,
+  });
+  const saveMutation = useMutation({
+    mutationFn: saveSettings,
+    onSuccess: (settings) => {
+      queryClient.setQueryData(["settings"], settings);
+      setLanguage(normalizeLanguage(settings.language));
+    },
+  });
+
+  if (settingsQuery.isLoading) {
+    return <p className="text-sm text-stone-500">{t("settings.loading")}</p>;
+  }
+
+  if (!settingsQuery.data) {
+    return <p className="text-sm text-red-700">{t("settings.error")}</p>;
+  }
+
+  const settings = settingsQuery.data;
+  const effectiveModalityVisibility = modalityVisibility ?? localModalityVisibility;
+  const handleModalityVisibilityChange = (modality: AccountModality, visible: boolean) => {
+    if (onModalityVisibilityChange) {
+      onModalityVisibilityChange(modality, visible);
+      return;
+    }
+    setLocalModalityVisibility((current) => ({ ...current, [modality]: visible }));
+  };
+  const handleLanguageChange = (nextLanguage: Language) => {
+    setLanguage(nextLanguage);
+    saveMutation.mutate({ ...settings, language: nextLanguage });
+  };
+
+  // Proxy fields: drafts overlay the loaded settings so the card edits smoothly
+  // and resets cleanly if settings reload underneath.
+  const PROXY_EXAMPLE = "http://127.0.0.1:7890";
+  const proxyEnabled = proxyEnabledDraft ?? settings.proxy_enabled;
+  const proxyUrl = proxyUrlDraft ?? settings.proxy_url ?? "";
+
+  const saveProxy = (nextEnabled: boolean, nextUrl: string) => {
+    if (nextEnabled && !nextUrl.trim()) {
+      setProxyError(t("settings.proxy.required"));
+      return;
+    }
+    setProxyError(null);
+    saveMutation.mutate({
+      ...settings,
+      proxy_enabled: nextEnabled,
+      proxy_url: nextUrl.trim() || null,
+    });
+  };
+
+  const requestBodyLimit = settings.route_proxy_request_body_limit_mib ?? 128;
+  const codexKeepLoginState = settings.codex_keep_login_state ?? false;
+  // Keyed lookup rather than a template string: the translation keys are a
+  // closed union, and an unknown state must fall back to silence, not a crash.
+  const codexLoginWarning = (() => {
+    const state = codexLoginQuery.data;
+    if (!state || state.usable) return null;
+    const keys = {
+      missing: "settings.codexLogin.state.missing",
+      not_chatgpt: "settings.codexLogin.state.not_chatgpt",
+      unreadable: "settings.codexLogin.state.unreadable",
+    } as const;
+    const key = keys[state.state as keyof typeof keys];
+    return key ? t(key) : null;
+  })();
+  const saveRequestBodyLimit = () => {
+    const draft = requestBodyLimitDraft ?? String(requestBodyLimit);
+    const value = Number(draft);
+    // Match the backend's u32 MiB representation, without imposing another
+    // product-specific ceiling on configurable request sizes.
+    if (!draft.trim() || !Number.isInteger(value) || value < 0 || value > 0xffff_ffff) {
+      setRequestBodyLimitError(true);
+      return;
+    }
+    setRequestBodyLimitError(false);
+    if (value !== requestBodyLimit) {
+      saveMutation.mutate(
+        { ...settings, route_proxy_request_body_limit_mib: value },
+        { onSuccess: () => setRequestBodyLimitDraft(null) },
+      );
+    }
+  };
+
+  const handleProxyEnabledChange = (next: boolean) => {
+    setProxyEnabledDraft(next);
+    if (next && !proxyUrl.trim()) {
+      setProxyError(t("settings.proxy.required"));
+      return;
+    }
+    setProxyError(null);
+    saveProxy(next, proxyUrl);
+  };
+
+  return (
+    <section className="space-y-3">
+      <div className="rounded-2xl border border-stone-200 bg-white/82 shadow-sm">
+        <div className="border-b border-stone-200 px-4 py-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-stone-400">
+            {t("settings.hub.kicker")}
+          </p>
+          <h1 className="mt-0.5 text-lg font-semibold tracking-tight text-stone-950">
+            {t("settings.title")}
+          </h1>
+        </div>
+
+        <div className="px-4 py-3">
+          <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.features.title")}</h2>
+        </div>
+        <div className="grid gap-2 px-3 pb-3 sm:grid-cols-2 xl:grid-cols-3">
+          {featureEntries.map((entry) => {
+            const Icon = entry.icon;
+            return (
+              <button
+                className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-2.5 text-left motion-control hover:border-stone-300 hover:bg-white focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+                key={entry.screen ?? entry.section}
+                onClick={() => {
+                  if (entry.screen) {
+                    onOpenFeature?.(entry.screen);
+                    return;
+                  }
+                  if (entry.section) {
+                    setActiveSection(entry.section);
+                  }
+                }}
+                type="button"
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className="grid h-8 w-8 place-items-center rounded-lg bg-white text-stone-700 shadow-sm ring-1 ring-stone-200">
+                    <Icon className="h-3.5 w-3.5" />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] font-semibold text-stone-950">{t(entry.titleKey)}</p>
+                    <p className="mt-0.5 truncate text-[12px] text-stone-500">{t(entry.descriptionKey)}</p>
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <MotionPresence>
+        {activeSection === "https" && (
+          <motion.div
+            key="settings-https"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <RouteProxyHttpsSettings />
+          </motion.div>
+        )}
+        {activeSection === "notification" && (
+          <motion.div
+            key="settings-notification"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <NotificationSettings settings={settings} />
+          </motion.div>
+        )}
+      </MotionPresence>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.requestBodyLimit.title")}</h2>
+        <label className="flex max-w-sm flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+          <span>{t("settings.requestBodyLimit.label")}</span>
+          <input
+            aria-label={t("settings.requestBodyLimit.label")}
+            aria-invalid={requestBodyLimitError}
+            aria-describedby="request-body-limit-hint"
+            className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-[13px] font-medium text-stone-900 shadow-sm outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            disabled={saveMutation.isPending}
+            min={0}
+            step={1}
+            type="number"
+            value={requestBodyLimitDraft ?? requestBodyLimit}
+            onChange={(event) => {
+              setRequestBodyLimitDraft(event.target.value);
+              setRequestBodyLimitError(false);
+            }}
+            onBlur={saveRequestBodyLimit}
+          />
+        </label>
+        <p id="request-body-limit-hint" className="text-[12px] text-stone-500">{t("settings.requestBodyLimit.hint")}</p>
+        {requestBodyLimitError && (
+          <p role="alert" className="text-[12px] font-medium text-red-700">{t("settings.requestBodyLimit.invalid")}</p>
+        )}
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.proxy.title")}</h2>
+        <p className="text-[12px] text-stone-500">{t("settings.proxy.subtitle")}</p>
+        <label className="flex max-w-xl items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-[12px] font-semibold text-stone-700">
+          <input
+            aria-label={t("settings.proxy.enable")}
+            checked={proxyEnabled}
+            className="mt-0.5"
+            disabled={saveMutation.isPending}
+            onChange={(event) => handleProxyEnabledChange(event.target.checked)}
+            type="checkbox"
+          />
+          <span>{t("settings.proxy.enable")}</span>
+        </label>
+        <label className="flex max-w-sm flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+          <span>{t("settings.proxy.address")}</span>
+          <input
+            aria-label={t("settings.proxy.address")}
+            className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-[13px] font-medium text-stone-900 shadow-sm outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            disabled={saveMutation.isPending}
+            onBlur={() => {
+              if (proxyEnabled && !proxyUrl.trim()) {
+                setProxyError(t("settings.proxy.required"));
+                return;
+              }
+              setProxyError(null);
+              if (proxyUrl.trim() !== (settings.proxy_url ?? "")) {
+                saveProxy(proxyEnabled, proxyUrl);
+              }
+            }}
+            onChange={(event) => {
+              setProxyUrlDraft(event.target.value);
+              if (event.target.value.trim()) setProxyError(null);
+            }}
+            placeholder={PROXY_EXAMPLE}
+            type="text"
+            value={proxyUrl}
+          />
+          {proxyError ? (
+            <span className="text-[11px] font-medium text-red-700">{proxyError}</span>
+          ) : (
+            <span className="text-[11px] font-medium text-stone-500">{t("settings.proxy.hint")}</span>
+          )}
+        </label>
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">
+          {t("settings.codexLogin.title")}
+        </h2>
+        <p className="text-[12px] text-stone-500">{t("settings.codexLogin.subtitle")}</p>
+        <label className="flex max-w-xl items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-[12px] font-semibold text-stone-700">
+          <input
+            aria-label={t("settings.codexLogin.enable")}
+            checked={codexKeepLoginState}
+            className="mt-0.5"
+            disabled={saveMutation.isPending}
+            onChange={(event) =>
+              saveMutation.mutate({ ...settings, codex_keep_login_state: event.target.checked })
+            }
+            type="checkbox"
+          />
+          <span>{t("settings.codexLogin.enable")}</span>
+        </label>
+        {codexLoginWarning && (
+          <p
+            className="max-w-xl rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-[11px] font-medium text-amber-900"
+            role="status"
+          >
+            {codexLoginWarning}
+          </p>
+        )}
+        <p className="text-[11px] font-medium text-stone-500">
+          {t("settings.codexLogin.hint")}
+        </p>
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.app.title")}</h2>
+        <div className="space-y-2 rounded-xl border border-stone-200 bg-stone-50/70 p-3">
+          <div>
+            <h3 className="text-[13px] font-semibold text-stone-800">{t("settings.modalityVisibility.title")}</h3>
+            <p className="mt-1 text-[11px] font-medium text-stone-500">{t("settings.modalityVisibility.subtitle")}</p>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {accountModalities.map((modality) => (
+              <label
+                className="flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-2 text-[12px] font-semibold text-stone-700"
+                key={modality}
+              >
+                <input
+                  aria-label={t("settings.modalityVisibility.show", { modality: t(modalityLabelKeys[modality]) })}
+                  checked={effectiveModalityVisibility[modality]}
+                  className="accent-blue-600"
+                  onChange={(event) => handleModalityVisibilityChange(modality, event.target.checked)}
+                  type="checkbox"
+                />
+                <span>{t("settings.modalityVisibility.show", { modality: t(modalityLabelKeys[modality]) })}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <p className="rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[12px] text-stone-600">
+          {t("settings.dataDir", { path: settings.data_dir })}
+        </p>
+        <UsageStorageSettings />
+        <label className="flex max-w-sm flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+          <span>{t("settings.language")}</span>
+          <select
+            aria-label={t("settings.language")}
+            className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-[13px] font-medium text-stone-900 shadow-sm outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            disabled={saveMutation.isPending}
+            onChange={(event) => handleLanguageChange(event.target.value as Language)}
+            value={language}
+          >
+            {supportedLanguages.map((option) => (
+              <option key={option.code} value={option.code}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex max-w-sm flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+          <span>{t("settings.theme")}</span>
+          <select
+            aria-label={t("settings.theme")}
+            className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-[13px] font-medium text-stone-900 shadow-sm outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            disabled={saveMutation.isPending}
+            onChange={(event) =>
+              saveMutation.mutate({ ...settings, theme: event.target.value })
+            }
+            value={normalizeThemePreference(settings.theme)}
+          >
+            {themeOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {t(option.labelKey)}
+              </option>
+            ))}
+          </select>
+        </label>
+        {saveMutation.data && <p className="text-[13px] font-medium text-emerald-700">{t("settings.saved")}</p>}
+        {saveMutation.error && <p className="text-[13px] font-medium text-red-700">{t("settings.saveError")}</p>}
+      </div>
+    </section>
+  );
+}

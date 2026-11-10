@@ -1,0 +1,332 @@
+use super::models::*;
+use super::protocol::{openai_images_body, parse_openai_images};
+use super::repository::ImageGenerationRepository;
+use super::storage::store_image;
+use crate::app_state::AppState;
+use crate::error::AppError;
+use crate::services::route_model_capability::parse_model_capability;
+use crate::services::route_proxy_service::{
+    build_proxy_state, forward_request, load_pool_candidates,
+};
+use axum::body::{to_bytes, Body};
+use axum::http::{HeaderMap, HeaderValue, Method, Uri};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerateImageInput {
+    pub session_id: String,
+    pub model: String,
+    pub prompt: String,
+    #[serde(default = "default_count")]
+    pub count: u32,
+    #[serde(default = "default_size")]
+    pub size: String,
+    #[serde(default = "default_quality")]
+    pub quality: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerateImageOutcome {
+    pub message: ImageMessage,
+    pub assets: Vec<ImageAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAssetContent {
+    pub asset: ImageAsset,
+    pub data_base64: String,
+}
+
+pub struct ImageGenerationService;
+
+impl ImageGenerationService {
+    pub async fn list_models(
+        state: &AppState,
+        platform: &str,
+    ) -> Result<Vec<ImageModelOption>, AppError> {
+        if !matches!(platform, "codex" | "gemini") {
+            return Err(validation(
+                "validation.image_platform",
+                "Image generation supports Codex and Gemini groups",
+            ));
+        }
+        let candidates = load_pool_candidates(&state.pool, platform).await?;
+        let mut models = BTreeMap::<String, ImageModelOption>::new();
+        for candidate in candidates {
+            for mapping in parse_model_capability(&candidate.credential.config_json).mappings {
+                let capabilities = mapping
+                    .capabilities
+                    .iter()
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| item.starts_with("image."))
+                    .collect::<Vec<_>>();
+                if capabilities.is_empty() {
+                    continue;
+                }
+                models
+                    .entry(mapping.from.to_ascii_lowercase())
+                    .or_insert(ImageModelOption {
+                        id: mapping.from,
+                        upstream_model: mapping.to,
+                        capabilities,
+                    });
+            }
+        }
+        Ok(models.into_values().collect())
+    }
+
+    pub async fn generate(
+        state: &AppState,
+        input: GenerateImageInput,
+    ) -> Result<GenerateImageOutcome, AppError> {
+        let session =
+            ImageGenerationRepository::get_session(&state.pool, &input.session_id).await?;
+        let prompt = input.prompt.trim();
+        let model = input.model.trim();
+        if prompt.is_empty() || model.is_empty() || !(1..=10).contains(&input.count) {
+            return Err(validation(
+                "validation.image_request",
+                "Prompt, model, and an image count from 1 to 10 are required",
+            ));
+        }
+        let available = Self::list_models(state, &session.platform).await?;
+        if !available.iter().any(|item| {
+            item.id.eq_ignore_ascii_case(model)
+                && item.capabilities.iter().any(|cap| cap == "image.generate")
+        }) {
+            return Err(validation(
+                "imagegen.model_unavailable",
+                "The selected image model is not available in the active group",
+            ));
+        }
+        let request_json = serde_json::to_string(&input)?;
+        ImageGenerationRepository::add_message(
+            &state.pool,
+            NewImageMessage {
+                session_id: session.id.clone(),
+                role: "user".into(),
+                prompt: prompt.into(),
+                request_json: request_json.clone(),
+                status: "completed".into(),
+                model: Some(model.into()),
+            },
+        )
+        .await?;
+        let assistant = ImageGenerationRepository::add_message(
+            &state.pool,
+            NewImageMessage {
+                session_id: session.id.clone(),
+                role: "assistant".into(),
+                prompt: String::new(),
+                request_json,
+                status: "running".into(),
+                model: Some(model.into()),
+            },
+        )
+        .await?;
+        match Self::execute(
+            state,
+            &session.platform,
+            model,
+            prompt,
+            input.count,
+            &input.size,
+            &input.quality,
+        )
+        .await
+        {
+            Ok((response_id, images)) => {
+                let mut assets = Vec::with_capacity(images.len());
+                for (index, image) in images.iter().enumerate() {
+                    let pending = store_image(
+                        &state.paths.imagegen_dir,
+                        &session.id,
+                        &assistant.id,
+                        index,
+                        image,
+                    )
+                    .await?;
+                    assets.push(ImageGenerationRepository::add_asset(&state.pool, pending).await?);
+                }
+                let message = ImageGenerationRepository::finish_message(
+                    &state.pool,
+                    &assistant.id,
+                    "completed",
+                    None,
+                    None,
+                    response_id.as_deref(),
+                    None,
+                    assets.len() as i64,
+                )
+                .await?;
+                Ok(GenerateImageOutcome { message, assets })
+            }
+            Err(error) => {
+                let _ = ImageGenerationRepository::finish_message(
+                    &state.pool,
+                    &assistant.id,
+                    "failed",
+                    None,
+                    None,
+                    None,
+                    Some(&error),
+                    0,
+                )
+                .await;
+                Err(validation("imagegen.generate_failed", &error))
+            }
+        }
+    }
+
+    async fn execute(
+        state: &AppState,
+        platform: &str,
+        model: &str,
+        prompt: &str,
+        count: u32,
+        size: &str,
+        quality: &str,
+    ) -> Result<(Option<String>, Vec<super::protocol::GeneratedImage>), String> {
+        let platform = crate::models::platform::PlatformId::parse(platform)
+            .map_err(|error| error.to_string())?;
+        let proxy = build_proxy_state(state.pool.clone(), &state.route_proxy)
+            .with_platform_scope(platform);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = openai_images_body(model, prompt, count, size, quality);
+        let response = forward_request(
+            &proxy,
+            Method::POST,
+            headers,
+            Uri::from_static("/v1/images/generations"),
+            Body::from(body),
+        )
+        .await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 128 * 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "Image upstream returned {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let response_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let images = parse_openai_images(&bytes)?;
+        if images.is_empty() {
+            return Err("Image upstream returned no images".to_string());
+        }
+        Ok((response_id, images))
+    }
+
+    pub async fn read_asset(
+        state: &AppState,
+        asset_id: &str,
+    ) -> Result<ImageAssetContent, AppError> {
+        let asset = ImageGenerationRepository::get_asset(&state.pool, asset_id).await?;
+        let path =
+            super::storage::resolve_asset_path(&state.paths.imagegen_dir, &asset.relative_path)?;
+        let bytes = tokio::fs::read(path).await?;
+        Ok(ImageAssetContent {
+            asset,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+}
+
+fn default_count() -> u32 {
+    1
+}
+fn default_size() -> String {
+    "1024x1024".to_string()
+}
+fn default_quality() -> String {
+    "auto".to_string()
+}
+fn validation(code: &'static str, message: &str) -> AppError {
+    AppError::Validation {
+        code,
+        message: message.to_string(),
+        details: None,
+        recoverable: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{create_memory_pool, run_migrations};
+    use crate::database::repositories::route_credential_repository::RouteCredentialRepository;
+    use crate::database::repositories::route_pool_repository::RoutePoolRepository;
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn native_image_generation_routes_without_header_bypass_and_records_usage() {
+        let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, Value)>::new()));
+        let sink = captured.clone();
+        let app = Router::new().fallback(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push((headers, body));
+                Json(json!({"id":"local-image", "data":[{"b64_json":"aW1hZ2U="}]}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let credential = RouteCredentialRepository::create(
+            &pool, "codex", "api", "image mock", None, "ok", None,
+            r#"{"api_key":"image-upstream-key"}"#,
+            &json!({"base_url":base_url,"interface_format":"openai","model_mappings":[{
+                "from":"image-alias","to":"gpt-image-1","capabilities":["image.generate"]
+            }]}).to_string(), "{}",
+        ).await.unwrap();
+        RoutePoolRepository::replace_members(&pool, "codex", &[credential.id]).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState {
+            paths: crate::paths::AppPaths::from_data_dir(temp.path().to_path_buf()),
+            pool: pool.clone(),
+            config_writes: Default::default(),
+            deeplink_protocols: Default::default(),
+            close_to_tray: Default::default(),
+            route_proxy: Default::default(),
+            event_broadcaster: Default::default(),
+        };
+        let result = ImageGenerationService::execute(
+            &state, "codex", "image-alias", "a cat", 1, "1024x1024", "auto",
+        ).await;
+        upstream.abort();
+        let (id, images) = result.expect("trusted native image request");
+        assert_eq!(id.as_deref(), Some("local-image"));
+        assert_eq!(images.len(), 1);
+        let records = captured.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1["model"], "gpt-image-1");
+        assert_eq!(records[0].0["authorization"], "Bearer image-upstream-key");
+        assert!(!records[0].0.contains_key("x-ai-switch-platform"));
+        drop(records);
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(events, 1);
+        let log = state.route_proxy.live_log().snapshot();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].requested_model.as_deref(), Some("image-alias"));
+        assert_eq!(log[0].upstream_model.as_deref(), Some("gpt-image-1"));
+    }
+}

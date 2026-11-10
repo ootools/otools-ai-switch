@@ -1,0 +1,370 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { act } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { AppLayout } from "../src/components/layout/AppLayout";
+import { createDefaultModalityVisibility } from "../src/lib/accountModalities";
+import { I18nProvider } from "../src/lib/i18n";
+
+function dispatchPointerEvent(
+  target: EventTarget,
+  type: "pointerdown" | "pointermove" | "pointerup",
+  {
+    button = 0,
+    clientX = 0,
+    pointerId = 1,
+  }: { button?: number; clientX?: number; pointerId?: number } = {},
+) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    button: { configurable: true, value: button },
+    clientX: { configurable: true, value: clientX },
+    clientY: { configurable: true, value: 0 },
+    pointerId: { configurable: true, value: pointerId },
+  });
+  act(() => {
+    target.dispatchEvent(event);
+  });
+}
+
+function setViewportWidth(width: number) {
+  act(() => {
+    (window as Window & { innerWidth: number }).innerWidth = width;
+    window.dispatchEvent(new Event("resize"));
+  });
+}
+
+describe("AppLayout", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    (window as Window & { innerWidth: number }).innerWidth = 1024;
+  });
+
+  it("shows five independent account modalities instead of agent platforms", () => {
+    window.localStorage.setItem("ai-switch.agent-visibility", JSON.stringify({ codex: false, claude: false }));
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="PoolVideo" onNavigate={vi.fn()} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+    const modalities = ["通用", "图片", "视频", "音频", "向量"];
+    const buttons = modalities.map((name) => screen.getByRole("button", { name }));
+    for (let index = 1; index < buttons.length; index += 1) {
+      expect(buttons[index - 1].compareDocumentPosition(buttons[index]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(screen.getByRole("button", { name: "视频" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getAllByRole("button").filter((button) => button.getAttribute("aria-current") === "page")).toHaveLength(1);
+    for (const name of ["Codex", "Claude", "Grok", "Gemini", "OpenCode", "OpenClaw", "Hermes"]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+  });
+
+  it("navigates each modality to its own route and closes the narrow drawer", async () => {
+    setViewportWidth(500);
+    const onNavigate = vi.fn();
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="PoolGeneral" onNavigate={onNavigate} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+    for (const [label, route] of [["通用", "PoolGeneral"], ["图片", "PoolImage"], ["视频", "PoolVideo"], ["音频", "PoolAudio"], ["向量", "PoolVector"]]) {
+      await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+      await userEvent.click(screen.getByRole("button", { name: label }));
+      expect(onNavigate).toHaveBeenLastCalledWith(route);
+      expect(screen.getByTestId("app-sidebar")).not.toHaveClass("app-sidebar-drawer");
+    }
+  });
+
+
+
+  it("renders system utility nav entries and navigates to their screens", async () => {
+    const onNavigate = vi.fn();
+
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={onNavigate}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "统计" }));
+    await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
+    await userEvent.click(screen.getByRole("button", { name: /技能/ }));
+    expect(screen.queryByRole("button", { name: /客户端接入/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /关于/ }));
+
+    expect(onNavigate).toHaveBeenCalledWith("Stats");
+    expect(onNavigate).toHaveBeenCalledWith("MCP");
+    expect(onNavigate).toHaveBeenCalledWith("Skills");
+    expect(onNavigate).toHaveBeenCalledWith("About");
+  });
+
+  it("lists usage first in the system group and highlights it on its own", () => {
+    const onNavigate = vi.fn();
+
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="Stats" onNavigate={onNavigate}
+          onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    const stats = screen.getByRole("button", { name: "统计" });
+    const mcp = screen.getByRole("button", { name: /MCP/ });
+    // 统计 moved out of the pool status bar, so it leads the system group.
+    expect(stats.compareDocumentPosition(mcp) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(stats).toHaveAttribute("aria-current", "page");
+    expect(mcp).not.toHaveAttribute("aria-current");
+  });
+
+  it("hides only the disabled modality from the sidebar", () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="PoolGeneral"
+          modalityVisibility={{ ...createDefaultModalityVisibility(), video: false }}
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: "通用" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "音频" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "视频" })).not.toBeInTheDocument();
+  });
+
+  it("toggles and persists modality visibility from the sidebar menu", async () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="PoolGeneral"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "模态显示选项" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "显示 视频" }));
+
+    expect(screen.queryByRole("button", { name: "视频" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "音频" })).toBeInTheDocument();
+    expect(JSON.parse(window.localStorage.getItem("ai-switch.modality-visibility") ?? "{}").video).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "显示全部模态" }));
+    expect(screen.getByRole("button", { name: "视频" })).toBeInTheDocument();
+  });
+
+  it("highlights About on its own instead of the Settings area", () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="About"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: /关于/ })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: /设置/ })).not.toHaveAttribute("aria-current");
+  });
+
+  it("only highlights the active system utility entry", () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="MCP"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: /MCP/ })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("button", { name: /设置/ })).not.toHaveAttribute("aria-current");
+  });
+
+  it("exposes the sidebar toggle state and compact desktop grid", () => {
+    const onToggleSidebar = vi.fn();
+    const { rerender } = render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={vi.fn()}
+          onToggleSidebar={onToggleSidebar}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    const collapseButton = screen.getByRole("button", { name: "收起侧栏" });
+    expect(collapseButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByTestId("app-shell")).toHaveClass("grid-cols-[56px_minmax(0,1fr)]");
+    fireEvent.click(collapseButton);
+    expect(onToggleSidebar).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={vi.fn()}
+          onToggleSidebar={onToggleSidebar}
+          sidebarCollapsed
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByRole("button", { name: "展开侧栏" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("app-shell")).toHaveClass("min-[600px]:grid-cols-[56px_minmax(0,1fr)]");
+    expect(screen.getByRole("button", { name: "通用" })).toHaveAttribute("title", "通用");
+    expect(screen.getByRole("button", { name: "通用" }).querySelector("svg")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "通用" }).querySelector("span.font-medium")).toHaveClass("sr-only");
+    expect(screen.getByRole("combobox", { name: "语言" }).parentElement).toHaveClass("hidden");
+    expect(screen.getByText("账号池")).toHaveClass("hidden");
+  });
+
+  it("opens the full sidebar as a fixed drawer on narrow windows", async () => {
+    setViewportWidth(500);
+    const onNavigate = vi.fn();
+    const onToggleSidebar = vi.fn();
+
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={onNavigate}
+          onToggleSidebar={onToggleSidebar}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    const sidebar = screen.getByTestId("app-sidebar");
+    const expand = screen.getByRole("button", { name: "展开侧栏" });
+    expect(expand).toHaveAttribute("aria-expanded", "false");
+    expect(sidebar).not.toHaveClass("app-sidebar-drawer");
+    expect(screen.queryByTestId("app-sidebar-drawer-backdrop")).not.toBeInTheDocument();
+
+    await userEvent.click(expand);
+
+    expect(onToggleSidebar).not.toHaveBeenCalled();
+    expect(sidebar).toHaveClass("app-sidebar-drawer");
+    expect(screen.getByTestId("app-sidebar-drawer-backdrop")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "收起侧栏" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByText("账号池")).not.toHaveClass("hidden");
+    expect(screen.getByText("content").parentElement).toHaveClass("col-start-2");
+
+    await userEvent.click(screen.getByTestId("app-sidebar-drawer-backdrop"));
+    expect(sidebar).not.toHaveClass("app-sidebar-drawer");
+
+    await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    await userEvent.keyboard("{Escape}");
+    expect(sidebar).not.toHaveClass("app-sidebar-drawer");
+
+    await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
+    expect(onNavigate).toHaveBeenCalledWith("MCP");
+    expect(sidebar).not.toHaveClass("app-sidebar-drawer");
+  });
+
+  it("defaults to a compact expanded width and resizes within bounds", () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    const shell = screen.getByTestId("app-shell");
+    const handle = screen.getByTestId("sidebar-resize-handle");
+    expect(shell.style.getPropertyValue("--app-sidebar-width")).toBe("216px");
+    expect(handle).toHaveAttribute("role", "separator");
+    expect(handle).toHaveAttribute("aria-valuenow", "216");
+
+    dispatchPointerEvent(handle, "pointerdown", { clientX: 216, pointerId: 11 });
+    dispatchPointerEvent(document, "pointermove", { clientX: 260, pointerId: 11 });
+    expect(shell.style.getPropertyValue("--app-sidebar-width")).toBe("260px");
+
+    dispatchPointerEvent(document, "pointermove", { clientX: 20, pointerId: 11 });
+    expect(shell.style.getPropertyValue("--app-sidebar-width")).toBe("180px");
+
+    dispatchPointerEvent(document, "pointermove", { clientX: 500, pointerId: 11 });
+    expect(shell.style.getPropertyValue("--app-sidebar-width")).toBe("320px");
+    dispatchPointerEvent(document, "pointerup", { pointerId: 11 });
+  });
+
+  it("restores a persisted width and hides the resize handle when collapsed", () => {
+    window.localStorage.setItem("ai-switch.sidebar-width", "245");
+    const { rerender } = render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed={false}
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--app-sidebar-width")).toBe("245px");
+    expect(screen.getByTestId("sidebar-resize-handle")).toHaveAttribute("aria-valuenow", "245");
+
+    rerender(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout
+          activeScreen="Codex"
+          onNavigate={vi.fn()}
+          onToggleSidebar={vi.fn()}
+          sidebarCollapsed
+        >
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByTestId("app-shell").style.getPropertyValue("--app-sidebar-width")).toBe("56px");
+    expect(screen.queryByTestId("sidebar-resize-handle")).not.toBeInTheDocument();
+  });
+});

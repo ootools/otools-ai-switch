@@ -1,0 +1,24 @@
+{
+  "packid": "otools-ai-switch",
+  "uuid": "otools-ai-switch",
+  "displayName": "AI Switch",
+  "displayNameCN": "AI Switch · AI 服务管理",
+  "version": "0.1.0",
+  "entry": "dist/index.html",
+  "icon": "🔀",
+  "developerName": "OTools",
+  "summary": "统一管理 AI 账号、模型路由和客户端接入，提供本地 AI 接口、用量统计、MCP 与 Skills 管理。",
+  "key": ["ai-switch", "AI Switch", "AI", "模型", "账号池", "路由", "Codex", "Claude", "Gemini", "MCP", "Skills"],
+  "openMode": "panel",
+  "panelWidth": 1200,
+  "panelHeight": 800,
+  "openInBrowser": false,
+  "native": {
+    "enabled": true,
+    "libDir": "lib",
+    "autoReload": false
+  },
+  "hasAd": false,
+  "inPluginPurchase": false,
+  "screenshots": []
+}

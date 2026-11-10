@@ -1,0 +1,3920 @@
+use crate::adapters::route_config::{
+    codex_model_catalog_path, ClaudeEnvPlan, ClientModel, RouteConfigInput, TargetAdapter,
+    TargetAdapterRegistry,
+};
+use crate::database::repositories::route_credential_repository::RouteCredentialRepository;
+use crate::database::repositories::route_pool_repository::RoutePoolRepository;
+use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+use crate::error::AppError;
+use crate::models::config_snapshot::ConfigWriteOutcome;
+use crate::models::platform::{PlatformId, PlatformOperation};
+use crate::models::route_credential::{
+    ClaudeSlotWrite, ModelMapping, RouteCredentialPoolScope, CLAUDE_MODEL_SLOTS,
+    CLAUDE_ONE_M_SUFFIX, CLAUDE_SUBAGENT_MODEL_ALIAS, FALLBACK_MODEL_ALIAS,
+};
+use crate::models::route_credential_transfer::RouteCredentialSelectionContext;
+use crate::paths::AppPaths;
+use crate::services::config_write_service::{
+    route_config_path_context, ConfigWriteCoordinator, ConfigWriteRequest, ConfigWriteRuntimeState,
+};
+use crate::services::direct_mode_service::DirectModeService;
+use crate::services::platform_capability_service::PlatformCapabilityService;
+use crate::services::route_model_capability::{
+    advertised_model_catalog_entries_with_baseline, catalog_member_inputs, catalog_members,
+    client_facing_model_catalog_entries, codex_default_context_window,
+    codex_model_catalog_payload_with_baseline, default_third_party_reasoning_levels,
+    normalize_reasoning_levels, parse_model_capability,
+};
+use crate::services::settings_service::SettingsService;
+use directories::BaseDirs;
+use serde::Serialize;
+use serde_json::{Map, Value};
+use sqlx::SqlitePool;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// One `/model` slot as the write path would render it right now.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClaudeSlotPlanSlot {
+    /// The pool alias a client requests (e.g. `claude-sonnet-alias`).
+    pub alias: String,
+    /// The `ANTHROPIC_DEFAULT_*_MODEL` env key this slot lands in.
+    pub model_env_key: String,
+    /// Alias plus the `[1M]` suffix when every pool account supports it;
+    /// `None` when no in-pool account maps this alias (the keys get cleared).
+    pub model: Option<String>,
+    /// Display name shown in Claude Code's `/model` menu, when the pool agrees.
+    pub display_name: Option<String>,
+}
+
+/// Read-only preview of the Claude env plan for the client-setup page: the same
+/// resolver as the write path, so the UI can show the slot mapping without
+/// duplicating its rules.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ClaudeSlotPlan {
+    pub slots: Vec<ClaudeSlotPlanSlot>,
+    pub subagent_model: Option<String>,
+    pub fallback_model: Option<String>,
+}
+
+pub struct RouteConfigService;
+
+impl RouteConfigService {
+    pub async fn write_configs(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        base_url: &str,
+        platform: &str,
+        client_keys: Option<&[String]>,
+    ) -> Result<Vec<ConfigWriteOutcome>, AppError> {
+        let home = resolve_home_dir()?;
+        Self::write_configs_for_home(paths, pool, runtime, base_url, platform, &home, client_keys)
+            .await
+    }
+
+    pub(crate) async fn write_configs_for_home(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        base_url: &str,
+        platform: &str,
+        home: &Path,
+        client_keys: Option<&[String]>,
+    ) -> Result<Vec<ConfigWriteOutcome>, AppError> {
+        let base_url = normalize_base_url(base_url)?;
+        let platform = PlatformId::parse(platform)?;
+        PlatformCapabilityService::require(platform, PlatformOperation::ConfigWrite)?;
+        let path_context = route_config_path_context(paths).await?;
+        let adapters = Self::resolve_write_clients(paths, platform, client_keys).await?;
+        let platform_key = platform.as_str();
+
+        let existing_route_proxy_key =
+            RouteProxyKeyRepository::get_existing_platform_key(pool, platform_key).await?;
+        let route_proxy_key = RouteProxyKeyRepository::ensure_platform_key(
+            pool,
+            platform_key,
+            &generate_route_proxy_key(),
+        )
+        .await?;
+
+        let claude_env = Self::resolve_claude_env_plan(paths, pool, platform).await?;
+        let requires_client_models = adapters
+            .iter()
+            .any(|adapter| adapter.requires_client_models());
+        let client_models =
+            Self::resolve_models_for_config_input(pool, platform, requires_client_models).await?;
+        if requires_client_models && client_models.is_empty() {
+            // A models-less provider is unselectable in ZCode, so writing one
+            // would report success and leave a dead entry.
+            if existing_route_proxy_key.is_none() {
+                let _ = RouteProxyKeyRepository::delete_if_matches(
+                    pool,
+                    platform_key,
+                    &route_proxy_key,
+                )
+                .await;
+            }
+            return Err(AppError::Validation {
+                code: "config.pool_models_empty",
+                message: "The pool advertises no models for this platform".to_string(),
+                details: Some(platform_key.to_string()),
+                recoverable: true,
+            });
+        }
+
+        // The Codex CLI's config.toml references this catalog, so it belongs to
+        // that client and not to the platform.
+        if adapters
+            .iter()
+            .any(|adapter| adapter.client_key() == "codex")
+        {
+            Self::write_codex_model_catalog(pool, home).await?;
+        }
+
+        let aliases =
+            RouteProxyKeyRepository::list_aliases_for_platform(pool, platform_key).await?;
+        let codex_keep_login_state = Self::resolve_codex_keep_login_state(paths, platform).await;
+
+        // One group per client: `write_group` aborts the whole group when any
+        // prepare fails, so grouping them would let a corrupt ZCode config cost
+        // the user their working CLI write.
+        let mut outcomes = Vec::new();
+        let mut last_error = None;
+        let mut any_succeeded = false;
+        for adapter in adapters {
+            let target_key = adapter.target_key();
+            let request = ConfigWriteRequest {
+                adapter,
+                home: home.to_path_buf(),
+                path_context: path_context.clone(),
+                input: RouteConfigInput {
+                    base_url: base_url.to_string(),
+                    route_proxy_key: route_proxy_key.clone(),
+                    route_proxy_key_aliases: aliases.clone(),
+                    claude_env: claude_env.clone(),
+                    client_models: client_models.clone(),
+                    codex_keep_login_state,
+                },
+            };
+            match DirectModeService::write_route(paths, pool, runtime, request, false).await {
+                Ok(group) => {
+                    any_succeeded |= group.iter().any(|outcome| outcome.status == "succeeded");
+                    outcomes.extend(group);
+                }
+                Err(error) => {
+                    // A failed group produces no outcome row, so the result panel
+                    // would silently omit this client.
+                    outcomes.push(failed_client_outcome(target_key, platform_key, &error));
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        if !any_succeeded {
+            if existing_route_proxy_key.is_none() {
+                let _ = RouteProxyKeyRepository::delete_if_matches(
+                    pool,
+                    platform_key,
+                    &route_proxy_key,
+                )
+                .await;
+            }
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    /// Rewrites only platforms that already own a managed proxy key. This is
+    /// used for HTTP/HTTPS changes and never creates additional client config.
+    pub async fn write_existing_configs(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        base_url: &str,
+    ) -> Result<Vec<ConfigWriteOutcome>, AppError> {
+        let home = resolve_home_dir()?;
+        Self::write_existing_configs_for_home(paths, pool, runtime, base_url, &home).await
+    }
+
+    pub(crate) async fn write_existing_configs_for_home(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        base_url: &str,
+        home: &Path,
+    ) -> Result<Vec<ConfigWriteOutcome>, AppError> {
+        // 批量后台重写按固定顺序持有客户端写锁，保留原有组回滚边界。
+        let _codex_guard = DirectModeService::authentication_guard("codex").await;
+        let _claude_guard = DirectModeService::authentication_guard("claude").await;
+        let base_url = normalize_base_url(base_url)?;
+        let platforms = RouteProxyKeyRepository::list_platforms(pool).await?;
+        let registry = TargetAdapterRegistry::new();
+        let path_context = route_config_path_context(paths).await?;
+        let mut requests = Vec::with_capacity(platforms.len());
+        let mut skipped = Vec::new();
+
+        for platform in platforms {
+            let parsed = match PlatformId::parse(&platform) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    skipped.push(skipped_outcome(
+                        &platform,
+                        &platform,
+                        "config.adapter_unavailable",
+                    ));
+                    continue;
+                }
+            };
+            if PlatformCapabilityService::require(parsed, PlatformOperation::ConfigWrite).is_err() {
+                skipped.push(skipped_outcome(
+                    &platform,
+                    parsed.as_str(),
+                    "config.adapter_unavailable",
+                ));
+                continue;
+            }
+            let Some(adapter) = registry
+                .clients_for_platform(parsed)
+                .into_iter()
+                .find(|client| client.native)
+                .and_then(|client| registry.by_client_and_platform(&client.client_key, parsed))
+            else {
+                skipped.push(skipped_outcome(
+                    &platform,
+                    parsed.as_str(),
+                    "config.adapter_unavailable",
+                ));
+                continue;
+            };
+            let Some(route_proxy_key) =
+                RouteProxyKeyRepository::get_existing_platform_key(pool, &platform).await?
+            else {
+                skipped.push(skipped_outcome(
+                    adapter.target_key(),
+                    parsed.as_str(),
+                    "config.route_proxy_key_missing",
+                ));
+                continue;
+            };
+            if DirectModeService::has_direct(pool, adapter.client_key()).await? {
+                skipped.push(skipped_outcome(
+                    adapter.target_key(),
+                    parsed.as_str(),
+                    "direct_mode.preserved",
+                ));
+                continue;
+            }
+            if parsed == PlatformId::Codex {
+                Self::write_codex_model_catalog(pool, home).await?;
+            }
+            // Per-iteration: a claude request must not inherit another
+            // platform's pool state.
+            let claude_env = Self::resolve_claude_env_plan(paths, pool, parsed).await?;
+            // A client that carries its own model list would otherwise have that
+            // list emptied by a base-URL-only rewrite.
+            let client_models = Self::resolve_models_for_config_input(
+                pool,
+                parsed,
+                adapter.requires_client_models(),
+            )
+            .await?;
+            requests.push(ConfigWriteRequest {
+                adapter,
+                home: home.to_path_buf(),
+                path_context: path_context.clone(),
+                input: RouteConfigInput {
+                    base_url: base_url.to_string(),
+                    route_proxy_key,
+                    route_proxy_key_aliases: Vec::new(),
+                    claude_env,
+                    client_models,
+                    codex_keep_login_state: Self::resolve_codex_keep_login_state(paths, parsed)
+                        .await,
+                },
+            });
+        }
+
+        let mut outcomes =
+            ConfigWriteCoordinator::write_group(paths, pool, runtime, requests).await?;
+        let operation_id = outcomes
+            .first()
+            .map(|outcome| outcome.operation_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        for outcome in &mut skipped {
+            outcome.operation_id = operation_id.clone();
+        }
+        outcomes.extend(skipped);
+        Ok(outcomes)
+    }
+
+    /// Whether writing config right now would change the file on disk.
+    ///
+    /// Renders through the real adapter and compares bytes, so this can never
+    /// drift from what a write actually produces — a hand-rolled "did the pool
+    /// change since last write" flag would.
+    ///
+    /// `false` when the platform has no managed proxy key yet (nothing was ever
+    /// written, so there is nothing to re-write) and on any error: a stale-config
+    /// hint must never be the thing that breaks the screen.
+    pub async fn config_write_is_stale(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        base_url: &str,
+        platform: &str,
+        client_keys: Option<&[String]>,
+    ) -> bool {
+        let home = match resolve_home_dir() {
+            Ok(home) => home,
+            Err(_) => return false,
+        };
+        Self::config_write_is_stale_for_home(paths, pool, base_url, platform, &home, client_keys)
+            .await
+    }
+
+    pub(crate) async fn config_write_is_stale_for_home(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        base_url: &str,
+        platform: &str,
+        home: &Path,
+        client_keys: Option<&[String]>,
+    ) -> bool {
+        Self::rendered_config_differs(paths, pool, base_url, platform, home, client_keys)
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn rendered_config_differs(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        base_url: &str,
+        platform: &str,
+        home: &Path,
+        client_keys: Option<&[String]>,
+    ) -> Result<bool, AppError> {
+        let base_url = normalize_base_url(base_url)?;
+        let platform = PlatformId::parse(platform)?;
+        PlatformCapabilityService::require(platform, PlatformOperation::ConfigWrite)?;
+
+        // Never written for this platform → nothing to re-write.
+        let Some(route_proxy_key) =
+            RouteProxyKeyRepository::get_existing_platform_key(pool, platform.as_str()).await?
+        else {
+            return Ok(false);
+        };
+
+        let adapters = Self::resolve_write_clients(paths, platform, client_keys).await?;
+        let path_context = route_config_path_context(paths).await?;
+        let claude_env = Self::resolve_claude_env_plan(paths, pool, platform).await?;
+        let needs_models = adapters
+            .iter()
+            .any(|adapter| adapter.requires_client_models())
+            || platform == PlatformId::Codex;
+        let client_models =
+            Self::resolve_models_for_config_input(pool, platform, needs_models).await?;
+        let aliases =
+            RouteProxyKeyRepository::list_aliases_for_platform(pool, platform.as_str()).await?;
+        // The staleness probe renders through the real adapter, so it must see
+        // the same switch state a write would. Flipping the toggle in settings
+        // then shows up as "config out of date" instead of silently waiting for
+        // an unrelated pool change.
+        let codex_keep_login_state = Self::resolve_codex_keep_login_state(paths, platform).await;
+
+        for adapter in adapters {
+            if DirectModeService::has_direct(pool, adapter.client_key()).await? {
+                continue;
+            }
+            let path = adapter.resolve_path_with_context(home, &path_context);
+            let Ok(existing) = tokio::fs::read(&path).await else {
+                // A file we manage is gone; writing would recreate it.
+                return Ok(true);
+            };
+            let input = RouteConfigInput {
+                base_url: base_url.to_string(),
+                route_proxy_key: route_proxy_key.clone(),
+                route_proxy_key_aliases: aliases.clone(),
+                claude_env: claude_env.clone(),
+                client_models: client_models.clone(),
+                codex_keep_login_state,
+            };
+            // One client's render error must not hide another client's real drift.
+            let Ok(rendered) = adapter.render(&path, Some(&existing), &input) else {
+                continue;
+            };
+            // Compare parsed content, not bytes: `render` pretty-prints whatever
+            // it parsed, so a file the coordinator previously wrote compact would
+            // look "stale" forever on formatting alone.
+            if config_content_differs(&existing, &rendered) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub(crate) async fn write_existing_config_for_home(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        home: &Path,
+        base_url: &str,
+        platform: &str,
+        route_proxy_key: &str,
+    ) -> Result<ConfigWriteOutcome, AppError> {
+        let _authentication_guard = DirectModeService::authentication_guard(platform).await;
+        let base_url = normalize_base_url(base_url)?;
+        let platform = PlatformId::parse(platform)?;
+        PlatformCapabilityService::require(platform, PlatformOperation::ConfigWrite)?;
+        let claude_env = Self::resolve_claude_env_plan(paths, pool, platform).await?;
+        let path_context = route_config_path_context(paths).await?;
+        let adapter = route_config_adapter(&native_client_key(platform)?, platform)?;
+        let client_models =
+            Self::resolve_models_for_config_input(pool, platform, adapter.requires_client_models())
+                .await?;
+        let request = ConfigWriteRequest {
+            adapter,
+            home: home.to_path_buf(),
+            path_context,
+            input: RouteConfigInput {
+                base_url: base_url.to_string(),
+                route_proxy_key: route_proxy_key.to_string(),
+                route_proxy_key_aliases: Vec::new(),
+                claude_env,
+                client_models,
+                codex_keep_login_state: Self::resolve_codex_keep_login_state(paths, platform).await,
+            },
+        };
+        if DirectModeService::has_direct(pool, request.adapter.client_key()).await? {
+            return Ok(skipped_outcome(
+                request.adapter.target_key(),
+                platform.as_str(),
+                "direct_mode.preserved",
+            ));
+        }
+        if platform == PlatformId::Codex {
+            Self::write_codex_model_catalog(pool, home).await?;
+        }
+        ConfigWriteCoordinator::write_group(paths, pool, runtime, vec![request])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Filesystem {
+                code: "filesystem.route_config_write",
+                message: "Configuration write returned no target outcome".to_string(),
+                details: None,
+                recoverable: false,
+            })
+    }
+
+    /// Resolves one alias's write across the pool. Shared by the four `/model`
+    /// slots, the subagent alias, and the fallback alias so all of them obey the
+    /// same 1M and display-name rules.
+    ///
+    /// Always the generic alias, never an account's upstream model name: one
+    /// settings file serves the whole pool, so the proxy does the per-account
+    /// translation.
+    ///
+    /// Merge rules, both deliberately conservative because the client contract
+    /// is one value while our data is per-account:
+    /// - **1M is unanimous (AND).** Every account configuring the alias must
+    ///   support it, else the suffix is omitted. Declaring it otherwise would
+    ///   route a 1M-sized prompt to an account that cannot serve it.
+    /// - **Display name needs consensus.** Accounts that set a non-empty label
+    ///   must all agree; a disagreement omits the key rather than picking a
+    ///   winner. Accounts leaving it blank abstain instead of vetoing.
+    fn resolve_alias_write(account_mappings: &[Vec<ModelMapping>], alias: &str) -> ClaudeSlotWrite {
+        let configured = account_mappings
+            .iter()
+            .filter_map(|mappings| {
+                mappings
+                    .iter()
+                    .find(|mapping| mapping.from.trim() == alias && !mapping.to.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+
+        if configured.is_empty() {
+            return ClaudeSlotWrite::default();
+        }
+
+        let all_support_one_m = configured
+            .iter()
+            .all(|mapping| mapping.supports_1m == Some(true));
+        let model = if all_support_one_m {
+            format!("{alias}{CLAUDE_ONE_M_SUFFIX}")
+        } else {
+            alias.to_string()
+        };
+
+        let mut labels = configured
+            .iter()
+            .filter_map(|mapping| mapping.label.as_deref().map(str::trim))
+            .filter(|label| !label.is_empty());
+        let first = labels.next();
+        let display_name = match first {
+            Some(label) if labels.all(|other| other == label) => Some(label.to_string()),
+            _ => None,
+        };
+
+        ClaudeSlotWrite {
+            model: Some(model),
+            display_name,
+        }
+    }
+
+    fn resolve_claude_slot_writes(account_mappings: &[Vec<ModelMapping>]) -> Vec<ClaudeSlotWrite> {
+        CLAUDE_MODEL_SLOTS
+            .iter()
+            .map(|slot| Self::resolve_alias_write(account_mappings, slot.alias))
+            .collect()
+    }
+
+    /// Loads every enabled in-pool Claude API credential's mappings.
+    ///
+    /// Official credentials are excluded — their bodies are forwarded without
+    /// model rewriting, so an alias would reach the vendor verbatim and 404.
+    /// Like the Codex catalog, this does not filter on `status`, so a cooling
+    /// account still counts.
+    async fn claude_pool_mappings(pool: &SqlitePool) -> Result<Vec<Vec<ModelMapping>>, AppError> {
+        let ids = RoutePoolRepository::list_member_ids(pool, PlatformId::Claude.as_str()).await?;
+        let credentials = RouteCredentialRepository::list_by_ids(
+            pool,
+            &ids,
+            &RouteCredentialSelectionContext {
+                group_id: None,
+                platform: PlatformId::Claude.as_str().to_string(),
+                pool_scope: RouteCredentialPoolScope::InPool,
+            },
+        )
+        .await?;
+
+        Ok(credentials
+            .iter()
+            .filter(|credential| credential.kind == "api")
+            .map(|credential| parse_model_capability(&credential.config_json).mappings)
+            .collect())
+    }
+
+    /// Parses the pool-wide client config, ignoring anything that is not a JSON
+    /// object. A malformed value must not block a config write: the user would be
+    /// locked out of writing any config until they fixed unrelated JSON.
+    fn parse_claude_client_config(raw: Option<&str>) -> Option<Map<String, Value>> {
+        let raw = raw.map(str::trim).filter(|value| !value.is_empty())?;
+        let parsed = serde_json::from_str::<Value>(raw).ok()?;
+        let object = parsed.as_object()?;
+        (!object.is_empty()).then(|| object.clone())
+    }
+
+    /// Adapters to write for this platform. Explicit `requested` wins; otherwise
+    /// the stored per-platform selection; otherwise the platform's native CLI so
+    /// callers that predate client selection behave exactly as before.
+    pub(crate) async fn resolve_write_clients(
+        paths: &AppPaths,
+        platform: PlatformId,
+        requested: Option<&[String]>,
+    ) -> Result<Vec<Arc<dyn TargetAdapter>>, AppError> {
+        let keys = match requested {
+            Some(keys) if !keys.is_empty() => keys.to_vec(),
+            _ => Self::stored_write_client_keys(paths, platform).await,
+        };
+        if keys.is_empty() {
+            return Ok(vec![route_config_adapter(
+                &native_client_key(platform)?,
+                platform,
+            )?]);
+        }
+
+        keys.iter()
+            .map(|key| route_config_adapter(key, platform))
+            .collect()
+    }
+
+    /// Stored selection for this platform, or empty when absent, malformed, or
+    /// empty. A corrupt preference must never block a write.
+    async fn stored_write_client_keys(paths: &AppPaths, platform: PlatformId) -> Vec<String> {
+        let Ok(settings) = SettingsService::load(paths).await else {
+            return Vec::new();
+        };
+        let Some(raw) = settings.config_write_clients_json else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Map<String, Value>>(&raw)
+            .ok()
+            .and_then(|map| map.get(platform.as_str()).cloned())
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// Models this platform's pool advertises, shaped for client configs that
+    /// must carry the list themselves.
+    pub(crate) async fn resolve_client_models(
+        pool: &SqlitePool,
+        platform: PlatformId,
+    ) -> Result<Vec<ClientModel>, AppError> {
+        let credentials = Self::pool_member_credentials(pool, platform).await?;
+        let members = catalog_members(&catalog_member_inputs(&credentials));
+        let mode = RoutePoolRepository::model_mode(pool, platform.as_str()).await?;
+
+        // Claude third-party clients see the upstream model name (``to``) as
+        // the model id, not the Claude Code alias (``from``).  Other platforms
+        // keep using ``advertised_model_catalog_entries`` because their ``from``
+        // IS the model name users want.
+        let baseline_models = if platform == PlatformId::Codex {
+            Some(RoutePoolRepository::baseline_models(pool, platform.as_str()).await?)
+        } else {
+            None
+        };
+        let entries = if platform == PlatformId::Claude {
+            client_facing_model_catalog_entries(platform.as_str(), &members, mode)
+        } else {
+            advertised_model_catalog_entries_with_baseline(
+                platform.as_str(),
+                &members,
+                mode,
+                baseline_models.as_deref(),
+            )
+        };
+
+        Ok(entries
+            .into_iter()
+            .map(|model| ClientModel {
+                context_window: client_model_context_window(
+                    platform,
+                    &model.base_id,
+                    model.context_window,
+                    &model.upstream_model,
+                ),
+                max_output_tokens: CLIENT_MODEL_MAX_OUTPUT_TOKENS,
+                id: model.id,
+                reasoning_levels: {
+                    // The account's own declaration wins, cleaned up. A model the
+                    // account left undeclared — a stepfun relay model that simply
+                    // is not in the built-in profile table — used to get an empty
+                    // list, which left third-party clients (ZCode, WorkBuddy) with
+                    // no reasoning control at all: only a bare on/off toggle. Fall
+                    // back to a minimal ladder so an unmatched model can still
+                    // pick a tier. `low`/`medium`/`high` are all recognised by the
+                    // bridges, so nothing is silently dropped. DeepSeek‑V4 upstreams
+                    // get an extra `max` tier on top of that ladder. A genuinely
+                    // declared empty list is treated the same as "none declared":
+                    // the user wants the choice, not an empty menu.
+                    let declared = normalize_reasoning_levels(model.reasoning_levels.as_deref());
+                    if declared.is_empty() {
+                        default_third_party_reasoning_levels(&model.upstream_model)
+                    } else {
+                        declared
+                    }
+                },
+                supports_image_input: model.supports_image_input,
+            })
+            .collect())
+    }
+
+    async fn resolve_models_for_config_input(
+        pool: &SqlitePool,
+        platform: PlatformId,
+        required_by_adapter: bool,
+    ) -> Result<Vec<ClientModel>, AppError> {
+        if required_by_adapter || platform == PlatformId::Codex {
+            Self::resolve_client_models(pool, platform).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The pool's enabled members for this platform, as full credential rows.
+    async fn pool_member_credentials(
+        pool: &SqlitePool,
+        platform: PlatformId,
+    ) -> Result<Vec<crate::models::route_credential::RouteCredential>, AppError> {
+        let ids = RoutePoolRepository::list_member_ids(pool, platform.as_str()).await?;
+        RouteCredentialRepository::list_by_ids(
+            pool,
+            &ids,
+            &RouteCredentialSelectionContext {
+                group_id: None,
+                platform: platform.as_str().to_string(),
+                pool_scope: RouteCredentialPoolScope::InPool,
+            },
+        )
+        .await
+    }
+
+    /// Builds the Claude-only env plan for a config write. Non-Claude platforms
+    /// get an empty plan, which clears every managed key.
+    async fn resolve_claude_env_plan(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        platform: PlatformId,
+    ) -> Result<ClaudeEnvPlan, AppError> {
+        if platform != PlatformId::Claude {
+            return Ok(ClaudeEnvPlan::default());
+        }
+
+        let account_mappings = Self::claude_pool_mappings(pool).await?;
+        let settings = SettingsService::load(paths).await?;
+        Ok(ClaudeEnvPlan {
+            subagent_model: Self::resolve_alias_write(
+                &account_mappings,
+                CLAUDE_SUBAGENT_MODEL_ALIAS,
+            )
+            .model,
+            // Requests that fall outside the four `/model` roles. The client key
+            // wants a concrete model, so write the fallback alias the proxy
+            // already rewrites per account.
+            fallback_model: Self::resolve_alias_write(&account_mappings, FALLBACK_MODEL_ALIAS)
+                .model,
+            slots: Self::resolve_claude_slot_writes(&account_mappings),
+            client_config: Self::parse_claude_client_config(
+                settings.claude_client_config_json.as_deref(),
+            ),
+        })
+    }
+
+    /// Read-only view of what the next Claude config write would put into the
+    /// `/model` slots and the subagent/fallback env keys. Reuses the write
+    /// path's resolver so the client-setup page can explain the mapping without
+    /// a second copy of its rules.
+    pub async fn claude_slot_plan(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+    ) -> Result<ClaudeSlotPlan, AppError> {
+        let plan = Self::resolve_claude_env_plan(paths, pool, PlatformId::Claude).await?;
+        Ok(ClaudeSlotPlan {
+            slots: CLAUDE_MODEL_SLOTS
+                .iter()
+                .zip(plan.slots)
+                .map(|(slot, write)| ClaudeSlotPlanSlot {
+                    alias: slot.alias.to_string(),
+                    model_env_key: slot.model_env_key.to_string(),
+                    model: write.model,
+                    display_name: write.display_name,
+                })
+                .collect(),
+            subagent_model: plan.subagent_model,
+            fallback_model: plan.fallback_model,
+        })
+    }
+
+    /// Whether the Codex provider should keep the client's ChatGPT login.
+    ///
+    /// Only applies to the Codex platform: the switch describes Codex's own
+    /// `auth.json` credential, which no other client reads. A settings read
+    /// failure falls back to `false` — the default-off shape is the one that
+    /// works without a login, so an unreadable settings file must not push every
+    /// platform onto the experimental path.
+    async fn resolve_codex_keep_login_state(paths: &AppPaths, platform: PlatformId) -> bool {
+        if platform != PlatformId::Codex {
+            return false;
+        }
+        SettingsService::load(paths)
+            .await
+            .map(|settings| settings.codex_keep_login_state)
+            .unwrap_or(false)
+    }
+
+    async fn write_codex_model_catalog(pool: &SqlitePool, home: &Path) -> Result<(), AppError> {
+        let credentials = Self::pool_member_credentials(pool, PlatformId::Codex).await?;
+        let members = catalog_members(&catalog_member_inputs(&credentials));
+        let mode = RoutePoolRepository::model_mode(pool, PlatformId::Codex.as_str()).await?;
+        let baseline_models =
+            RoutePoolRepository::baseline_models(pool, PlatformId::Codex.as_str()).await?;
+        let payload =
+            codex_model_catalog_payload_with_baseline(&members, mode, Some(&baseline_models));
+        // The desktop build filters every model's ladder through a global
+        // enabled-efforts set that defaults to low/medium/high/xhigh/ultra/
+        // persistent and therefore has no `max`. A model that declares `max`
+        // loses it in the picker while the catalog still advertises it, which
+        // reads as "I ticked max but the client only offers high". Teach the
+        // client the tiers this catalog actually uses.
+        Self::align_codex_enabled_reasoning_efforts(home, &payload).await;
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(|err| AppError::Validation {
+            code: "validation.codex_model_catalog_serialization",
+            message: "Could not serialize Codex model catalog".to_string(),
+            details: Some(err.to_string()),
+            recoverable: false,
+        })?;
+        let path = codex_model_catalog_path(home);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| AppError::Filesystem {
+                    code: "filesystem.codex_model_catalog_dir",
+                    message: "Could not create Codex configuration directory".to_string(),
+                    details: Some(err.to_string()),
+                    recoverable: true,
+                })?;
+        }
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|err| AppError::Filesystem {
+                code: "filesystem.codex_model_catalog_write",
+                message: "Could not write Codex model catalog".to_string(),
+                details: Some(err.to_string()),
+                recoverable: true,
+            })
+    }
+
+    /// Brings the Codex desktop's global `enabled-reasoning-efforts` set in line
+    /// with the tiers this catalog actually advertises.
+    ///
+    /// The desktop UI keeps a single whitelist of selectable efforts — persisted
+    /// as a "persisted atom" under `enabled-reasoning-efforts`, defaulting to
+    /// `["low","medium","high","xhigh","ultra","persistent"]` — and filters every
+    /// model's declared ladder through it. `KNt` (the "is this a real effort"
+    /// guard it runs first) does accept `max`, so the whitelist is the only thing
+    /// dropping it. That is why a model can carry `max` in the catalog yet show
+    /// only `low/medium/high` in the picker.
+    ///
+    /// The set is additive on purpose: it never removes a tier the user enabled
+    /// by hand, and it is a no-op when the client has no state file yet (the CLI
+    /// never reads it) or already lists everything. Failing to write it must not
+    /// cost the user their catalog, so every error here is swallowed — the
+    /// catalog is still correct and the CLI still works.
+    async fn align_codex_enabled_reasoning_efforts(home: &Path, payload: &Value) {
+        let advertised = advertised_codex_reasoning_efforts(payload);
+        if advertised.is_empty() {
+            return;
+        }
+        let global_state = codex_global_state_path(home);
+        let Ok(raw) = tokio::fs::read_to_string(&global_state).await else {
+            return;
+        };
+        let Ok(mut document) = serde_json::from_str::<Value>(&raw) else {
+            return;
+        };
+        let Some(atom) = document
+            .get_mut("electron-persisted-atom-state")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+
+        // The host prefixes atom keys by writer — `diff-filter` lands bare while
+        // the onboarding atoms land as `electron:<key>`. Which form this atom
+        // takes is therefore not something to guess: touch every existing key
+        // that names it, and seed the bare key when none exists yet (that is the
+        // shape the settings registry itself declares).
+        let mut targets: Vec<String> = atom
+            .keys()
+            .filter(|key| {
+                key.as_str() == ATOM_KEY
+                    || key
+                        .strip_suffix(ATOM_KEY)
+                        .is_some_and(|prefix| prefix == "electron:" || prefix == "electron-")
+            })
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            targets.push(ATOM_KEY.to_string());
+        }
+
+        let mut changed = false;
+        for target in targets {
+            let current = atom
+                .get(&target)
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    CODEX_DESKTOP_DEFAULT_REASONING_EFFORTS
+                        .iter()
+                        .map(|level| (*level).to_string())
+                        .collect()
+                });
+
+            let mut merged = current.clone();
+            for level in &advertised {
+                if !merged.iter().any(|existing| existing == level) {
+                    merged.push(level.clone());
+                }
+            }
+            if merged == current {
+                continue;
+            }
+            changed = true;
+            atom.insert(
+                target,
+                Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        if !changed {
+            return;
+        }
+        if let Ok(serialized) = serde_json::to_vec_pretty(&document) {
+            let _ = tokio::fs::write(&global_state, serialized).await;
+        }
+    }
+}
+
+/// The settings-registry key for the desktop's selectable-effort whitelist.
+const ATOM_KEY: &str = "enabled-reasoning-efforts";
+
+/// The desktop's built-in enabled-effort set. Mirrored so the merge above has a
+/// starting point when the client has not written the atom yet; `max` is absent
+/// on purpose, which is the whole bug this guards against.
+const CODEX_DESKTOP_DEFAULT_REASONING_EFFORTS: &[&str] =
+    &["low", "medium", "high", "xhigh", "ultra", "persistent"];
+
+fn codex_global_state_path(home: &Path) -> PathBuf {
+    home.join(".codex").join(".codex-global-state.json")
+}
+
+/// Every effort any model in the catalog advertises, in catalog order.
+fn advertised_codex_reasoning_efforts(payload: &Value) -> Vec<String> {
+    let mut efforts = Vec::new();
+    let Some(models) = payload.get("models").and_then(Value::as_array) else {
+        return efforts;
+    };
+    for model in models {
+        let Some(levels) = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for effort in levels.iter().filter_map(|entry| {
+            entry
+                .get("effort")
+                .and_then(Value::as_str)
+                .or_else(|| entry.as_str())
+        }) {
+            if !efforts.iter().any(|existing| existing == effort) {
+                efforts.push(effort.to_string());
+            }
+        }
+    }
+    efforts
+}
+
+fn skipped_outcome(target_key: &str, platform: &str, error_code: &str) -> ConfigWriteOutcome {
+    ConfigWriteOutcome {
+        operation_id: String::new(),
+        snapshot_id: None,
+        target_app_id: None,
+        target_key: target_key.to_string(),
+        platform: platform.to_string(),
+        path: String::new(),
+        status: "skipped".to_string(),
+        before_hash: None,
+        after_hash: None,
+        error_code: Some(error_code.to_string()),
+    }
+}
+
+/// A client whose group write errored has no outcome row of its own, so the
+/// result panel would silently omit it.
+fn failed_client_outcome(target_key: &str, platform: &str, error: &AppError) -> ConfigWriteOutcome {
+    ConfigWriteOutcome {
+        operation_id: String::new(),
+        snapshot_id: None,
+        target_app_id: None,
+        target_key: target_key.to_string(),
+        platform: platform.to_string(),
+        path: String::new(),
+        status: "failed".to_string(),
+        before_hash: None,
+        after_hash: None,
+        error_code: Some(error.code().to_string()),
+    }
+}
+
+fn route_config_adapter(
+    client_key: &str,
+    platform: PlatformId,
+) -> Result<Arc<dyn TargetAdapter>, AppError> {
+    TargetAdapterRegistry::new()
+        .by_client_and_platform(client_key, platform)
+        .ok_or_else(|| AppError::Validation {
+            code: "config.client_unavailable",
+            message: "No verified configuration adapter is available for this client".to_string(),
+            details: Some(format!("{client_key}:{}", platform.as_str())),
+            recoverable: true,
+        })
+}
+
+/// The platform's first-party CLI client key. Used by call sites that predate
+/// explicit client selection so their behavior is unchanged.
+fn native_client_key(platform: PlatformId) -> Result<String, AppError> {
+    TargetAdapterRegistry::new()
+        .clients_for_platform(platform)
+        .into_iter()
+        .find(|client| client.native)
+        .map(|client| client.client_key)
+        .ok_or_else(|| AppError::Validation {
+            code: "config.adapter_unavailable",
+            message: "No verified native configuration adapter is available".to_string(),
+            details: Some(platform.as_str().to_string()),
+            recoverable: true,
+        })
+}
+
+fn resolve_home_dir() -> Result<PathBuf, AppError> {
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .ok_or_else(|| AppError::Filesystem {
+            code: "filesystem.home_not_found",
+            message: "Could not resolve the current user home directory".to_string(),
+            details: None,
+            recoverable: false,
+        })
+}
+
+/// Whether two config payloads differ in content. JSON is compared as parsed
+/// values so formatting alone never reads as a pending change; anything else
+/// (TOML) falls back to bytes.
+fn config_content_differs(existing: &[u8], rendered: &[u8]) -> bool {
+    match (
+        serde_json::from_slice::<Value>(existing),
+        serde_json::from_slice::<Value>(rendered),
+    ) {
+        (Ok(existing), Ok(rendered)) => existing != rendered,
+        _ => existing != rendered,
+    }
+}
+
+fn normalize_base_url(base_url: &str) -> Result<&str, AppError> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(AppError::Validation {
+            code: "validation.route_proxy_base_url_required",
+            message: "Route proxy base URL is required before writing configs".to_string(),
+            details: None,
+            recoverable: true,
+        });
+    }
+    Ok(base_url)
+}
+
+pub fn generate_route_proxy_key() -> String {
+    format!("sk-ai-switch-{}", Uuid::new_v4().simple())
+}
+
+const CLIENT_MODEL_MAX_OUTPUT_TOKENS: u32 = 128_000;
+const CLIENT_MODEL_CONTEXT_WINDOW: u32 = 200_000;
+const CLIENT_MODEL_ONE_M_CONTEXT_WINDOW: u32 = 1_000_000;
+
+/// The `[1m]` suffix is how the pool advertises a 1M-context variant of a
+/// model, so the written limit has to follow it rather than the base id. A
+/// mapping that states its own context window outranks both: the user picked
+/// that number against a specific upstream, and guessing 200K for it would
+/// under-report a 400K relay.
+///
+/// Codex has its own default table keyed by the upstream model, and it has to be
+/// the same one the Codex catalog uses — a pool whose CLI is told 1M while ZCode
+/// is told 200K would truncate on one client and not the other.
+fn client_model_context_window(
+    platform: PlatformId,
+    model_id: &str,
+    declared: Option<u32>,
+    upstream_model: &str,
+) -> u32 {
+    if let Some(declared) = declared.filter(|window| *window > 0) {
+        return declared;
+    }
+    if platform == PlatformId::Codex {
+        return codex_default_context_window(upstream_model);
+    }
+    if model_id.trim().to_ascii_lowercase().ends_with("[1m]") {
+        CLIENT_MODEL_ONE_M_CONTEXT_WINDOW
+    } else {
+        CLIENT_MODEL_CONTEXT_WINDOW
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_writer::ConfigWriter;
+    use crate::database::{create_memory_pool, run_migrations};
+    use crate::models::settings::AppSettings;
+    use crate::services::config_write_service::ConfigWriteRuntimeState;
+    use crate::services::route_pool_model_mode::PoolModelMode;
+    use chrono::Utc;
+
+    const BASE_URL: &str = "http://127.0.0.1:43111";
+
+    #[test]
+    fn advertised_efforts_collect_every_tier_the_catalog_uses() {
+        let payload = serde_json::json!({
+            "models": [
+                { "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] },
+                { "supported_reasoning_levels": [{ "effort": "high" }, { "effort": "max" }] },
+                { "supported_reasoning_levels": [] },
+                { "supported_reasoning_levels": ["medium"] }
+            ]
+        });
+
+        assert_eq!(
+            advertised_codex_reasoning_efforts(&payload),
+            vec!["low", "max", "high", "medium"]
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_max_to_the_desktop_effort_set_keeps_hand_picked_tiers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "enabled-reasoning-efforts": ["low", "medium", "high", "xhigh", "ultra", "persistent"],
+                    "diff-filter": "last-turn"
+                },
+                "local-projects": ["keep-me"]
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [
+                { "supported_reasoning_levels": [
+                    { "effort": "low" }, { "effort": "medium" },
+                    { "effort": "high" }, { "effort": "max" }
+                ] }
+            ]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        let atom = written["electron-persisted-atom-state"]
+            .as_object()
+            .expect("atom state");
+        // `max` joins the set; nothing the client already had is dropped.
+        assert_eq!(
+            atom["enabled-reasoning-efforts"],
+            serde_json::json!([
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "ultra",
+                "persistent",
+                "max"
+            ])
+        );
+        // Unrelated atoms and top-level keys survive the rewrite.
+        assert_eq!(atom["diff-filter"], serde_json::json!("last-turn"));
+        assert_eq!(written["local-projects"], serde_json::json!(["keep-me"]));
+    }
+
+    #[tokio::test]
+    async fn align_efforts_updates_every_prefix_shape_the_host_uses() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        // The host writes atom keys bare, as `electron:<key>`, or as
+        // `electron-<key>` depending on the writer. All three must learn `max`.
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": {
+                    "enabled-reasoning-efforts": ["low", "high"],
+                    "electron:enabled-reasoning-efforts": ["medium", "high"],
+                    "diff-filter": "last-turn"
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        let atom = written["electron-persisted-atom-state"]
+            .as_object()
+            .expect("atom");
+        assert_eq!(
+            atom["enabled-reasoning-efforts"],
+            serde_json::json!(["low", "high", "max"])
+        );
+        assert_eq!(
+            atom["electron:enabled-reasoning-efforts"],
+            serde_json::json!(["medium", "high", "max"])
+        );
+        assert_eq!(atom["diff-filter"], serde_json::json!("last-turn"));
+        assert!(atom.get("electron:enabled-reasoning-efforts").is_some());
+    }
+
+    #[tokio::test]
+    async fn align_efforts_seeds_the_bare_key_when_the_client_never_wrote_one() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "electron-persisted-atom-state": { "diff-filter": "last-turn" }
+            }))
+            .expect("json"),
+        )
+        .expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read"))
+                .expect("parse");
+        // No key existed, so the seed starts from the desktop's own default set
+        // and gains only what the catalog adds.
+        assert_eq!(
+            written["electron-persisted-atom-state"]["enabled-reasoning-efforts"],
+            serde_json::json!([
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "ultra",
+                "persistent",
+                "max"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn aligning_efforts_leaves_a_file_that_already_lists_max_untouched() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path();
+        let state_path = codex_global_state_path(home);
+        std::fs::create_dir_all(state_path.parent().expect("dir")).expect("mkdir");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "electron-persisted-atom-state": {
+                "enabled-reasoning-efforts": ["low", "medium", "high", "max"]
+            }
+        }))
+        .expect("json");
+        std::fs::write(&state_path, &original).expect("write");
+
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] }]
+        });
+        RouteConfigService::align_codex_enabled_reasoning_efforts(home, &payload).await;
+
+        // Byte-identical: a no-op must not rewrite the client's state file.
+        assert_eq!(std::fs::read(&state_path).expect("read"), original);
+    }
+
+    #[tokio::test]
+    async fn aligning_efforts_is_a_no_op_without_a_client_state_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let payload = serde_json::json!({
+            "models": [{ "supported_reasoning_levels": [{ "effort": "max" }] }]
+        });
+
+        RouteConfigService::align_codex_enabled_reasoning_efforts(temp.path(), &payload).await;
+
+        // The CLI-only setup ships no desktop state file; writing one here would
+        // create a half-initialised document the client may then treat as canon.
+        assert!(!codex_global_state_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn generated_route_proxy_key_uses_sk_shape() {
+        let key = generate_route_proxy_key();
+        assert!(key.starts_with("sk-ai-switch-"));
+        assert!(key.len() > "sk-ai-switch-".len() + 20);
+    }
+
+    #[tokio::test]
+    async fn write_configs_refuses_a_platform_with_no_pool_models_without_minting_a_key() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = AppPaths::from_data_dir(temp.path().to_path_buf());
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = ConfigWriteRuntimeState::default();
+        // OpenCode's provider entry carries the model list, and these three
+        // platforms have no baseline models of their own — an empty pool means
+        // there is nothing to write.
+        let error = RouteConfigService::write_configs_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            "http://127.0.0.1:43111",
+            "opencode",
+            temp.path(),
+            None,
+        )
+        .await
+        .expect_err("no pool models");
+
+        match error {
+            AppError::Validation { code, details, .. } => {
+                assert_eq!(code, "config.pool_models_empty");
+                assert_eq!(details.as_deref(), Some("opencode"));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+        assert!(
+            RouteProxyKeyRepository::get_existing_platform_key(&pool, "opencode")
+                .await
+                .expect("key lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_agent_platform_writes_its_own_config_carrying_the_key_inline() {
+        for (platform, relative, needle) in [
+            ("opencode", ".config/opencode/opencode.json", "\"apiKey\""),
+            ("openclaw", ".openclaw/openclaw.json", "\"apiKey\""),
+            ("hermes", ".hermes/config.yaml", "api_key:"),
+        ] {
+            let fixture = ServiceFixture::new().await;
+            seed_agent_pool_member(&fixture.pool, platform, "glm-5.3").await;
+
+            let outcomes = RouteConfigService::write_configs_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                &fixture.runtime,
+                BASE_URL,
+                platform,
+                &fixture.home,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{platform} write: {error:?}"));
+
+            assert_eq!(outcomes.len(), 1, "{platform}");
+            assert_eq!(outcomes[0].status, "succeeded", "{platform}");
+            assert_eq!(outcomes[0].platform, platform);
+
+            let written = tokio::fs::read_to_string(fixture.home.join(relative))
+                .await
+                .unwrap_or_else(|error| panic!("{platform} config: {error:?}"));
+            let key = RouteProxyKeyRepository::get_existing_platform_key(&fixture.pool, platform)
+                .await
+                .expect("key lookup")
+                .expect("minted key");
+            // The credential travels inline: none of these three can read it from
+            // a loopback endpoint's host or from an env var we do not own, which
+            // is what left a hand-configured pool reporting a missing API key.
+            assert!(written.contains(&key), "{platform}: {written}");
+            assert!(written.contains(needle), "{platform}: {written}");
+            assert!(written.contains("glm-5.3"), "{platform}: {written}");
+            assert!(
+                written.contains("127.0.0.1:43111/v1"),
+                "{platform}: {written}"
+            );
+
+            // A fresh write is not stale, and the platform reports as managed.
+            assert!(
+                !RouteConfigService::config_write_is_stale_for_home(
+                    &fixture.paths,
+                    &fixture.pool,
+                    BASE_URL,
+                    platform,
+                    &fixture.home,
+                    None,
+                )
+                .await,
+                "{platform}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_base_url_rewrite_keeps_the_agent_platforms_model_list() {
+        // The HTTP↔HTTPS switch path passes no client models. For the four
+        // native CLIs that is right — they discover models themselves — but for
+        // these three the list lives in the file we are rewriting, so a
+        // models-less rewrite would silently empty the provider.
+        let fixture = ServiceFixture::new().await;
+        seed_agent_pool_member(&fixture.pool, "hermes", "glm-5.3").await;
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "http://127.0.0.1:19527",
+            "hermes",
+            &fixture.home,
+            None,
+        )
+        .await
+        .expect("first write");
+
+        let outcomes = RouteConfigService::write_existing_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "https://127.0.0.1:19528",
+            &fixture.home,
+        )
+        .await
+        .expect("rewrite");
+
+        assert!(outcomes
+            .iter()
+            .any(|item| item.platform == "hermes" && item.status == "succeeded"));
+        let written = tokio::fs::read_to_string(fixture.home.join(".hermes/config.yaml"))
+            .await
+            .expect("hermes config");
+        assert!(written.contains("https://127.0.0.1:19528/v1"), "{written}");
+        assert!(written.contains("glm-5.3"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn a_hermes_write_leaves_every_section_it_does_not_own_untouched() {
+        let fixture = ServiceFixture::new().await;
+        seed_agent_pool_member(&fixture.pool, "hermes", "glm-5.3").await;
+        let hermes = fixture.home.join(".hermes").join("config.yaml");
+        tokio::fs::create_dir_all(hermes.parent().unwrap())
+            .await
+            .unwrap();
+        // Hermes' own docs tell people to hand-edit this file, so its comments
+        // and unrelated sections are load-bearing user data.
+        tokio::fs::write(
+            &hermes,
+            b"# my notes\ndatabase:\n  journal_mode: \"wal\"\n\nmcp_servers:\n  filesystem:\n    command: npx\n",
+        )
+        .await
+        .unwrap();
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "hermes",
+            &fixture.home,
+            None,
+        )
+        .await
+        .expect("write");
+
+        let written = tokio::fs::read_to_string(&hermes).await.expect("read");
+        assert!(written.contains("# my notes"), "{written}");
+        assert!(written.contains("journal_mode: \"wal\""), "{written}");
+        assert!(written.contains("command: npx"), "{written}");
+        assert!(written.contains("provider: ai-switch"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn write_configs_removes_new_proxy_key_when_user_config_is_invalid() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        tokio::fs::write(codex_dir.join("config.toml"), "model_provider = [invalid")
+            .await
+            .expect("seed invalid config");
+
+        let paths = AppPaths::from_data_dir(app_dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = ConfigWriteRuntimeState::default();
+
+        let error = RouteConfigService::write_configs_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            "http://127.0.0.1:43111",
+            "codex",
+            home.path(),
+            None,
+        )
+        .await
+        .expect_err("invalid config must fail");
+
+        assert!(matches!(
+            error,
+            AppError::Filesystem {
+                code: "filesystem.route_config_write",
+                details: Some(details),
+                ..
+            } if details.contains("validation.route_config_existing_invalid")
+        ));
+        assert!(
+            RouteProxyKeyRepository::get_existing_platform_key(&pool, "codex")
+                .await
+                .expect("key lookup")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_platform_key_is_stable_across_generations() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+
+        let first = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "grok",
+            &generate_route_proxy_key(),
+        )
+        .await
+        .expect("first");
+        let second = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "grok",
+            &generate_route_proxy_key(),
+        )
+        .await
+        .expect("second");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("sk-ai-switch-"));
+        assert_eq!(
+            RouteProxyKeyRepository::get_platform_by_key(&pool, &first)
+                .await
+                .expect("lookup")
+                .as_deref(),
+            Some("grok")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_existing_configs_for_home_writes_only_preexisting_proxy_key_platforms() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let home = tempfile::tempdir().expect("home dir");
+        let paths = AppPaths::from_data_dir(app_dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let runtime = ConfigWriteRuntimeState::default();
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-codex")
+            .await
+            .expect("codex key");
+
+        let outcomes = RouteConfigService::write_existing_configs_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            "https://127.0.0.1:43111",
+            home.path(),
+        )
+        .await
+        .expect("write existing configs");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].target_key, "codex");
+        assert_eq!(outcomes[0].status, "succeeded");
+        assert!(outcomes[0].snapshot_id.is_some());
+        assert!(serde_json::to_value(&outcomes[0])
+            .unwrap()
+            .get("route_proxy_key")
+            .is_none());
+        let codex_config = tokio::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        assert!(codex_config.contains("https://127.0.0.1:43111"));
+        assert!(codex_config.contains("model_catalog_json = \"ai-switch-model-catalog.json\""));
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(home.path().join(".codex/ai-switch-model-catalog.json"))
+                .await
+                .expect("codex model catalog"),
+        )
+        .expect("valid codex model catalog");
+        assert!(catalog.get("models").is_some());
+        assert!(catalog.get("data").is_none());
+        assert!(!home.path().join(".claude/settings.json").exists());
+        assert!(!home.path().join(".gemini/settings.json").exists());
+        assert!(!home.path().join(".grok/settings.json").exists());
+        assert_eq!(
+            RouteProxyKeyRepository::list_platforms(&pool)
+                .await
+                .expect("platforms"),
+            vec!["codex".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_existing_codex_config_repairs_stale_model_and_preserves_unmanaged_toml() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        let codex_path = codex_dir.join("config.toml");
+        tokio::fs::write(
+            &codex_path,
+            r#"model = "gpt-5.5"
+approval_policy = "never"
+
+[model_providers.keep]
+name = "Keep"
+base_url = "https://keep.example/v1"
+wire_api = "chat"
+api_key_env_var = "KEEP_KEY"
+
+[mcp_servers.filesystem]
+command = "npx"
+"#,
+        )
+        .await
+        .expect("seed config");
+
+        RouteConfigService::write_existing_config_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            home.path(),
+            "http://127.0.0.1:43111",
+            "codex",
+            "sk-ai-switch-test",
+        )
+        .await
+        .expect("write config");
+
+        let written = tokio::fs::read_to_string(&codex_path)
+            .await
+            .expect("read config");
+        assert!(written.contains("approval_policy = \"never\""));
+        assert!(written.contains("model = \"gpt-5.6-sol\""));
+        assert!(written.contains("[model_providers.keep]"));
+        assert!(written.contains("api_key_env_var = \"KEEP_KEY\""));
+        assert!(written.contains("[mcp_servers.filesystem]"));
+        assert!(written.contains("model_provider = \"ai-switch\""));
+        assert!(written.contains("[model_providers.ai-switch]"));
+        assert!(written.contains("base_url = \"http://127.0.0.1:43111/v1\""));
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(!written.contains("api_key = \"sk-ai-switch-test\""));
+    }
+
+    #[tokio::test]
+    async fn codex_keep_login_state_switch_reaches_the_written_config() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        // The login-state branch only writes when a ChatGPT login exists; this is
+        // what `codex login` leaves behind.
+        tokio::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-access","refresh_token":"rt","id_token":"id","account_id":"acct"}}"#,
+        )
+        .await
+        .expect("seed auth");
+        let codex_path = codex_dir.join("config.toml");
+        let write = || {
+            RouteConfigService::write_existing_config_for_home(
+                &paths,
+                &pool,
+                &runtime,
+                home.path(),
+                "http://127.0.0.1:43111",
+                "codex",
+                "sk-ai-switch-test",
+            )
+        };
+        let read = || async {
+            tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config")
+        };
+        let set_switch = |keep: bool| {
+            let paths = paths.clone();
+            async move {
+                let mut settings = SettingsService::load(&paths).await.expect("settings");
+                settings.codex_keep_login_state = keep;
+                SettingsService::save(&paths, &settings)
+                    .await
+                    .expect("save settings");
+            }
+        };
+
+        // Default: the proxy key authenticates Codex, no login hand-off.
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(!written.contains("requires_openai_auth"));
+
+        // Switched on: Codex keeps its ChatGPT login and loses the proxy key.
+        set_switch(true).await;
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("requires_openai_auth = true"));
+        assert!(written.contains("name = \"OpenAI\""));
+        assert!(written.contains("x-ai-switch-platform = \"codex\""));
+        assert!(
+            !written.contains("experimental_bearer_token"),
+            "the bearer token would outrank the login and void the switch"
+        );
+        // The gateway URL must still be the proxy, not the official backend.
+        assert!(written.contains("base_url = \"http://127.0.0.1:43111/v1\""));
+
+        // Toggling back must fully restore the default shape.
+        set_switch(false).await;
+        write().await.expect("write config");
+        let written = read().await;
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(!written.contains("requires_openai_auth"));
+        assert!(!written.contains("x-ai-switch-platform"));
+    }
+
+    #[tokio::test]
+    async fn a_login_state_write_without_a_login_fails_and_keeps_the_old_config() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        let codex_path = codex_dir.join("config.toml");
+        // No auth.json at all, or an apikey-mode one: both mean there is no
+        // ChatGPT credential to hand off to.
+        for auth in [
+            None,
+            Some(r#"{"OPENAI_API_KEY":"sk-upstream","auth_mode":"apikey"}"#),
+        ] {
+            match auth {
+                Some(contents) => {
+                    tokio::fs::write(codex_dir.join("auth.json"), contents)
+                        .await
+                        .expect("seed auth");
+                }
+                None => {
+                    let _ = tokio::fs::remove_file(codex_dir.join("auth.json")).await;
+                }
+            }
+            let write = || {
+                RouteConfigService::write_existing_config_for_home(
+                    &paths,
+                    &pool,
+                    &runtime,
+                    home.path(),
+                    "http://127.0.0.1:43111",
+                    "codex",
+                    "sk-ai-switch-test",
+                )
+            };
+
+            // Write a working default config first, then flip the switch. Reset
+            // the switch each round: the settings file outlives the loop and the
+            // previous iteration left it on.
+            let mut settings = SettingsService::load(&paths).await.expect("settings");
+            settings.codex_keep_login_state = false;
+            SettingsService::save(&paths, &settings)
+                .await
+                .expect("save settings");
+            write().await.expect("seed config");
+            let before = tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config");
+            let mut settings = SettingsService::load(&paths).await.expect("settings");
+            settings.codex_keep_login_state = true;
+            SettingsService::save(&paths, &settings)
+                .await
+                .expect("save settings");
+
+            let error = write().await.expect_err("write must be refused");
+            // The coordinator wraps per-target failures, but the real reason is
+            // preserved in `cause_code` (which the UI reads as `error_code`).
+            let details = format!("{error:?}");
+            assert!(
+                details.contains("config.codex_login_missing")
+                    || details.contains("config.codex_login_not_chatgpt"),
+                "unexpected error: {details}"
+            );
+            // The previously working config must survive untouched — replacing
+            // it with an unauthenticated provider is the failure this prevents.
+            let after = tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read config");
+            assert_eq!(before, after);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_check_reports_a_codex_login_state_change() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        seed_codex_pool_member(&pool, "gpt-5.6-sol").await;
+        // The probe bails out early for platforms that never got a managed key,
+        // so the key has to exist before a written config can be compared.
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+            .await
+            .expect("codex key");
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        // Flipping the switch only produces a different config when a ChatGPT
+        // login exists; without one the write is refused by design.
+        tokio::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-access","refresh_token":"rt","id_token":"id","account_id":"acct"}}"#,
+        )
+        .await
+        .expect("seed auth");
+        let base_url = "http://127.0.0.1:43111";
+        let is_stale = || {
+            RouteConfigService::config_write_is_stale_for_home(
+                &paths,
+                &pool,
+                base_url,
+                "codex",
+                home.path(),
+                None,
+            )
+        };
+
+        RouteConfigService::write_existing_config_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            home.path(),
+            base_url,
+            "codex",
+            "sk-ai-switch-test",
+        )
+        .await
+        .expect("write config");
+        assert!(!is_stale().await);
+
+        // The probe renders through the real adapter, so flipping this switch
+        // has to read as pending work — otherwise the file stays on the old
+        // auth shape until some unrelated edit happens to rewrite it.
+        let mut settings = SettingsService::load(&paths).await.expect("settings");
+        settings.codex_keep_login_state = true;
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save settings");
+        assert!(is_stale().await);
+    }
+
+    #[tokio::test]
+    async fn write_existing_json_config_preserves_unmanaged_settings_and_env() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("mkdir");
+        let claude_path = claude_dir.join("settings.json");
+        tokio::fs::write(
+            &claude_path,
+            r#"{
+  "permissions": {
+    "allow": ["Bash(ls)"]
+  },
+  "env": {
+    "EXISTING_FLAG": "1",
+    "ANTHROPIC_BASE_URL": "https://old.example"
+  }
+}"#,
+        )
+        .await
+        .expect("seed settings");
+
+        RouteConfigService::write_existing_config_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            home.path(),
+            "https://127.0.0.1:43111",
+            "claude",
+            "sk-ai-switch-test",
+        )
+        .await
+        .expect("write settings");
+
+        let written = tokio::fs::read_to_string(&claude_path)
+            .await
+            .expect("read settings");
+        let json: serde_json::Value = serde_json::from_str(&written).expect("valid json");
+        assert_eq!(json["permissions"]["allow"][0], "Bash(ls)");
+        assert_eq!(json["env"]["EXISTING_FLAG"], "1");
+        assert_eq!(json["env"]["ANTHROPIC_BASE_URL"], "https://127.0.0.1:43111");
+        // The key Claude Code actually authenticates with.
+        assert_eq!(json["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-ai-switch-test");
+        assert!(json["env"].get("AI_SWITCH_ROUTE_PROXY_API_KEY").is_none());
+        assert_eq!(
+            json["aiSwitch"]["routeProxy"]["baseUrl"],
+            "https://127.0.0.1:43111"
+        );
+        assert_eq!(json["aiSwitch"]["routeProxy"]["platform"], "claude");
+    }
+
+    async fn seed_claude_pool_member(pool: &SqlitePool, kind: &str, mappings_json: &str) {
+        use crate::models::route_credential::CreateApiRouteCredentialInput;
+        use crate::models::route_pool::SetRoutePoolMembersInput;
+        use crate::services::route_credential_service::RouteCredentialService;
+        use crate::services::route_pool_service::RoutePoolService;
+
+        let credential = RouteCredentialService::create_api(
+            pool,
+            CreateApiRouteCredentialInput {
+                platform: "claude".to_string(),
+                display_name: "Claude Account".to_string(),
+                api_key: "sk-test".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                interface_format: "anthropic".to_string(),
+                model_mappings_json: mappings_json.to_string(),
+                fetched_models_json: None,
+                api_key_field: None,
+                preview_json: None,
+                batch_id: None,
+                responses_custom_tool_compat: None,
+                responses_plaintext_reasoning_compat: None,
+                request_brotli_compression: None,
+                responses_encrypted_content_cleanup: None,
+                responses_encrypted_content_aggressive_strip: None,
+                force_reasoning_content: None,
+                content_rejection_compat: None,
+                user_agent: None,
+                relay_balance_provider: None,
+                relay_balance_access_token: None,
+                relay_balance_access_token_user_id: None,
+                provider: None,
+            },
+        )
+        .await
+        .expect("create claude credential");
+
+        if kind != "api" {
+            sqlx::query("UPDATE route_credentials SET kind = ? WHERE id = ?")
+                .bind(kind)
+                .bind(&credential.id)
+                .execute(pool)
+                .await
+                .expect("set kind");
+        }
+
+        RoutePoolService::set_members(
+            pool,
+            SetRoutePoolMembersInput {
+                platform: "claude".to_string(),
+                account_ids: vec![credential.id],
+            },
+        )
+        .await
+        .expect("set pool members");
+    }
+
+    async fn write_claude_config_with_pool(
+        home: &Path,
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+    ) -> serde_json::Value {
+        RouteConfigService::write_configs_for_home(
+            paths,
+            pool,
+            runtime,
+            "http://127.0.0.1:43111",
+            "claude",
+            home,
+            None,
+        )
+        .await
+        .expect("write claude config");
+
+        let written = tokio::fs::read_to_string(home.join(".claude/settings.json"))
+            .await
+            .expect("read settings");
+        serde_json::from_str(&written).expect("valid json")
+    }
+
+    #[tokio::test]
+    async fn a_fresh_claude_write_carries_the_credential_claude_code_authenticates_with() {
+        // 0.7.0 shipped with only ANTHROPIC_BASE_URL here: the client was told
+        // where the proxy is but not how to authenticate to it, so every request
+        // died at 401 before a credential was picked — invisible in both the
+        // request log and the usage stats. `write_existing_config_for_home` has its
+        // own assertion; this pins the path behind the "write client config"
+        // button, which is the one users actually take.
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+
+        let token = json["env"]["ANTHROPIC_AUTH_TOKEN"]
+            .as_str()
+            .expect("ANTHROPIC_AUTH_TOKEN must be written");
+        assert!(!token.is_empty());
+        // Same value as the ledger entry, so the proxy recognizes the caller.
+        assert_eq!(json["aiSwitch"]["routeProxy"]["apiKey"], token);
+        // Two keys nothing ever read; one of them leaked the credential to every
+        // process the agent spawns.
+        assert!(json["env"].get("AI_SWITCH_ROUTE_PROXY").is_none());
+        assert!(json["env"].get("AI_SWITCH_ROUTE_PROXY_API_KEY").is_none());
+    }
+
+    #[tokio::test]
+    async fn subagent_alias_is_written_only_when_a_pool_account_configures_it() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+
+        // No account configures a subagent mapping yet.
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+        assert!(json["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[{"from":"claude-subagent","to":"provider-haiku"}]"#,
+        )
+        .await;
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+        // The generic alias, NOT the account's upstream model: one settings file
+        // serves the whole pool, so the proxy does the per-account translation.
+        assert_eq!(json["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-subagent");
+        assert_ne!(json["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "provider-haiku");
+    }
+
+    #[tokio::test]
+    async fn subagent_alias_is_cleared_when_no_account_configures_it() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[{"from":"claude-sonnet-alias","to":"provider-sonnet","label":"Sonnet"}]"#,
+        )
+        .await;
+
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("mkdir");
+        tokio::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"stale-alias","EXISTING_FLAG":"1"}}"#,
+        )
+        .await
+        .expect("seed stale settings");
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+
+        // Mirror-inverse: a stale value must never harden into an explicit setting.
+        assert!(json["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+        assert_eq!(json["env"]["EXISTING_FLAG"], "1");
+    }
+
+    #[tokio::test]
+    async fn subagent_alias_ignores_official_accounts() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        // Official credentials forward bodies without model rewriting, so an
+        // alias would reach the vendor verbatim and 404.
+        seed_claude_pool_member(
+            &pool,
+            "official",
+            r#"[{"from":"claude-subagent","to":"provider-haiku"}]"#,
+        )
+        .await;
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+
+        assert!(json["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
+    }
+
+    #[tokio::test]
+    async fn claude_slot_plan_previews_the_write_path_resolution() {
+        let (_app_dir, paths, pool, _runtime) = config_write_context().await;
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[
+                {"from":"claude-sonnet-alias","to":"provider-sonnet","label":"Sonnet","supports_1m":true},
+                {"from":"claude-opus-alias","to":"provider-opus"},
+                {"from":"claude-subagent","to":"provider-haiku"}
+            ]"#,
+        )
+        .await;
+
+        let plan = RouteConfigService::claude_slot_plan(&paths, &pool)
+            .await
+            .expect("slot plan");
+
+        assert_eq!(plan.slots.len(), CLAUDE_MODEL_SLOTS.len());
+        let sonnet = &plan.slots[0];
+        assert_eq!(sonnet.alias, "claude-sonnet-alias");
+        assert_eq!(sonnet.model_env_key, "ANTHROPIC_DEFAULT_SONNET_MODEL");
+        // 全部命中账号都声明 1M → 写入值带后缀；显示名池内一致 → 保留。
+        assert_eq!(sonnet.model.as_deref(), Some("claude-sonnet-alias[1M]"));
+        assert_eq!(sonnet.display_name.as_deref(), Some("Sonnet"));
+        // 没声明 1M → 裸别名；无显示名。
+        assert_eq!(plan.slots[1].model.as_deref(), Some("claude-opus-alias"));
+        assert_eq!(plan.slots[1].display_name, None);
+        // 未配置的槽位解析为清空。
+        assert_eq!(plan.slots[2].model, None);
+        assert_eq!(plan.slots[3].model, None);
+        assert_eq!(plan.subagent_model.as_deref(), Some("claude-subagent"));
+        assert_eq!(plan.fallback_model, None);
+    }
+
+    #[tokio::test]
+    async fn claude_slot_plan_is_empty_without_pool_accounts() {
+        let (_app_dir, paths, pool, _runtime) = config_write_context().await;
+
+        let plan = RouteConfigService::claude_slot_plan(&paths, &pool)
+            .await
+            .expect("slot plan");
+
+        assert!(plan.slots.iter().all(|slot| slot.model.is_none()));
+        assert_eq!(plan.subagent_model, None);
+        assert_eq!(plan.fallback_model, None);
+    }
+
+    fn slot_mapping(alias: &str, to: &str, label: Option<&str>, one_m: bool) -> ModelMapping {
+        ModelMapping {
+            from: alias.to_string(),
+            to: to.to_string(),
+            label: label.map(str::to_string),
+            supports_1m: one_m.then_some(true),
+            ..Default::default()
+        }
+    }
+
+    fn sonnet_write(mappings: &[Vec<ModelMapping>]) -> ClaudeSlotWrite {
+        RouteConfigService::resolve_claude_slot_writes(mappings)
+            .into_iter()
+            .next()
+            .expect("sonnet slot")
+    }
+
+    #[test]
+    fn unconfigured_slots_are_cleared() {
+        let writes = RouteConfigService::resolve_claude_slot_writes(&[vec![slot_mapping(
+            "claude-sonnet-alias",
+            "provider-sonnet",
+            None,
+            false,
+        )]]);
+
+        assert_eq!(writes.len(), CLAUDE_MODEL_SLOTS.len());
+        assert_eq!(writes[0].model.as_deref(), Some("claude-sonnet-alias"));
+        // Opus/Fable/Haiku unconfigured → cleared, not defaulted to something.
+        assert_eq!(writes[1], ClaudeSlotWrite::default());
+        assert_eq!(writes[3], ClaudeSlotWrite::default());
+    }
+
+    #[test]
+    fn slot_model_is_the_generic_alias_never_the_upstream_name() {
+        let write = sonnet_write(&[vec![slot_mapping(
+            "claude-sonnet-alias",
+            "deepseek-v3-0324",
+            None,
+            false,
+        )]]);
+
+        assert_eq!(write.model.as_deref(), Some("claude-sonnet-alias"));
+    }
+
+    #[test]
+    fn one_m_is_declared_only_when_every_account_supports_it() {
+        let all = sonnet_write(&[
+            vec![slot_mapping("claude-sonnet-alias", "a", None, true)],
+            vec![slot_mapping("claude-sonnet-alias", "b", None, true)],
+        ]);
+        assert_eq!(all.model.as_deref(), Some("claude-sonnet-alias[1M]"));
+
+        // AND, not OR: declaring 1M here would route a 1M-sized prompt to the
+        // account that cannot serve it.
+        let mixed = sonnet_write(&[
+            vec![slot_mapping("claude-sonnet-alias", "a", None, true)],
+            vec![slot_mapping("claude-sonnet-alias", "b", None, false)],
+        ]);
+        assert_eq!(mixed.model.as_deref(), Some("claude-sonnet-alias"));
+    }
+
+    #[test]
+    fn one_m_ignores_accounts_that_do_not_configure_the_slot() {
+        // The second account configures only Haiku, so it must not veto Sonnet's 1M.
+        let write = sonnet_write(&[
+            vec![slot_mapping("claude-sonnet-alias", "a", None, true)],
+            vec![slot_mapping("claude-haiku-alias", "b", None, false)],
+        ]);
+
+        assert_eq!(write.model.as_deref(), Some("claude-sonnet-alias[1M]"));
+    }
+
+    #[test]
+    fn display_name_needs_pool_consensus() {
+        let agreed = sonnet_write(&[
+            vec![slot_mapping(
+                "claude-sonnet-alias",
+                "a",
+                Some("DeepSeek V3"),
+                false,
+            )],
+            vec![slot_mapping(
+                "claude-sonnet-alias",
+                "b",
+                Some("DeepSeek V3"),
+                false,
+            )],
+        ]);
+        assert_eq!(agreed.display_name.as_deref(), Some("DeepSeek V3"));
+
+        // Disagreement omits the key rather than silently picking a winner.
+        let conflicting = sonnet_write(&[
+            vec![slot_mapping(
+                "claude-sonnet-alias",
+                "a",
+                Some("DeepSeek V3"),
+                false,
+            )],
+            vec![slot_mapping(
+                "claude-sonnet-alias",
+                "b",
+                Some("Kimi K2"),
+                false,
+            )],
+        ]);
+        assert_eq!(conflicting.display_name, None);
+    }
+
+    #[test]
+    fn blank_display_names_abstain_instead_of_vetoing() {
+        let write = sonnet_write(&[
+            vec![slot_mapping(
+                "claude-sonnet-alias",
+                "a",
+                Some("DeepSeek V3"),
+                false,
+            )],
+            vec![slot_mapping("claude-sonnet-alias", "b", None, false)],
+            vec![slot_mapping("claude-sonnet-alias", "c", Some("  "), false)],
+        ]);
+
+        assert_eq!(write.display_name.as_deref(), Some("DeepSeek V3"));
+    }
+
+    #[tokio::test]
+    async fn write_claude_config_pins_model_slots_and_display_names() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[{"from":"claude-sonnet-alias","to":"deepseek-v3","label":"DeepSeek V3","supports_1m":true},
+                {"from":"claude-haiku-alias","to":"provider-haiku","label":"Haiku Fast"}]"#,
+        )
+        .await;
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+        let env = &json["env"];
+
+        // Generic aliases pin the client contract; the upstream name never leaks.
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "claude-sonnet-alias[1M]"
+        );
+        assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "DeepSeek V3");
+        assert_ne!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "deepseek-v3");
+
+        assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-alias");
+        assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"], "Haiku Fast");
+
+        // Unconfigured slots stay absent rather than being invented.
+        assert!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+        assert!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME").is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_check_reports_pending_pool_and_client_config_edits() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        let base_url = "http://127.0.0.1:43111";
+        let is_stale = || {
+            RouteConfigService::config_write_is_stale_for_home(
+                &paths,
+                &pool,
+                base_url,
+                "claude",
+                home.path(),
+                None,
+            )
+        };
+
+        // Never written for this platform → nothing to nudge about.
+        assert!(!is_stale().await);
+
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[{"from":"claude-sonnet-alias","to":"provider-sonnet"}]"#,
+        )
+        .await;
+        write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+
+        // Just written → in sync.
+        assert!(!is_stale().await);
+
+        // A mapping edit alone makes the on-disk file stale: the app writes only
+        // on demand, so this is exactly the state the UI must surface.
+        seed_claude_pool_member(
+            &pool,
+            "api",
+            r#"[{"from":"claude-opus-alias","to":"provider-opus"}]"#,
+        )
+        .await;
+        assert!(is_stale().await);
+
+        write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+        assert!(!is_stale().await);
+
+        // Same for a global client-config edit, which never touches the pool.
+        let mut settings = SettingsService::load(&paths).await.expect("settings");
+        settings.claude_client_config_json = Some(r#"{"includeCoAuthoredBy":false}"#.to_string());
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save settings");
+        assert!(is_stale().await);
+    }
+
+    #[tokio::test]
+    async fn write_claude_config_covers_every_managed_model_key() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        // Every role configured, all 1M, one shared display name — the fully
+        // populated shape a single-account pool produces.
+        let mappings = CLAUDE_MODEL_SLOTS
+            .iter()
+            .map(|slot| slot.alias)
+            .chain([CLAUDE_SUBAGENT_MODEL_ALIAS, FALLBACK_MODEL_ALIAS])
+            .map(|alias| {
+                format!(
+                    r#"{{"from":"{alias}","to":"claude-opus-5","label":"claude-opus-5","supports_1m":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        seed_claude_pool_member(&pool, "api", &format!("[{mappings}]")).await;
+
+        let json = write_claude_config_with_pool(home.path(), &paths, &pool, &runtime).await;
+        let env = json["env"].as_object().expect("env object");
+
+        for slot in CLAUDE_MODEL_SLOTS {
+            assert_eq!(env[slot.model_env_key], format!("{}[1M]", slot.alias));
+            assert_eq!(env[slot.name_env_key], "claude-opus-5");
+        }
+        // The subagent and the catch-all are aliases too, so they carry [1M] the
+        // same way and get rewritten per account by the proxy.
+        assert_eq!(env["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-subagent[1M]");
+        assert_eq!(env["ANTHROPIC_MODEL"], "claude-model[1M]");
+
+        // Ten managed model keys in total: 4 slots x (model + display name),
+        // plus the subagent and the catch-all.
+        let managed = env
+            .keys()
+            .filter(|key| {
+                key.starts_with("ANTHROPIC_DEFAULT_")
+                    || key.as_str() == "ANTHROPIC_MODEL"
+                    || key.as_str() == "CLAUDE_CODE_SUBAGENT_MODEL"
+            })
+            .count();
+        assert_eq!(managed, 10);
+    }
+
+    #[test]
+    fn malformed_client_config_is_ignored_rather_than_blocking_the_write() {
+        // A bad value must not lock the user out of writing any config at all.
+        for raw in [
+            Some("not json"),
+            Some("[1,2,3]"),
+            Some("\"a string\""),
+            Some("{}"),
+            Some("   "),
+            None,
+        ] {
+            assert_eq!(RouteConfigService::parse_claude_client_config(raw), None);
+        }
+
+        let parsed = RouteConfigService::parse_claude_client_config(Some(
+            r#"{"includeCoAuthoredBy":false}"#,
+        ))
+        .expect("object");
+        assert_eq!(parsed["includeCoAuthoredBy"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn write_existing_config_refuses_to_overwrite_invalid_user_config() {
+        let (_app_dir, paths, pool, runtime) = config_write_context().await;
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        let codex_path = codex_dir.join("config.toml");
+        let original = "model_provider = [not valid TOML";
+        tokio::fs::write(&codex_path, original)
+            .await
+            .expect("seed invalid config");
+
+        let error = RouteConfigService::write_existing_config_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            home.path(),
+            "http://127.0.0.1:43111",
+            "codex",
+            "sk-ai-switch-test",
+        )
+        .await
+        .expect_err("invalid existing config must not be overwritten");
+
+        assert!(matches!(
+            error,
+            AppError::Filesystem {
+                code: "filesystem.route_config_write",
+                details: Some(details),
+                ..
+            } if details.contains("validation.route_config_existing_invalid")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read original"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn write_existing_configs_for_home_fails_before_overwriting_invalid_config() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let home = tempfile::tempdir().expect("home dir");
+        let codex_dir = home.path().join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        let codex_path = codex_dir.join("config.toml");
+        let original = "model_provider = [not valid TOML";
+        tokio::fs::write(&codex_path, original)
+            .await
+            .expect("seed invalid config");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let paths = AppPaths::from_data_dir(app_dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let runtime = ConfigWriteRuntimeState::default();
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-codex")
+            .await
+            .expect("codex key");
+
+        let error = RouteConfigService::write_existing_configs_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            "http://127.0.0.1:43111",
+            home.path(),
+        )
+        .await
+        .expect_err("invalid config must fail the batch before writes");
+
+        assert!(matches!(
+            error,
+            AppError::Filesystem {
+                code: "filesystem.route_config_write",
+                details: Some(details),
+                ..
+            } if details.contains("validation.route_config_existing_invalid")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&codex_path)
+                .await
+                .expect("read original"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn write_existing_configs_for_home_does_not_partially_update_another_platform() {
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        let grok_dir = home.path().join(".grok");
+        tokio::fs::create_dir_all(&claude_dir)
+            .await
+            .expect("claude mkdir");
+        tokio::fs::create_dir_all(&grok_dir)
+            .await
+            .expect("grok mkdir");
+        let claude_path = claude_dir.join("settings.json");
+        let grok_path = grok_dir.join("settings.json");
+        let claude_original = r#"{"env":{"EXISTING_FLAG":"1"}}"#;
+        let grok_original = "{not valid JSON";
+        tokio::fs::write(&claude_path, claude_original)
+            .await
+            .expect("seed claude");
+        tokio::fs::write(&grok_path, grok_original)
+            .await
+            .expect("seed grok");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let paths = AppPaths::from_data_dir(app_dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let runtime = ConfigWriteRuntimeState::default();
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "claude", "sk-claude")
+            .await
+            .expect("claude key");
+        RouteProxyKeyRepository::ensure_platform_key(&pool, "grok", "sk-grok")
+            .await
+            .expect("grok key");
+
+        let error = RouteConfigService::write_existing_configs_for_home(
+            &paths,
+            &pool,
+            &runtime,
+            "http://127.0.0.1:43111",
+            home.path(),
+        )
+        .await
+        .expect_err("invalid Grok config must prevent all writes");
+
+        assert!(matches!(
+            error,
+            AppError::Filesystem {
+                code: "filesystem.route_config_write",
+                details: Some(details),
+                ..
+            } if details.contains("validation.route_config_existing_invalid")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&claude_path)
+                .await
+                .expect("read claude"),
+            claude_original
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&grok_path)
+                .await
+                .expect("read grok"),
+            grok_original
+        );
+    }
+
+    #[test]
+    fn one_m_suffixed_models_get_the_larger_context_window() {
+        assert_eq!(
+            client_model_context_window(PlatformId::Codex, "gpt-5.6-sol", None, "gpt-5.6-sol"),
+            272_000
+        );
+        assert_eq!(
+            client_model_context_window(
+                PlatformId::Claude,
+                "claude-sonnet-alias[1m]",
+                None,
+                "claude-sonnet-alias"
+            ),
+            1_000_000
+        );
+        assert_eq!(
+            client_model_context_window(
+                PlatformId::Claude,
+                "Claude-Sonnet-Alias[1M]",
+                None,
+                "claude-sonnet-alias"
+            ),
+            1_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn write_clients_default_to_the_native_cli_when_never_chosen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+
+        let clients = RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, None)
+            .await
+            .expect("clients");
+
+        // Unchanged behavior for users who never open the dialog.
+        assert_eq!(
+            clients
+                .iter()
+                .map(|adapter| adapter.client_key())
+                .collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_selection_is_honored_per_platform() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let mut settings = AppSettings::defaults_for_data_dir(paths.data_dir.display().to_string());
+        settings.config_write_clients_json =
+            Some(r#"{"codex":["codex","zcode"],"claude":["claude_code"]}"#.to_string());
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save");
+
+        let codex = RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, None)
+            .await
+            .expect("codex clients");
+        assert_eq!(
+            codex
+                .iter()
+                .map(|adapter| adapter.target_key())
+                .collect::<Vec<_>>(),
+            vec!["codex", "zcode_codex"]
+        );
+
+        // The stored codex selection must not leak into another platform.
+        let claude = RouteConfigService::resolve_write_clients(&paths, PlatformId::Claude, None)
+            .await
+            .expect("claude clients");
+        assert_eq!(
+            claude
+                .iter()
+                .map(|adapter| adapter.target_key())
+                .collect::<Vec<_>>(),
+            vec!["claude_code"]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_request_overrides_storage_and_rejects_unknown_clients() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+
+        let requested = vec!["zcode".to_string()];
+        let clients =
+            RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, Some(&requested))
+                .await
+                .expect("clients");
+        assert_eq!(
+            clients
+                .iter()
+                .map(|adapter| adapter.target_key())
+                .collect::<Vec<_>>(),
+            vec!["zcode_codex"]
+        );
+
+        // Fail loudly: silently skipping an unknown key would look like a
+        // successful write that did nothing.
+        let unknown = vec!["not-a-client".to_string()];
+        // `Vec<Arc<dyn TargetAdapter>>` is not `Debug`, so `expect_err` is out.
+        let Err(error) =
+            RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, Some(&unknown))
+                .await
+        else {
+            panic!("an unknown client key must be rejected");
+        };
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "config.client_unavailable",
+                ..
+            }
+        ));
+
+        // A client that exists but not for this platform is equally a mismatch.
+        let wrong_platform = vec!["claude_code".to_string()];
+        assert!(RouteConfigService::resolve_write_clients(
+            &paths,
+            PlatformId::Codex,
+            Some(&wrong_platform)
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_selection_json_falls_back_to_the_native_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let mut settings = AppSettings::defaults_for_data_dir(paths.data_dir.display().to_string());
+        settings.config_write_clients_json = Some("{not json".to_string());
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save");
+
+        // A corrupt preference must never be the thing that blocks a write.
+        let clients = RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, None)
+            .await
+            .expect("clients");
+        assert_eq!(
+            clients
+                .iter()
+                .map(|adapter| adapter.client_key())
+                .collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_stored_selection_falls_back_to_the_native_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let mut settings = AppSettings::defaults_for_data_dir(paths.data_dir.display().to_string());
+        settings.config_write_clients_json = Some(r#"{"codex":[]}"#.to_string());
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save");
+
+        // An empty list would otherwise write nothing and report success.
+        let clients = RouteConfigService::resolve_write_clients(&paths, PlatformId::Codex, None)
+            .await
+            .expect("clients");
+        assert_eq!(
+            clients
+                .iter()
+                .map(|adapter| adapter.client_key())
+                .collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+    }
+
+    struct ServiceFixture {
+        _temp: tempfile::TempDir,
+        paths: AppPaths,
+        pool: SqlitePool,
+        runtime: ConfigWriteRuntimeState,
+        home: PathBuf,
+    }
+
+    impl ServiceFixture {
+        async fn new() -> Self {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let paths = AppPaths::from_data_dir(temp.path().join("app-data"));
+            paths.ensure().await.expect("paths");
+            let pool = create_memory_pool().await.expect("pool");
+            run_migrations(&pool).await.expect("migrations");
+            let home = temp.path().join("home");
+            tokio::fs::create_dir_all(&home).await.expect("home");
+
+            Self {
+                _temp: temp,
+                paths,
+                pool,
+                runtime: ConfigWriteRuntimeState::default(),
+                home,
+            }
+        }
+    }
+
+    /// An in-pool api credential mapping one model to itself, which is the
+    /// minimum for the pool to advertise anything.
+    async fn seed_codex_pool_member(pool: &SqlitePool, model: &str) {
+        let config_json = serde_json::json!({
+            "model_mappings": [{ "from": model, "to": model }]
+        })
+        .to_string();
+        seed_codex_pool_member_with_config(pool, &config_json).await;
+    }
+
+    async fn seed_codex_pool_member_with_config(pool: &SqlitePool, config_json: &str) {
+        seed_pool_member(pool, "codex", config_json).await;
+    }
+
+    /// A codex pool member whose display name matters, for the precise-mode
+    /// tests: the account prefix is derived from it.
+    async fn seed_named_codex_pool_member(pool: &SqlitePool, display_name: &str, model: &str) {
+        let config_json = serde_json::json!({
+            "model_mappings": [{ "from": model, "to": model }]
+        })
+        .to_string();
+        seed_named_pool_member(pool, "codex", display_name, &config_json).await;
+    }
+
+    /// An in-pool api credential on `platform`, advertising whatever
+    /// `config_json`'s mappings declare.
+    async fn seed_pool_member(pool: &SqlitePool, platform: &str, config_json: &str) {
+        seed_named_pool_member(pool, platform, "seed", config_json).await;
+    }
+
+    async fn seed_named_pool_member(
+        pool: &SqlitePool,
+        platform: &str,
+        display_name: &str,
+        config_json: &str,
+    ) {
+        let credential_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        // 统一账号池（G-P8 P4a）：夹具账号一律落唯一池 codex + 默认组；
+        // platform 参数保留为对接身份（决定给哪个客户端写配置），不影响存储。
+        sqlx::query(
+            "INSERT INTO route_credentials (id, platform, kind, display_name, secret_payload_json, config_json, preview_json, created_at, updated_at)
+             VALUES (?, 'codex', 'api', ?, '{}', ?, '{}', ?, ?)",
+        )
+        .bind(&credential_id)
+        .bind(display_name)
+        .bind(config_json)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert credential");
+        sqlx::query(
+            "INSERT INTO route_pool_members (id, platform, route_credential_id, created_at, updated_at, group_id)
+             VALUES (?, 'codex', ?, ?, ?, 'codex-default')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&credential_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert pool member");
+    }
+
+    /// One model mapped to itself, the minimum for the pool to advertise it.
+    async fn seed_agent_pool_member(pool: &SqlitePool, platform: &str, model: &str) {
+        let config_json = serde_json::json!({
+            "model_mappings": [{ "from": model, "to": model }]
+        })
+        .to_string();
+        seed_pool_member(pool, platform, &config_json).await;
+    }
+
+    /// The sk the Codex CLI config was written with, read back from disk.
+    async fn codex_written_key(home: &Path) -> String {
+        let raw = tokio::fs::read_to_string(home.join(".codex/config.toml"))
+            .await
+            .expect("read config.toml");
+        raw.lines()
+            .find_map(|line| line.trim().strip_prefix("experimental_bearer_token = "))
+            .map(|value| value.trim().trim_matches('"').to_string())
+            .expect("bearer token")
+    }
+
+    #[tokio::test]
+    async fn zcode_only_write_leaves_the_codex_cli_files_untouched() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+
+        let outcomes = RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|o| o.target_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zcode_codex"]
+        );
+        assert!(fixture.home.join(".zcode/v2/provider_config.json").exists());
+        // Neither the CLI config nor the catalog it references belongs to this write.
+        assert!(!fixture.home.join(".codex/config.toml").exists());
+        assert!(!fixture
+            .home
+            .join(".codex/ai-switch-model-catalog.json")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn zcode_writes_the_declared_reasoning_levels_verbatim_and_falls_back_to_a_default_ladder_when_none(
+    ) {
+        // The third-party ZCode config mirrors the account exactly for models that
+        // declare efforts (no baseline-profile padding). A model that declares
+        // none no longer gets *no* reasoning control — a bare on/off toggle — but
+        // a minimal default ladder, so an unmatched relay model can still pick a
+        // tier. `low`/`medium`/`high` are all recognised by the bridges.
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member_with_config(
+            &fixture.pool,
+            &serde_json::json!({
+                "model_mappings": [
+                    { "from": "gpt-5.6-sol", "to": "gpt-5.6-sol", "reasoning_levels": ["medium", "max"] },
+                    { "from": "some-audio-model", "to": "some-audio-model" },
+                    { "from": "ds-flash", "to": "deepseek-v4-flash", "reasoning_levels": [] }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
+            .await
+            .expect("read zcode config");
+        let json: Value = serde_json::from_slice(&raw).expect("json");
+        let rules = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules");
+        let rule_for = |model_id: &str| {
+            rules
+                .iter()
+                .find(|rule| rule["modelId"] == model_id)
+                .unwrap_or_else(|| panic!("no rule for {model_id}: {json}"))
+        };
+
+        // Declared efforts survive exactly, in order, with no profile padding.
+        assert_eq!(
+            rule_for("gpt-5.6-sol")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["medium", "max"] })
+        );
+        // No declaration → a default ladder (not an empty block), so ZCode offers
+        // real tiers instead of a bare enable/disable.
+        assert_eq!(
+            rule_for("some-audio-model")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["low", "medium", "high"] }),
+            "an undeclared model must get the default reasoning ladder: {}",
+            rule_for("some-audio-model")
+        );
+        // A DeepSeek‑V4 upstream adds a `max` tier to that ladder.
+        assert_eq!(
+            rule_for("ds-flash")["config"]["optionSpecs"]["reasoningLevel"],
+            serde_json::json!({ "values": ["low", "medium", "high", "max"] }),
+            "a deepseek-v4 upstream must get the max tier in its ladder: {}",
+            rule_for("ds-flash")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_zcode_config_does_not_block_the_codex_cli_write() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
+        tokio::fs::create_dir_all(zcode_path.parent().unwrap())
+            .await
+            .expect("dir");
+        tokio::fs::write(&zcode_path, b"{not json")
+            .await
+            .expect("corrupt");
+
+        let outcomes = RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string(), "zcode".to_string()]),
+        )
+        .await
+        .expect("partial success is not an error");
+
+        // Independent client configs are not one transaction: one broken file
+        // must not cost the user their working Codex setup.
+        let codex = outcomes
+            .iter()
+            .find(|o| o.target_key == "codex")
+            .expect("codex");
+        assert_eq!(codex.status, "succeeded");
+        let zcode = outcomes
+            .iter()
+            .find(|o| o.target_key == "zcode_codex")
+            .expect("zcode");
+        assert_ne!(zcode.status, "succeeded");
+        assert!(fixture.home.join(".codex/config.toml").exists());
+        // Refused, not overwritten.
+        assert_eq!(
+            tokio::fs::read(&zcode_path).await.expect("read"),
+            b"{not json"
+        );
+
+        // The key backs a write that did land, so it must survive.
+        assert_eq!(
+            RouteProxyKeyRepository::get_existing_platform_key(&fixture.pool, "codex")
+                .await
+                .expect("key"),
+            Some(codex_written_key(&fixture.home).await)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_key_is_removed_only_when_every_client_fails() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let zcode_path = fixture.home.join(".zcode/v2/provider_config.json");
+        tokio::fs::create_dir_all(zcode_path.parent().unwrap())
+            .await
+            .expect("dir");
+        tokio::fs::write(&zcode_path, b"{not json")
+            .await
+            .expect("corrupt");
+
+        let error = RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect_err("only client failed");
+
+        assert!(matches!(
+            error,
+            AppError::Validation { .. } | AppError::Filesystem { .. }
+        ));
+        // Nothing was written, so the key we minted has no reason to exist.
+        assert!(
+            RouteProxyKeyRepository::get_existing_platform_key(&fixture.pool, "codex")
+                .await
+                .expect("key")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_zcode_without_pool_models_is_refused() {
+        let fixture = ServiceFixture::new().await;
+        // No pool member: nothing to advertise.
+
+        let error = RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect_err("must refuse");
+
+        // A models-less provider is unselectable in ZCode, so writing one would
+        // look like success and behave like a dead entry.
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "config.pool_models_empty",
+                ..
+            }
+        ));
+        assert!(!fixture.home.join(".zcode/v2/provider_config.json").exists());
+    }
+
+    #[tokio::test]
+    async fn zcode_write_carries_the_pool_models_and_rotated_key_aliases() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
+            .await
+            .expect("read");
+        let json: Value = serde_json::from_slice(&raw).expect("json");
+        let rule = json["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .expect("provider rules")
+            .iter()
+            .find(|rule| rule["providerId"] == "ai-switch-codex")
+            .expect("ai-switch-codex rule");
+        assert_eq!(
+            rule["config"]["api"]["headers"]["ai-switch-managed"],
+            "codex"
+        );
+        assert_eq!(
+            rule["config"]["personalModelIds"],
+            serde_json::json!(["gpt-5.6-sol"])
+        );
+        let model_rule = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol rule");
+        assert_eq!(
+            model_rule["config"]["optionSpecs"]["maxOutputTokens"]["max"],
+            128000
+        );
+        // Same Codex default the CLI catalog writes for a passthrough gpt id.
+        assert_eq!(model_rule["config"]["properties"]["contextWindow"], 272000);
+    }
+
+    #[tokio::test]
+    async fn codex_config_writes_the_selected_models_top_reasoning_effort() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        // `gpt-5.6-sol` ships low→ultra, so the client opens on `ultra` — the same
+        // tier the catalog advertises as its default. A fixed `high` used to win
+        // here and silently cap every model whose ladder went higher.
+        assert!(codex_config.contains("model_reasoning_effort = \"ultra\""));
+    }
+
+    #[tokio::test]
+    async fn gpt_6_1_sol_config_writes_max_instead_of_an_unsupported_ultra() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-6.1-sol").await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        // The Responses upstream rejects `ultra`; the default effort is the last
+        // tier of the baseline ladder, which for this model stops at `max`.
+        assert!(codex_config.contains("model_reasoning_effort = \"max\""));
+        assert!(!codex_config.contains("model_reasoning_effort = \"ultra\""));
+    }
+
+    #[tokio::test]
+    async fn codex_config_carries_a_declared_reasoning_list_into_the_root_effort() {
+        let fixture = ServiceFixture::new().await;
+        // An account that deliberately caps a model at `medium`: the root effort
+        // has to follow the declaration, not the model's shipped ladder.
+        seed_codex_pool_member_with_config(
+            &fixture.pool,
+            r#"{"model_mappings":[{"from":"relay-model","to":"relay-model","reasoning_levels":["low","medium"]}]}"#,
+        )
+        .await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        assert!(codex_config.contains("model_reasoning_effort = \"medium\""));
+    }
+
+    #[tokio::test]
+    async fn codex_config_repairs_a_stale_default_model_missing_from_the_catalog() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let codex_dir = fixture.home.join(".codex");
+        tokio::fs::create_dir_all(&codex_dir).await.expect("mkdir");
+        tokio::fs::write(
+            codex_dir.join("config.toml"),
+            r#"model = "gpt-5.5"
+model_provider = "ai-switch"
+"#,
+        )
+        .await
+        .expect("seed config");
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let codex_config = tokio::fs::read_to_string(fixture.home.join(".codex/config.toml"))
+            .await
+            .expect("codex config");
+        let document: toml::Value = codex_config.parse().expect("codex TOML");
+        let catalog: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(fixture.home.join(".codex/ai-switch-model-catalog.json"))
+                .await
+                .expect("codex model catalog"),
+        )
+        .expect("valid codex model catalog");
+
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-sol"));
+        assert!(catalog["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .any(|model| model["slug"].as_str() == Some("gpt-5.6-sol")));
+    }
+
+    #[tokio::test]
+    async fn codex_base_url_rewrite_repairs_a_default_model_missing_from_the_catalog() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "http://127.0.0.1:19527",
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("initial write");
+
+        let codex_path = fixture.home.join(".codex/config.toml");
+        let current = tokio::fs::read_to_string(&codex_path)
+            .await
+            .expect("codex config");
+        let stale = current.replace("model = \"gpt-5.6-sol\"", "model = \"gpt-5.5\"");
+        assert_ne!(stale, current);
+        tokio::fs::write(&codex_path, stale)
+            .await
+            .expect("make model stale");
+
+        RouteConfigService::write_existing_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "https://127.0.0.1:19528",
+            &fixture.home,
+        )
+        .await
+        .expect("rewrite");
+
+        let document: toml::Value = tokio::fs::read_to_string(&codex_path)
+            .await
+            .expect("codex config")
+            .parse()
+            .expect("codex TOML");
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            document["model_providers"]["ai-switch"]["base_url"].as_str(),
+            Some("https://127.0.0.1:19528/v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_stale_check_detects_a_default_model_missing_from_the_catalog() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let clients = vec!["codex".to_string()];
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("initial write");
+
+        let codex_path = fixture.home.join(".codex/config.toml");
+        let current = tokio::fs::read_to_string(&codex_path)
+            .await
+            .expect("codex config");
+        let stale = current.replace("model = \"gpt-5.6-sol\"", "model = \"gpt-5.5\"");
+        assert_ne!(stale, current);
+        tokio::fs::write(&codex_path, stale)
+            .await
+            .expect("make model stale");
+
+        assert!(
+            RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn precise_mode_writes_account_prefixed_models_to_every_client() {
+        let fixture = ServiceFixture::new().await;
+        seed_named_codex_pool_member(&fixture.pool, "Grox", "gpt-5.6-sol").await;
+        seed_named_codex_pool_member(&fixture.pool, "247 Kan", "gpt-5.6-sol").await;
+        RoutePoolRepository::save_model_mode(&fixture.pool, "codex", PoolModelMode::Precise)
+            .await
+            .expect("save mode");
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string(), "codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
+            .await
+            .expect("read");
+        let json: Value = serde_json::from_slice(&raw).expect("json");
+        let models = json["config"]["providerConfigRules"]["providerRules"]
+            .as_array()
+            .expect("provider rules")
+            .iter()
+            .find(|rule| rule["providerId"] == "ai-switch-codex")
+            .expect("ai-switch-codex rule")["config"]["personalModelIds"]
+            .as_array()
+            .expect("model ids");
+        // One entry per account, so a request names the account it wants. The
+        // aggregated id is gone: keeping it would leave a rotating door open.
+        assert!(
+            models.contains(&serde_json::json!("Grox/gpt-5.6-sol")),
+            "models={models:?}"
+        );
+        assert!(
+            models.contains(&serde_json::json!("247-Kan/gpt-5.6-sol")),
+            "models={models:?}"
+        );
+        assert!(
+            !models.contains(&serde_json::json!("gpt-5.6-sol")),
+            "models={models:?}"
+        );
+
+        // The Codex CLI reads its own catalog file, which has to agree — a bare
+        // `--model` would otherwise not be in the list the CLI offers.
+        let catalog: Value = serde_json::from_slice(
+            &tokio::fs::read(codex_model_catalog_path(&fixture.home))
+                .await
+                .expect("read catalog"),
+        )
+        .expect("catalog json");
+        let slugs: Vec<&str> = catalog["models"]
+            .as_array()
+            .expect("catalog models")
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .collect();
+        assert!(slugs.contains(&"Grox/gpt-5.6-sol"), "slugs={slugs:?}");
+        // Read off the bare alias, not the prefixed id, or the model would lose
+        // its reasoning tiers.
+        let sol = catalog["models"]
+            .as_array()
+            .expect("catalog models")
+            .iter()
+            .find(|model| model["slug"] == "Grox/gpt-5.6-sol")
+            .expect("sol entry");
+        assert_eq!(
+            sol["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .len(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn zcode_gets_the_one_m_default_for_a_one_m_upstream() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "glm-5.3").await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["zcode".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
+            .await
+            .expect("read");
+        let json: Value = serde_json::from_slice(&raw).expect("json");
+        let model_rule = json["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "glm-5.3")
+            .expect("glm-5.3 rule");
+
+        assert_eq!(model_rule["config"]["properties"]["contextWindow"], 1000000);
+    }
+
+    #[tokio::test]
+    async fn deepseek_harness_write_carries_the_advertised_context_window() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "glm-5.3").await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["deepseek_harness".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(fixture.home.join(".dsh/settings.yaml"))
+            .await
+            .expect("read");
+        let yaml: serde_yaml::Value = serde_yaml::from_slice(&raw).expect("yaml");
+        let model = &yaml["llm-pi-ai"]["providers"]["ai-switch-codex"]["models"][0];
+
+        assert_eq!(model["id"], "glm-5.3");
+        // Without this the harness falls back to its own 256K route default and
+        // compacts a 1M model early — while the CLI, reading the same pool,
+        // does not.
+        assert_eq!(model["contextWindow"], 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn deepseek_harness_write_uses_the_configured_custom_path() {
+        let fixture = ServiceFixture::new().await;
+        // Declare efforts explicitly: writers now mirror the account verbatim
+        // and no longer pad in a baseline profile, so a mapping with no
+        // reasoning_levels would write no efforts at all.
+        seed_codex_pool_member_with_config(
+            &fixture.pool,
+            &serde_json::json!({
+                "model_mappings": [{
+                    "from": "gpt-5.6-sol",
+                    "to": "gpt-5.6-sol",
+                    "reasoning_levels": ["low", "max"]
+                }]
+            })
+            .to_string(),
+        )
+        .await;
+        let custom_path = fixture.home.join("custom-dsh").join("settings.yaml");
+        let mut settings = SettingsService::load(&fixture.paths)
+            .await
+            .expect("settings");
+        settings.deepseek_harness_config_path = Some(custom_path.display().to_string());
+        SettingsService::save(&fixture.paths, &settings)
+            .await
+            .expect("save path");
+
+        let clients = ["deepseek_harness".to_string()];
+        let outcomes = RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("write");
+
+        assert_eq!(outcomes[0].path, custom_path.display().to_string());
+        assert!(custom_path.is_file());
+        let raw = tokio::fs::read(&custom_path)
+            .await
+            .expect("read custom path");
+        let yaml: serde_yaml::Value = serde_yaml::from_slice(&raw).expect("yaml");
+        let efforts =
+            &yaml["llm-pi-ai"]["providers"]["ai-switch-codex"]["models"][0]["reasoningEfforts"];
+        assert_eq!(efforts["off"], serde_yaml::Value::Null);
+        assert_eq!(efforts["low"], "low");
+        assert_eq!(efforts["max"], "max");
+        assert!(efforts.get("ultra").is_none());
+        assert!(!fixture.home.join(".dsh/settings.yaml").exists());
+        assert!(
+            !RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+
+        let snapshot_id = outcomes[0].snapshot_id.clone().expect("snapshot");
+        ConfigWriteCoordinator::rollback_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            &fixture.home,
+            &snapshot_id,
+        )
+        .await
+        .expect("rollback");
+        assert!(!custom_path.exists());
+    }
+
+    /// The pool alternates between accounts, so one alias gets one number. Two
+    /// accounts that disagree resolve upward, and every client has to hear the
+    /// same answer: a per-client rule would truncate in one app and not the next.
+    #[tokio::test]
+    async fn accounts_disagreeing_about_a_window_advertise_the_larger_one_to_every_client() {
+        let fixture = ServiceFixture::new().await;
+        for (target, window) in [("up-a", 1_000_000), ("up-b", 128_000)] {
+            seed_codex_pool_member_with_config(
+                &fixture.pool,
+                &serde_json::json!({
+                    "model_mappings": [{
+                        "from": "gpt-5.5",
+                        "to": target,
+                        "context_window": window
+                    }]
+                })
+                .to_string(),
+            )
+            .await;
+        }
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&[
+                "codex".to_string(),
+                "zcode".to_string(),
+                "deepseek_harness".to_string(),
+            ]),
+        )
+        .await
+        .expect("write");
+
+        let catalog: Value = serde_json::from_slice(
+            &tokio::fs::read(codex_model_catalog_path(&fixture.home))
+                .await
+                .expect("read catalog"),
+        )
+        .expect("catalog json");
+        assert_eq!(catalog["models"][0]["slug"], "gpt-5.5");
+        assert_eq!(catalog["models"][0]["context_window"], 1_000_000);
+
+        let zcode: Value = serde_json::from_slice(
+            &tokio::fs::read(fixture.home.join(".zcode/v2/provider_config.json"))
+                .await
+                .expect("read zcode"),
+        )
+        .expect("zcode json");
+        let zcode_rule = zcode["config"]["modelConfigRules"]["providerModelRules"]
+            .as_array()
+            .expect("provider model rules")
+            .iter()
+            .find(|entry| entry["modelId"] == "gpt-5.5")
+            .expect("gpt-5.5 rule");
+        assert_eq!(
+            zcode_rule["config"]["properties"]["contextWindow"],
+            1_000_000
+        );
+
+        let harness: serde_yaml::Value = serde_yaml::from_slice(
+            &tokio::fs::read(fixture.home.join(".dsh/settings.yaml"))
+                .await
+                .expect("read harness"),
+        )
+        .expect("harness yaml");
+        assert_eq!(
+            harness["llm-pi-ai"]["providers"]["ai-switch-codex"]["models"][0]["contextWindow"],
+            1_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_on_disk_carries_the_declared_context_and_efforts() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member_with_config(
+            &fixture.pool,
+            &serde_json::json!({
+                "model_mappings": [{
+                    "from": "gpt-5.6-sol",
+                    "to": "gpt-5.6-sol",
+                    "context_window": 400_000,
+                    "reasoning_levels": ["medium", "max"]
+                }]
+            })
+            .to_string(),
+        )
+        .await;
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&["codex".to_string()]),
+        )
+        .await
+        .expect("write");
+
+        let raw = tokio::fs::read(codex_model_catalog_path(&fixture.home))
+            .await
+            .expect("read catalog");
+        let json: Value = serde_json::from_slice(&raw).expect("json");
+        let model = &json["models"][0];
+
+        assert_eq!(model["slug"], "gpt-5.6-sol");
+        assert_eq!(model["context_window"], 400_000);
+        assert_eq!(model["max_context_window"], 400_000);
+        assert_eq!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .expect("levels")
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["medium", "max"]
+        );
+        // The catalog now preselects the highest advertised tier, so a declared
+        // list of `medium`/`max` opens on `max` rather than a conservative default.
+        assert_eq!(model["default_reasoning_level"], "max");
+    }
+
+    #[tokio::test]
+    async fn stale_check_covers_every_selected_client() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let clients = vec!["codex".to_string(), "zcode".to_string()];
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("write");
+
+        assert!(
+            !RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+
+        // A ZCode-only drift still has to surface on the shared nudge.
+        tokio::fs::remove_file(fixture.home.join(".zcode/v2/provider_config.json"))
+            .await
+            .expect("remove");
+        assert!(
+            RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+
+        // Narrowing the selection back to the intact client clears the nudge.
+        assert!(
+            !RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&["codex".to_string()]),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_previously_written_https_address_reads_as_stale_against_the_http_endpoint() {
+        // HTTPS moved to its own port, so `base_url` is the HTTP one again. Users
+        // who had HTTPS on are carrying an https:// address in their client config,
+        // and this nudge is the only thing that tells them to write it again.
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let clients = vec!["codex".to_string()];
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "https://127.0.0.1:19527",
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("write the pre-change HTTPS address");
+
+        assert!(
+            RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                "http://127.0.0.1:19527",
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+
+        // And writing once clears it, so the nudge is actionable rather than sticky.
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            "http://127.0.0.1:19527",
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("rewrite with the HTTP address");
+        assert!(
+            !RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                "http://127.0.0.1:19527",
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_mapping_change_marks_the_zcode_config_stale() {
+        let fixture = ServiceFixture::new().await;
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-sol").await;
+        let clients = vec!["zcode".to_string()];
+
+        RouteConfigService::write_configs_for_home(
+            &fixture.paths,
+            &fixture.pool,
+            &fixture.runtime,
+            BASE_URL,
+            "codex",
+            &fixture.home,
+            Some(&clients),
+        )
+        .await
+        .expect("write");
+
+        assert!(
+            !RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+
+        // ZCode's model list lives in the config file, so a pool mapping change
+        // leaves the file advertising a stale set until the user writes again.
+        seed_codex_pool_member(&fixture.pool, "gpt-5.6-terra").await;
+        assert!(
+            RouteConfigService::config_write_is_stale_for_home(
+                &fixture.paths,
+                &fixture.pool,
+                BASE_URL,
+                "codex",
+                &fixture.home,
+                Some(&clients),
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn client_model_context_window_honours_per_mapping_declaration() {
+        // The mapping declares 400K for its upstream; the guess would be wrong.
+        assert_eq!(
+            client_model_context_window(
+                PlatformId::Codex,
+                "gpt-5.6-sol",
+                Some(400_000),
+                "deepseek-v4-flash"
+            ),
+            400_000
+        );
+        // Zero is not a real window; fall back to the upstream's own default.
+        assert_eq!(
+            client_model_context_window(PlatformId::Codex, "gpt-5.6-sol", Some(0), "gpt-5.6-sol"),
+            272_000
+        );
+        // A declaration also outranks the `[1m]` guess, since the user picked it
+        // against a specific upstream.
+        assert_eq!(
+            client_model_context_window(
+                PlatformId::Claude,
+                "claude-opus-alias[1m]",
+                Some(256_000),
+                "claude-opus-5"
+            ),
+            256_000
+        );
+    }
+
+    #[test]
+    fn zcode_style_clients_get_the_same_codex_default_as_the_cli() {
+        // The CLI catalog and ZCode read two different files; disagreeing here
+        // would truncate on one client and not the other.
+        assert_eq!(
+            client_model_context_window(
+                PlatformId::Codex,
+                "gpt-5.6-sol",
+                None,
+                "deepseek-v4-flash-0731"
+            ),
+            1_000_000
+        );
+        // A Claude alias never consults the Codex table, so its own rules stand.
+        assert_eq!(
+            client_model_context_window(PlatformId::Claude, "claude-sonnet-alias", None, "glm-5.3"),
+            200_000
+        );
+    }
+
+    async fn config_write_context() -> (
+        tempfile::TempDir,
+        AppPaths,
+        sqlx::SqlitePool,
+        ConfigWriteRuntimeState,
+    ) {
+        let app_dir = tempfile::tempdir().expect("app dir");
+        let paths = AppPaths::from_data_dir(app_dir.path().to_path_buf());
+        paths.ensure().await.expect("paths");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        (app_dir, paths, pool, ConfigWriteRuntimeState::default())
+    }
+}

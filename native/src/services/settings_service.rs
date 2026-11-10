@@ -1,0 +1,106 @@
+use crate::error::AppError;
+use crate::models::settings::AppSettings;
+use crate::paths::AppPaths;
+
+pub struct SettingsService;
+
+impl SettingsService {
+    pub async fn load(paths: &AppPaths) -> Result<AppSettings, AppError> {
+        paths.ensure().await?;
+        if !paths.settings_file.exists() {
+            let settings = AppSettings::defaults_for_data_dir(paths.data_dir.display().to_string());
+            Self::save(paths, &settings).await?;
+            return Ok(settings);
+        }
+
+        let contents = tokio::fs::read_to_string(&paths.settings_file).await?;
+        let mut settings: AppSettings = serde_json::from_str(&contents)?;
+        if settings.data_dir.is_empty() {
+            settings.data_dir = paths.data_dir.display().to_string();
+        }
+        Ok(settings)
+    }
+
+    pub async fn save(paths: &AppPaths, settings: &AppSettings) -> Result<(), AppError> {
+        paths.ensure().await?;
+        let contents = serde_json::to_string_pretty(settings)?;
+        tokio::fs::write(&paths.settings_file, contents).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::AppPaths;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn load_creates_default_settings_when_file_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+
+        let settings = SettingsService::load(&paths).await.expect("settings");
+
+        assert_eq!(settings.language, "zh-CN");
+        assert_eq!(settings.theme, "system");
+        assert!(settings.close_to_tray);
+        assert!(!settings.image_generation_enabled);
+        assert!(paths.settings_file.exists());
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips_settings() {
+        let dir = tempdir().expect("tempdir");
+        let paths = AppPaths::from_data_dir(dir.path().to_path_buf());
+        let settings = AppSettings {
+            language: "en".to_string(),
+            theme: "dark".to_string(),
+            copy_import_sources: true,
+            logging_enabled: true,
+            secret_storage: "keyring".to_string(),
+            data_dir: paths.data_dir.display().to_string(),
+            ccswitch_deeplink_compat_enabled: false,
+            close_to_tray: false,
+            image_generation_enabled: true,
+            claude_client_config_json: Some(r#"{"includeCoAuthoredBy":false}"#.to_string()),
+            config_write_clients_json: None,
+            deepseek_harness_config_path: Some("/custom/dsh/settings.yaml".to_string()),
+            notification_config_json: None,
+            route_proxy_request_body_limit_mib: 256,
+            proxy_enabled: true,
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            codex_keep_login_state: true,
+        };
+
+        SettingsService::save(&paths, &settings)
+            .await
+            .expect("save");
+        let loaded = SettingsService::load(&paths).await.expect("load");
+
+        assert_eq!(loaded.language, "en");
+        assert_eq!(loaded.theme, "dark");
+        assert!(loaded.copy_import_sources);
+        // `false` specifically: the field defaults to `true`, so a round trip that
+        // dropped it would still read back as `true` and look like it worked.
+        assert!(!loaded.close_to_tray);
+        assert!(loaded.image_generation_enabled);
+        assert_eq!(
+            loaded.claude_client_config_json.as_deref(),
+            Some(r#"{"includeCoAuthoredBy":false}"#)
+        );
+        assert_eq!(
+            loaded.deepseek_harness_config_path.as_deref(),
+            Some("/custom/dsh/settings.yaml")
+        );
+        assert_eq!(loaded.route_proxy_request_body_limit_mib, 256);
+        assert!(loaded.proxy_enabled);
+        // Opt-in switch, so a round trip that lost it would read back as the
+        // default and quietly rewrite Codex with a bearer token again.
+        assert!(loaded.codex_keep_login_state);
+        assert_eq!(
+            loaded.proxy_url.as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+    }
+}
