@@ -1,6 +1,6 @@
 {
   "name": "otools-ai-switch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.33.2",
@@ -13,6 +13,8 @@
     "native:build": "node scripts/build-native.mjs",
     "pack": "node scripts/pack-plugin.mjs",
     "test:package": "node --test scripts/package.test.mjs",
+    "test:autostart": "python -I scripts/test_autostart.py",
+    "test:nano-banana": "python -I scripts/test_nano_banana.py",
     "verify": "node scripts/verify-plugin.mjs"
   },
   "dependencies": {

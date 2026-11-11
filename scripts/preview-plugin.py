@@ -67,7 +67,18 @@ def main():
     parser.add_argument("--library", type=Path, default=root / "lib/Windows.dll")
     parser.add_argument("--dist", type=Path, default=root / "dist")
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument(
+        "--fail-once", action="append", default=[],
+        choices=["list_route_credentials_page", "start_route_proxy", "stop_route_proxy"],
+        help="Inject one explicit test failure before calling the real native method",
+    )
+    parser.add_argument(
+        "--failure-count", type=int, default=1,
+        help="Number of injected failures per --fail-once method (2 also covers automatic query retry)",
+    )
     args = parser.parse_args()
+    if args.failure_count < 1:
+        parser.error("--failure-count must be positive")
     dist = args.dist.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="otools-ai-switch-preview-") as directory:
         os.environ["OTOOLS_AI_SWITCH_DATA_DIR"] = directory
@@ -77,6 +88,8 @@ def main():
         native.otools_plugin_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         native.otools_plugin_free.restype = None
         lock = threading.Lock()
+        failures = {method: args.failure_count for method in args.fail_once}
+        failure_lock = threading.Lock()
 
         def invoke(method, payload):
             data = json.dumps({"method": method, "payload": payload}).encode()
@@ -111,8 +124,20 @@ def main():
                     return self.respond(413, b"too large", "text/plain")
                 request = json.loads(self.rfile.read(length))
                 method = request.get("method")
+                with failure_lock:
+                    fail = failures.get(method, 0) > 0
+                    if fail:
+                        failures[method] -= 1
                 if method not in ALLOW:
                     data = json.dumps({"ok": False, "error": f"Test host disallows: {method}"}).encode()
+                elif fail:
+                    error = {
+                        "message": "测试宿主模拟的一次故障，请重试",
+                        "code": "test.preview_failure",
+                        "details": f"Injected once for {method}; retry calls the real native library",
+                        "recoverable": True,
+                    }
+                    data = json.dumps({"ok": False, "error": json.dumps(error, ensure_ascii=False)}).encode()
                 else:
                     data = invoke(method, request.get("payload") or {})
                 return self.respond(200, data, "application/json")

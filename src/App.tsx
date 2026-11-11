@@ -174,6 +174,7 @@ export function App() {
                     modality={accountModality}
                     onOpenImageStudio={() => navigate("ImageGen")}
                     onOpenSessions={openSessions}
+                    onOpenClientSetup={(platform, clientKey) => openClientSetup({ platform, clientKey })}
                     onPoolScopeFocusConsumed={handlePoolScopeFocusConsumed}
                     onProviderFilterFocusConsumed={handleProviderFilterFocusConsumed}
                     poolScopeFocus={poolScopeFocus}

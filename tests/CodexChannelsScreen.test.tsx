@@ -13,13 +13,14 @@ vi.mock("../src/screens/AccountsScreen", () => ({
   AccountsScreen: ({
     platform,
     capabilityFilter,
+    modality,
   }: {
     platform?: string;
     capabilityFilter?: string;
+    modality?: string;
   }) => (
     <div>
-      accounts:{platform}
-      {capabilityFilter ? `:${capabilityFilter}` : ""}
+      {modality === "vector" ? "向量接口尚未开放" : <>accounts:{platform}{capabilityFilter ? `:${capabilityFilter}` : ""}</>}
     </div>
   ),
 }));
@@ -64,7 +65,7 @@ describe("CodexChannelsScreen", () => {
     renderScreen();
 
     await userEvent.click(screen.getByRole("tab", { name: "图片" }));
-    expect(screen.getByText("image-segment")).toBeInTheDocument();
+    expect(screen.queryByText("image-segment")).not.toBeInTheDocument();
     expect(screen.getByText("accounts:codex:image.generate")).toBeInTheDocument();
     expect(screen.queryByText("accounts:codex")).not.toBeInTheDocument();
 

@@ -1,7 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#7c3aed"/></linearGradient></defs>
-  <rect width="128" height="128" rx="30" fill="url(#bg)"/>
-  <g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M28 43h72m-16-16 16 16-16 16M100 85H28m16-16L28 85l16 16"/>
-  </g>
+<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ai-switch-logo-bg" x1="10" x2="56" y1="6" y2="60">
+      <stop offset="0" stop-color="#292524" />
+      <stop offset="1" stop-color="#0C0A09" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="19" fill="url(#ai-switch-logo-bg)" />
+  <path d="M15 19 C27 19 28 32 39 32 C44 32 47 28 50 24" fill="none" stroke="#10B981" stroke-linecap="round" stroke-width="5" />
+  <path d="M15 45 C27 45 28 32 39 32 C44 32 47 36 50 40" fill="none" stroke="#F59E0B" stroke-linecap="round" stroke-width="5" />
+  <circle cx="15" cy="19" r="4.5" fill="#A7F3D0" />
+  <circle cx="15" cy="45" r="4.5" fill="#FCD34D" />
+  <circle cx="50" cy="24" r="4.5" fill="#FCD34D" />
+  <circle cx="50" cy="40" r="4.5" fill="#A7F3D0" />
+  <circle cx="39" cy="32" r="5.5" fill="#FAFAF9" />
+  <circle cx="39" cy="32" r="2.4" fill="#1C1917" />
 </svg>

@@ -23,6 +23,7 @@ function fixture(t) {
     entry: 'dist/index.html', openMode: 'panel',
     devUrl: 'http://localhost:1420', quickDev: true,
     native: { enabled: true, libDir: 'lib', autoReload: true },
+    autostart: { enabled: true, once: true, tasks: [{ command: 'start_route_proxy', args: {} }] },
   };
   fs.writeFileSync(path.join(root, 'plugin.json'), JSON.stringify(manifest));
   return { root, manifest };
@@ -55,6 +56,9 @@ test('packaging strips development flags and produces a verifiable archive', (t)
   assert.equal(manifest.quickDev, undefined);
   assert.equal(manifest.native.autoReload, false);
   assert.equal(manifest.openMode, 'panel');
+  assert.deepEqual(manifest.autostart, {
+    enabled: true, once: true, tasks: [{ command: 'start_route_proxy', args: {} }],
+  });
   const verify = run('verify-plugin.mjs', root);
   assert.equal(verify.status, 0, verify.stderr);
 });

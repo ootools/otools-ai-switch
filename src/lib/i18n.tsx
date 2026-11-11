@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 export type Language = "en" | "zh-CN";
 
 const STORAGE_KEY = "ai-switch.language";
-const defaultLanguage: Language = "en";
+const defaultLanguage: Language = "zh-CN";
 
 const en = {
   "accounts.brotliCompression.label": "Brotli request compression",
@@ -17,7 +17,7 @@ const en = {
   "accounts.brotliCompression.manualOff": "Manually disabled; this overrides the automatic allowlist.",
   "accounts.brotliCompression.hint": "Compresses only outbound model JSON requests, without changing commands, context or token counts. Auto applies to verified allowlisted endpoints. Enable manually only if the upstream supports Brotli. Non-JSON or already encoded requests are unchanged. Direct mode bypasses this setting.",
 
-  "layout.brandBadge": "OTools plugin",
+  "layout.brandBadge": "AI local gateway",
   "layout.brandSubtitle": "Model switching, target tooling, and automation in one shell.",
   "layout.language": "Language",
   "layout.switchToAgent": "Switch to Agent mode",
@@ -65,6 +65,25 @@ const en = {
   "imageSegment.editCaveat": "Image editing (/v1/images/edits) currently works only on accounts whose interface_format is openai.",
   "imageSegment.workspace": "Open Image Studio",
   "imageSegment.workspaceOff": "The Image Studio plugin is off; enable it in Settings to generate here.",
+  "modalityAccess.image": "Image access",
+  "modalityAccess.video": "Video access",
+  "modalityAccess.audio": "Audio access",
+  "modalityAccess.vector": "Vector access",
+  "modalityAccess.imageEdits": "Image editing endpoint",
+  "modalityAccess.videoGenerations": "Video generation endpoint",
+  "modalityAccess.videos": "Video task endpoint",
+  "modalityAccess.audioSpeech": "Speech generation endpoint",
+  "modalityAccess.audioTranscriptions": "Audio transcription endpoint",
+  "modalityAccess.audioTranslations": "Audio translation endpoint",
+  "modalityAccess.sharedKey": "All modalities share the compute-pool key; only accounts with the matching capability can serve requests.",
+  "modalityAccess.ready": "AI service is running and compute-pool routing is enabled.",
+  "modalityAccess.stopped": "AI service is not started; these addresses cannot accept requests yet.",
+  "modalityAccess.disabled": "AI service is running, but compute-pool routing is disabled; these addresses cannot accept model requests.",
+  "modalityAccess.checking": "Reading the native AI service status; endpoint availability is not confirmed yet.",
+  "modalityAccess.defaultAddress": "Showing the default address until the native listener address is available.",
+  "modalityAccess.statusError": "Could not read AI service status",
+  "modalityAccess.keyError": "Could not read the pool key",
+  "modalityAccess.retry": "Retry access information",
   "imagegen.kicker": "Image Studio",
   "imagegen.title": "Image generation",
   "imagegen.newSession": "New session",
@@ -702,7 +721,7 @@ const zh = {
   "accounts.brotliCompression.manualOff": "已手动关闭（优先于自动白名单）。",
   "accounts.brotliCompression.hint": "仅压缩发往模型上游的 JSON 请求，不改命令、上下文或 Token 数。自动仅对白名单中已验证的接口启用；手动开启前请确认上游支持 Brotli。非 JSON 或已编码请求保持原样，直连模式不生效。",
 
-  "layout.brandBadge": "OTools 插件",
+  "layout.brandBadge": "AI本地网关",
   "layout.brandSubtitle": "模型切换、目标工具和自动化都放在一个壳里。",
   "layout.language": "语言",
   "layout.switchToAgent": "切换到代理模式",
@@ -750,6 +769,25 @@ const zh = {
   "imageSegment.editCaveat": "图片编辑（/v1/images/edits）目前只支持 interface_format 为 openai 的账号。",
   "imageSegment.workspace": "打开生图工作台",
   "imageSegment.workspaceOff": "生图插件未启用；在设置里打开后可以在这里出图。",
+  "modalityAccess.image": "图片接入信息",
+  "modalityAccess.video": "视频接入信息",
+  "modalityAccess.audio": "音频接入信息",
+  "modalityAccess.vector": "向量接入信息",
+  "modalityAccess.imageEdits": "图片编辑端点",
+  "modalityAccess.videoGenerations": "视频生成端点",
+  "modalityAccess.videos": "视频任务端点",
+  "modalityAccess.audioSpeech": "语音生成端点",
+  "modalityAccess.audioTranscriptions": "音频转录端点",
+  "modalityAccess.audioTranslations": "音频翻译端点",
+  "modalityAccess.sharedKey": "各模态共用算力池密钥；请求仅由声明了对应能力的账号承接。",
+  "modalityAccess.ready": "AI 服务已启动，算力池路由已启用。",
+  "modalityAccess.stopped": "AI 服务未启动，以下端点暂不能请求。",
+  "modalityAccess.disabled": "AI 服务运行中，但算力池路由已关闭，以下端点暂不能推理。",
+  "modalityAccess.checking": "正在读取 native AI 服务状态，端点可用性尚未确认。",
+  "modalityAccess.defaultAddress": "native 监听地址尚未提供，当前显示默认地址。",
+  "modalityAccess.statusError": "读取 AI 服务状态失败",
+  "modalityAccess.keyError": "读取算力池密钥失败",
+  "modalityAccess.retry": "重试接入信息",
   "imagegen.kicker": "IMAGE STUDIO",
   "imagegen.title": "图片生成",
   "imagegen.newSession": "新建会话",
@@ -1435,7 +1473,7 @@ type I18nContextValue = {
   t: (key: TranslationKey, params?: TranslationParams) => string;
 };
 
-const fallbackT: I18nContextValue["t"] = (key, params) => format(en[key], params);
+const fallbackT: I18nContextValue["t"] = (key, params) => format(dictionaries[defaultLanguage][key], params);
 
 const I18nContext = createContext<I18nContextValue>({
   language: defaultLanguage,
