@@ -2586,9 +2586,14 @@ pub(crate) async fn forward_request(
             continue;
         }
 
-        // A resource-scoped reference cannot be recreated from its ID. Preserve
-        // the upstream explanation and request history instead of fabricating an
-        // empty reasoning item or penalizing every account in the pool.
+        // A resource-scoped reference cannot be recreated from its ID. When the
+        // account opted into cross-resource stripping the body already went out
+        // without any of that state, so the upstream's own explanation is the
+        // only honest answer left; otherwise the account-level switch
+        // (`responses_cross_resource_strip`) is what turns this turn into a
+        // stateless one that any resource in the pool can serve. Either way,
+        // preserve the explanation and the request history instead of
+        // fabricating an empty reasoning item or penalizing every account.
         if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
             && semantic_failure
                 .as_ref()
@@ -7031,6 +7036,19 @@ fn build_api_upstream_request(
     let mut rewritten_body = rewritten_body;
     if dialect == ApiDialect::OpenAi && matches!(upstream_path.as_str(), "/images/generations" | "/v1/images/generations") {
         rewritten_body = crate::imagegen::protocol::normalize_images_request_for_upstream(base_url, &rewritten_body)?;
+    }
+    // 跨资源剥离：Azure 多资源中转会把同一会话的相邻请求轮转到不同资源，
+    // 而 Codex 每轮原样回传服务端 item id、加密思维链和 previous_response_id，
+    // 非原资源一律 400（"created under a different Azure OpenAI resource"）。
+    // 先于密文清理由此执行：密文清理是形状感知的，会保留外形合法的外来密文，
+    // 而这里恰恰要把它们全部去掉，让请求变成任何资源都能接受的无状态形态。
+    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
+        && crate::services::responses_cross_resource_strip::enabled(config)
+    {
+        if let Some(stripped) = crate::services::responses_cross_resource_strip::strip(&rewritten_body)
+        {
+            rewritten_body = stripped;
+        }
     }
     // 目标账号专属的出站适配：切到 Chat/Anthropic/Gemini 不经过此分支，
     // 客户端传入的历史字节从未修改，密文清理由下方独立开关控制。

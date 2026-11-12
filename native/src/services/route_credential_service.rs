@@ -172,6 +172,13 @@ impl RouteCredentialService {
                 .map(|mode| json!(mode))
                 .as_ref(),
         )?;
+        crate::services::responses_cross_resource_strip::validate(
+            input
+                .responses_cross_resource_strip
+                .as_ref()
+                .map(|mode| json!(mode))
+                .as_ref(),
+        )?;
         validate_model_mappings(
             &input.model_mappings_json,
             declares_modality_capability(&input.model_mappings_json),
@@ -211,6 +218,14 @@ impl RouteCredentialService {
         });
         if let Some(mode) = input.responses_plaintext_reasoning_compat {
             config[crate::services::responses_plaintext_reasoning::CONFIG_KEY] = json!(mode);
+        }
+        // `auto` is the built-in site list, so it is omitted rather than written.
+        if let Some(mode) = input
+            .responses_cross_resource_strip
+            .as_deref()
+            .filter(|mode| *mode != "auto")
+        {
+            config[crate::services::responses_cross_resource_strip::CONFIG_KEY] = json!(mode);
         }
         if let Some(mode) = input.request_brotli_compression {
             config[crate::services::request_compression::CONFIG_KEY] = json!(mode);
@@ -354,6 +369,9 @@ impl RouteCredentialService {
             )?;
             crate::services::request_content_rejection::validate(
                 config.get(crate::services::request_content_rejection::CONFIG_KEY),
+            )?;
+            crate::services::responses_cross_resource_strip::validate(
+                config.get(crate::services::responses_cross_resource_strip::CONFIG_KEY),
             )?;
             crate::services::request_image_limit::validate(
                 config.get(crate::services::request_image_limit::CONFIG_KEY),
@@ -2121,6 +2139,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2169,6 +2188,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2220,6 +2240,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2308,6 +2329,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2400,6 +2422,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2456,6 +2479,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2510,6 +2534,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2565,6 +2590,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2617,6 +2643,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2743,6 +2770,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2799,6 +2827,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2907,6 +2936,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2951,6 +2981,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -2995,6 +3026,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -3039,6 +3071,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -3177,6 +3210,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -3224,6 +3258,7 @@ mod tests {
                 responses_plaintext_reasoning_compat: None,
                 request_brotli_compression: None,
                 responses_encrypted_content_cleanup: None,
+                responses_cross_resource_strip: None,
                 responses_encrypted_content_aggressive_strip: None,
                 force_reasoning_content: None,
                 content_rejection_compat: None,
@@ -3276,6 +3311,7 @@ mod tests {
                     responses_plaintext_reasoning_compat: None,
                     request_brotli_compression: None,
                     responses_encrypted_content_cleanup: None,
+                    responses_cross_resource_strip: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
                     content_rejection_compat: None,
@@ -3323,6 +3359,7 @@ mod tests {
                     responses_plaintext_reasoning_compat: None,
                     request_brotli_compression: None,
                     responses_encrypted_content_cleanup: None,
+                    responses_cross_resource_strip: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
                     content_rejection_compat: None,
@@ -3369,6 +3406,7 @@ mod tests {
                     responses_plaintext_reasoning_compat: None,
                     request_brotli_compression: None,
                     responses_encrypted_content_cleanup: None,
+                    responses_cross_resource_strip: None,
                     responses_encrypted_content_aggressive_strip: None,
                     force_reasoning_content: None,
                     content_rejection_compat: None,

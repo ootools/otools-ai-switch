@@ -3918,3 +3918,4 @@ model_provider = "ai-switch"
         (app_dir, paths, pool, ConfigWriteRuntimeState::default())
     }
 }
+                responses_cross_resource_strip: None,

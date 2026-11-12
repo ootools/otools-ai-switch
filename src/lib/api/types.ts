@@ -1467,3 +1467,4 @@ export type DirectModeStatus = {
   updated_at: string;
   restart_required: boolean;
 };
+  responses_cross_resource_strip?: "auto" | "on" | "off" | null;

@@ -74,7 +74,9 @@ import { CopyRouteCredentialDialog } from "../components/accounts/CopyRouteCrede
 import { RequestCompressionOption } from "../components/accounts/RequestCompressionOption";
 import { requestCompressionModeFromConfig, writeRequestCompressionMode, type RequestCompressionMode } from "../lib/requestCompression";
 import { ResponsesPlaintextReasoningOption } from "../components/accounts/ResponsesPlaintextReasoningOption";
+import { ResponsesCrossResourceStripOption } from "../components/accounts/ResponsesCrossResourceStripOption";
 import { plaintextReasoningModeFromConfig, writePlaintextReasoningMode, type ResponsesPlaintextReasoningMode } from "../lib/responsesPlaintextReasoning";
+import { crossResourceStripModeFromConfig, writeCrossResourceStripMode, type ResponsesCrossResourceStripMode } from "../lib/responsesCrossResourceStrip";
 import { QuickEditDialog } from "../components/accounts/QuickEditDialog";
 import { neighborsForDrop } from "../lib/accountReorder";
 import {
@@ -1963,6 +1965,7 @@ function apiConfigJsonWithFields(
   responsesEncryptedContentAggressiveStrip = false,
   forceReasoningContent = false,
   plaintextReasoningMode: ResponsesPlaintextReasoningMode = plaintextReasoningModeFromConfig(parseJsonObject(configJson)),
+  crossResourceStripMode: ResponsesCrossResourceStripMode = crossResourceStripModeFromConfig(parseJsonObject(configJson)),
   requestCompressionMode: RequestCompressionMode = requestCompressionModeFromConfig(parseJsonObject(configJson)),
   contentRejectionCompat = false,
   imageLimitCompat = false,
@@ -1973,6 +1976,7 @@ function apiConfigJsonWithFields(
   config.model_mappings = mappings;
   config.responses_custom_tool_compat = responsesCustomToolCompat;
   writePlaintextReasoningMode(config, plaintextReasoningMode);
+  writeCrossResourceStripMode(config, crossResourceStripMode);
   writeRequestCompressionMode(config, requestCompressionMode);
   writeContentRejectionCompat(config, contentRejectionCompat);
   writeImageLimitCompat(config, imageLimitCompat);
@@ -3648,6 +3652,7 @@ export function AccountsScreen({
   const [apiForceReasoningContent, setApiForceReasoningContent] = useState(false);
   const [apiResponsesEncryptedContentCleanup, setApiResponsesEncryptedContentCleanup] = useState(false);
   const [apiPlaintextReasoningMode, setApiPlaintextReasoningMode] = useState<ResponsesPlaintextReasoningMode>("auto");
+  const [apiCrossResourceStripMode, setApiCrossResourceStripMode] = useState<ResponsesCrossResourceStripMode>("auto");
   const [apiRequestCompressionMode, setApiRequestCompressionMode] = useState<RequestCompressionMode>("auto");
   const [apiContentRejectionCompat, setApiContentRejectionCompat] = useState(false);
   const [apiResponsesEncryptedContentAggressiveStrip, setApiResponsesEncryptedContentAggressiveStrip] = useState(false);
@@ -3713,6 +3718,7 @@ export function AccountsScreen({
   const [editForceReasoningContent, setEditForceReasoningContent] = useState(false);
   const [editResponsesEncryptedContentCleanup, setEditResponsesEncryptedContentCleanup] = useState(false);
   const [editPlaintextReasoningMode, setEditPlaintextReasoningMode] = useState<ResponsesPlaintextReasoningMode>("auto");
+  const [editCrossResourceStripMode, setEditCrossResourceStripMode] = useState<ResponsesCrossResourceStripMode>("auto");
   const [editRequestCompressionMode, setEditRequestCompressionMode] = useState<RequestCompressionMode>("auto");
   const [editContentRejectionCompat, setEditContentRejectionCompat] = useState(false);
   const [editImageLimitCompat, setEditImageLimitCompat] = useState(false);
@@ -4334,6 +4340,7 @@ export function AccountsScreen({
     setApiResponsesCustomToolCompat(false);
     setApiForceReasoningContent(false);
     setApiPlaintextReasoningMode("auto");
+    setApiCrossResourceStripMode("auto");
     setApiRequestCompressionMode("auto");
     setApiContentRejectionCompat(false);
     setApiResponsesEncryptedContentCleanup(false);
@@ -4408,6 +4415,7 @@ export function AccountsScreen({
       setEditResponsesCustomToolCompat(responsesCustomToolCompatFromConfig(config));
       setEditForceReasoningContent(forceReasoningContentFromConfig(config));
       setEditPlaintextReasoningMode(plaintextReasoningModeFromConfig(config));
+      setEditCrossResourceStripMode(crossResourceStripModeFromConfig(config));
       setEditRequestCompressionMode(requestCompressionModeFromConfig(config));
       setEditContentRejectionCompat(contentRejectionCompatFromConfig(config));
       setEditImageLimitCompat(imageLimitCompatFromConfig(config));
@@ -4431,6 +4439,7 @@ export function AccountsScreen({
       setEditResponsesCustomToolCompat(false);
       setEditForceReasoningContent(false);
       setEditPlaintextReasoningMode("auto");
+      setEditCrossResourceStripMode("auto");
       setEditRequestCompressionMode("auto");
       setEditContentRejectionCompat(false);
       setEditImageLimitCompat(false);
@@ -4935,6 +4944,7 @@ export function AccountsScreen({
             responses_custom_tool_compat: apiResponsesCustomToolCompat,
             ...(apiForceReasoningContent ? { force_reasoning_content: true } : {}),
             ...(apiPlaintextReasoningMode !== "auto" ? { responses_plaintext_reasoning_compat: apiPlaintextReasoningMode } : {}),
+            ...(apiCrossResourceStripMode !== "auto" ? { responses_cross_resource_strip: apiCrossResourceStripMode } : {}),
             ...(apiRequestCompressionMode !== "auto" ? { request_brotli_compression: apiRequestCompressionMode } : {}),
             ...(apiContentRejectionCompat ? { content_rejection_compat: "trim_old_tool_outputs" as const } : {}),
             ...(apiResponsesEncryptedContentCleanup ? { responses_encrypted_content_cleanup: true } : {}),
@@ -5550,6 +5560,7 @@ export function AccountsScreen({
                 editResponsesEncryptedContentAggressiveStrip,
                 editForceReasoningContent,
                 editPlaintextReasoningMode,
+                editCrossResourceStripMode,
                 editRequestCompressionMode,
                 editContentRejectionCompat,
                 editImageLimitCompat,
@@ -5565,7 +5576,7 @@ export function AccountsScreen({
       if (mediaView && editingCredential.kind === "api") {
         // Settings hidden in this modality must not be silently changed by its form.
         const previous = parseJsonObject(editConfigJson.trim() || "{}");
-        for (const key of ["request_brotli_compression", "content_rejection_compat", "force_reasoning_content", "responses_custom_tool_compat", "responses_plaintext_reasoning_compat", "responses_encrypted_content_cleanup", "responses_encrypted_content_aggressive_strip", "inline_remote_images", "image_limit_compat", "turn_reminder", "turn_reminder_text"]) {
+        for (const key of ["request_brotli_compression", "content_rejection_compat", "force_reasoning_content", "responses_custom_tool_compat", "responses_plaintext_reasoning_compat", "responses_cross_resource_strip", "responses_encrypted_content_cleanup", "responses_encrypted_content_aggressive_strip", "inline_remote_images", "image_limit_compat", "turn_reminder", "turn_reminder_text"]) {
           if (Object.prototype.hasOwnProperty.call(previous, key)) baseConfig[key] = previous[key];
           else delete baseConfig[key];
         }
@@ -9523,8 +9534,11 @@ export function AccountsScreen({
                       </label>
                     ) : null}
                     {!mediaView && shouldShowResponsesCustomToolCompatForFormat(activePlatform, apiInterfaceFormat) ? (
-                      <ResponsesPlaintextReasoningOption mode={apiPlaintextReasoningMode} baseUrl={apiBaseUrl} onChange={setApiPlaintextReasoningMode} />
-                    ) : null}
+                    <ResponsesPlaintextReasoningOption mode={apiPlaintextReasoningMode} baseUrl={apiBaseUrl} onChange={setApiPlaintextReasoningMode} />
+                  ) : null}
+                  {!mediaView && shouldShowResponsesCustomToolCompatForFormat(activePlatform, apiInterfaceFormat) ? (
+                    <ResponsesCrossResourceStripOption mode={apiCrossResourceStripMode} baseUrl={apiBaseUrl} onChange={setApiCrossResourceStripMode} />
+                  ) : null}
                     {!mediaView && shouldShowResponsesCustomToolCompatForFormat(activePlatform, apiInterfaceFormat) ? (
                       <ResponsesEncryptedContentCleanupOption
                         aggressiveStrip={apiResponsesEncryptedContentAggressiveStrip}
@@ -10708,6 +10722,9 @@ export function AccountsScreen({
                   ) : null}
                   {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
                     <ResponsesPlaintextReasoningOption mode={editPlaintextReasoningMode} baseUrl={editApiBaseUrl} onChange={setEditPlaintextReasoningMode} />
+                  ) : null}
+                  {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
+                    <ResponsesCrossResourceStripOption mode={editCrossResourceStripMode} baseUrl={editApiBaseUrl} onChange={setEditCrossResourceStripMode} />
                   ) : null}
                   {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
                     <ResponsesEncryptedContentCleanupOption

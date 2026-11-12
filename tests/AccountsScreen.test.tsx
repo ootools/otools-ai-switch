@@ -5325,6 +5325,48 @@ describe("AccountsScreen", () => {
     expect(screen.queryByLabelText("Responses 明文推理兼容")).not.toBeInTheDocument();
   });
 
+  it("跨资源状态剥离自动匹配 agentrouter 备用域名且手动关闭优先", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([{
+      ...credentialsFixture[1],config_json:JSON.stringify({base_url:"https://ps.air-outer.com/v1",interface_format:"openai-responses",model_mappings:[],unrelated:"keep"}),
+    }]);
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button",{name:"编辑 API Account"}));
+    await openFormTab("高级");
+    expect(screen.getByLabelText("跨资源状态剥离")).toHaveValue("auto");
+    expect(screen.getByText(/自动：已开启，命中 ps\.air-outer\.com/)).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("跨资源状态剥离"),"off");
+    await userEvent.click(screen.getByRole("button",{name:"保存修改"}));
+    await waitFor(()=>expect(updateRouteCredential).toHaveBeenCalled());
+    const config=JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
+    expect(config.responses_cross_resource_strip).toBe("off");
+    expect(config.unrelated).toBe("keep");
+  });
+
+  it("跨资源状态剥离可为其他网站强制开启，创建后重置且 Chat 不展示", async () => {
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button",{name:"新增账号"}));
+    await userEvent.click(screen.getByRole("button",{name:"API 账号"}));
+    await userEvent.type(screen.getByLabelText("API 账号名称"),"Strip API");
+    await userEvent.type(screen.getByLabelText("API Key"),"sk-fixture");
+    await userEvent.clear(screen.getByLabelText("Base URL"));
+    await userEvent.type(screen.getByLabelText("Base URL"),"https://other.example/v1");
+    await userEvent.selectOptions(screen.getByLabelText("接口格式"),"openai-responses");
+    await openFormTab("高级");
+    expect(screen.getByLabelText("跨资源状态剥离")).toHaveValue("auto");
+    await userEvent.selectOptions(screen.getByLabelText("跨资源状态剥离"),"on");
+    await userEvent.click(screen.getByRole("button",{name:"保存账号"}));
+    await waitFor(()=>expect(createApiRouteCredential).toHaveBeenCalledWith(expect.objectContaining({responses_cross_resource_strip:"on"})));
+    await userEvent.click(await screen.findByRole("button",{name:"新增账号"}));
+    await userEvent.click(screen.getByRole("button",{name:"API 账号"}));
+    await userEvent.selectOptions(screen.getByLabelText("接口格式"),"openai-responses");
+    await openFormTab("高级");
+    expect(screen.getByLabelText("跨资源状态剥离")).toHaveValue("auto");
+    await openFormTab("基础");
+    await userEvent.selectOptions(screen.getByLabelText("接口格式"),"openai");
+    await openFormTab("高级");
+    expect(screen.queryByLabelText("跨资源状态剥离")).not.toBeInTheDocument();
+  });
+
   it("creates API accounts with manual Brotli request compression and resets the mode", async () => {
     renderScreen();
     await userEvent.click(await screen.findByRole("button", { name: "新增账号" }));

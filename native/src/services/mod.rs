@@ -28,6 +28,7 @@ pub(crate) mod request_content_rejection;
 pub(crate) mod request_image_limit;
 pub mod response_failure_service;
 pub mod responses_encrypted_content;
+pub mod responses_cross_resource_strip;
 pub mod route_config_service;
 pub mod route_credential_activity;
 pub mod route_credential_service;

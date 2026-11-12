@@ -451,6 +451,12 @@ pub struct CreateApiRouteCredentialInput {
     pub request_brotli_compression: Option<String>,
     #[serde(default)]
     pub responses_encrypted_content_cleanup: Option<bool>,
+    /// None/auto follows the verified site list; explicit off overrides it.
+    /// Strips resource-bound Responses state (item ids, `encrypted*` fields,
+    /// `previous_response_id`) so a multi-resource Azure relay can serve the
+    /// replayed history from any resource.
+    #[serde(default)]
+    pub responses_cross_resource_strip: Option<String>,
     /// Sub-switch of `responses_encrypted_content_cleanup`: strip even
     /// well-formed reasoning ciphertext instead of only malformed values.
     #[serde(default)]
