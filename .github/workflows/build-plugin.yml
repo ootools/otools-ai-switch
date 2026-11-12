@@ -23,7 +23,10 @@ jobs:
             artifact: linux-x64
             library: Linux.so
             platform: linux
-          - os: macos-14
+          # Use the moving alias: pinning macos-14 resolves to the
+          # macos-14-arm64-us-default configuration, which this account cannot
+          # provision (GitHub cancels the job before any step runs).
+          - os: macos-latest
             artifact: macos-arm64
             library: macOS.dylib
             platform: macos
