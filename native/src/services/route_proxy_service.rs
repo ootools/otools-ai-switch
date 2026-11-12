@@ -21820,6 +21820,12 @@ data: [DONE]\n\n";
             start_scripted_sse_upstream(vec![vec![FULL]]).await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
+        // Both continuation cases describe the merged pool: routing mode pins a
+        // request to one account on purpose, so pin Aggregate to keep testing
+        // the failover behaviour these test names promise.
+        RoutePoolRepository::save_model_mode(&pool, "codex", PoolModelMode::Aggregate)
+            .await
+            .expect("pin aggregate mode");
         let first = create_proxy_api_credential_with_config(
             &pool,
             "first",
@@ -21900,6 +21906,12 @@ data: [DONE]\n\n";
             start_scripted_sse_upstream(vec![vec![FULL]]).await;
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
+        // Both continuation cases describe the merged pool: routing mode pins a
+        // request to one account on purpose, so pin Aggregate to keep testing
+        // the failover behaviour these test names promise.
+        RoutePoolRepository::save_model_mode(&pool, "codex", PoolModelMode::Aggregate)
+            .await
+            .expect("pin aggregate mode");
         let first = create_proxy_api_credential_with_config(
             &pool,
             "first",

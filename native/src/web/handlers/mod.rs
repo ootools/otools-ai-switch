@@ -1753,6 +1753,15 @@ mod tests {
         )
         .await
         .unwrap();
+        // The catalog assertion below expects the bare alias. Pin aggregate
+        // mode rather than inheriting the fresh-pool routing default.
+        dispatch_command(
+            fixture.state.clone(),
+            "set_route_pool_model_mode",
+            json!({"input": {"platform":"codex", "mode":"aggregate"}}),
+        )
+        .await
+        .unwrap();
         let models = dispatch_command(
             fixture.state.clone(),
             "list_route_proxy_models",

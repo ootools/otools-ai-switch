@@ -22,6 +22,10 @@ Google 图片预设分为 Nano Banana（`gemini-2.5-flash-image`）与 Nano Bana
 
 迁移账号请使用原版导出和插件导入，不要让两端共写同一 SQLite 数据库。测试可通过 `OTOOLS_AI_SWITCH_DATA_DIR` 指定临时数据目录。左侧不提供独立“客户端接入”入口，账号池内的配置相关业务保留。
 
+客户端接入页是**一张统一列表**，没有平台 tab：账号池只有一个（后端池身份恒为 `codex`），列表 = 原 Codex 客户端 + Claude Code。每张卡片标注接口格式（Codex CLI 为 Responses、Claude Code 为 Messages、其余第三方 Agent 默认 Chat），写入时按格式自动分组调用对应的适配器与接入 Key，不需要用户先选平台。统一账号池设计里明确不删 `PlatformId` 枚举，正是因为客户端生态与写配置适配器仍按协议族分组。
+
+模型清单默认「路由模式」（原「精确模式」），每个 API 账号各出「账号/模型」并钉在该账号；需要同名模型池内轮换时可切回「聚合模式」。Claude Code 只有固定的 `/model` 槽位，卡片上的「设置」会打开槽位映射弹窗；槽位按模型模式分别保存，因为路由模式的模型 id 带账号前缀、聚合模式是裸别名，两者不能共用一份映射。参考了统一账号池后已不可达的旧 Claude 平台账号角色表单行结构。
+
 ## 本地构建
 
 需要 Node.js 22.15+、pnpm、Rust，以及当前平台对应的 C/C++ 编译工具。SDK 源码已固定在 `vendor/otools-plugin-sdk`，构建无需原版 ai-switch 或相邻 OTools 仓库。

@@ -397,6 +397,7 @@ export type CreateApiRouteCredentialInput = {
   responses_plaintext_reasoning_compat?: "auto" | "on" | "off" | null;
   request_brotli_compression?: "auto" | "on" | "off" | null;
   responses_encrypted_content_cleanup?: boolean | null;
+  responses_cross_resource_strip?: "auto" | "on" | "off" | null;
   force_reasoning_content?: boolean | null;
   content_rejection_compat?: "trim_old_tool_outputs" | "off" | null;
   user_agent?: string | null;
@@ -1165,6 +1166,10 @@ export type ClaudeSlotPlan = {
   slots: ClaudeSlotPlanSlot[];
   subagent_model: string | null;
   fallback_model: string | null;
+  /** `precise`（路由模式）或 `aggregate`（聚合模式）；决定可选模型 id 的形态。 */
+  model_mode: string;
+  /** 当前模式下代理接受的模型别名；路由模式带 `<账号>/` 前缀。 */
+  available_models: string[];
 };
 
 export type AppSettings = {
@@ -1188,7 +1193,14 @@ export type AppSettings = {
    */
   claude_client_config_json?: string | null;
   /**
-   * Which clients each platform writes config for, as
+   * Per-model-mode Claude Code `/model` slot overrides, as
+   * `{"aggregate":{...},"precise":{...}}`. Routing mode pins
+   * `<account>/<alias>` while aggregate mode exposes the bare `<alias>`, so the
+   * two branches must never share a saved choice.
+   */
+  claude_slot_overrides_json?: string | null;
+  /**
+   * Which clients each protocol family writes config for, as
    * `{"codex":["codex","zcode"]}`. Recorded per platform because the dialog
    * always opens in one platform's context. Absent or empty means the
    * platform's native CLI only.
@@ -1467,4 +1479,3 @@ export type DirectModeStatus = {
   updated_at: string;
   restart_required: boolean;
 };
-  responses_cross_resource_strip?: "auto" | "on" | "off" | null;

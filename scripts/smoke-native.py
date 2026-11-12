@@ -63,9 +63,19 @@ def check_proxy_forwarding(call, opener, key):
         }})
         call("set_route_pool_members", {"input": {"platform": "codex", "account_ids": [account["id"]]}})
         models = call("list_route_proxy_models", {"platform": "codex"})
-        assert any(model["id"] == "demo-chat" for model in models), "Native model listing lost the pool model"
+        # The pool advertises the alias the catalog hands to clients. Routing mode
+        # (the default for a fresh pool) prefixes it with the account id, so the
+        # id is `<account>/demo-chat`; aggregate mode keeps the bare `demo-chat`.
+        # Either way the test must use exactly what the listing returned, because
+        # that is what the proxy actually accepts — and that is the real contract
+        # we are exercising here.
+        demo_chat_id = next(
+            (model["id"] for model in models if model["id"] == "demo-chat" or model["id"].endswith("/demo-chat")),
+            None,
+        )
+        assert demo_chat_id is not None, "Native model listing lost the pool model"
         for stream in [False, True]:
-            body = {"model": "demo-chat", "messages": [{"role": "user", "content": "local test only"}], "stream": stream}
+            body = {"model": demo_chat_id, "messages": [{"role": "user", "content": "local test only"}], "stream": stream}
             request = urllib.request.Request(
                 "http://127.0.0.1:29527/v1/chat/completions", data=json.dumps(body).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
@@ -91,7 +101,7 @@ def check_proxy_forwarding(call, opener, key):
         def held_client():
             request = urllib.request.Request(
                 "http://127.0.0.1:29527/v1/chat/completions",
-                data=json.dumps({"model": "demo-chat", "messages": [{"role": "user", "content": "hold until shutdown"}], "stream": True}).encode(),
+                data=json.dumps({"model": demo_chat_id, "messages": [{"role": "user", "content": "hold until shutdown"}], "stream": True}).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
             )
             try:
