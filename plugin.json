@@ -3,7 +3,7 @@
   "uuid": "otools-ai-switch",
   "displayName": "AI Switch · AI本地网关",
   "displayNameCN": "AI Switch · AI本地网关",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "entry": "dist/index.html",
   "icon": "🔀",
   "developerName": "OTools",

@@ -2,9 +2,20 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
-## Unreleased: unified single-page client setup
+## v0.1.4: cross-resource strip + unified single-page client setup
 
-Follow-up to the released v0.1.3 UI. The four `Codex / Claude / Gemini / Grok` tabs were removed: they were client-protocol families, not account-pool platforms, but the labels and copy made the page read like the removed platform hierarchy. Nothing in this section has been committed, tagged or published.
+Two user-facing changes ship in v0.1.4: the multi-resource Azure relay fix (commit `e38c404`) and the client-setup redesign (commit `e6fd268`). Both are in `docs/releases/0.1.4.md`.
+
+### Cross-resource Responses strip (`e38c404`)
+
+A relay that rotates over several Azure resources without session affinity answers replayed history from a resource that never created it, and Azure rejects the turn with `The requested item was created under a different Azure OpenAI resource.` Before forwarding a Responses-to-Responses request, `responses_cross_resource_strip::strip` drops every input item's `id`, every `encrypted*` field (matched case-insensitively) and the top-level `previous_response_id`; a pure `item_reference` is dropped whole because keeping it without its id only trades the cross-resource error for a missing-parameter one. Message text, tool-call ids/arguments, summaries, headers and the response stream are untouched. It runs ahead of the existing reasoning cleanup, whose shape-aware conservative pass deliberately keeps well-formed ciphertext (exactly what this error contains) and whose aggressive pass only covers `type: "reasoning"`.
+
+- Account-level switch `responses_cross_resource_strip` (`auto` / `on` / `off`, default `auto`) with an allow-list (`agentrouter.org`, `ps.air-outer.com`) so both AgentRouter lines default to on; `auto` matches the exact verified hostname only and `off` always wins. No database migration — it lives in `route_credentials.config_json`.
+- Tests: `auto_matches_only_exact_verified_hostname_and_off_wins`, `strips_ids_ciphertext_and_previous_response_id_but_nothing_else`, `drops_every_encrypted_carrier_case_insensitively`, `a_reference_with_extra_fields_survives_without_its_id`, `leaves_requests_without_resource_bound_state_untouched`.
+
+### Unified single-page client setup (`e6fd268`)
+
+Follow-up to the released v0.1.3 UI. The four `Codex / Claude / Gemini / Grok` tabs were removed: they were client-protocol families, not account-pool platforms, but the labels and copy made the page read like the removed platform hierarchy.
 
 - `ClientSetupScreen` now renders one card list (2 columns on wide screens) = the former Codex client set plus Claude Code. Each card shows a wire-format badge (`Responses` for Codex CLI, `Messages` for Claude Code, `Chat` for the other agents) and a real brand SVG for the two first-party CLIs; third-party agents get deterministic brand-colour monograms because no redistributable official SVG endpoint was reachable from this machine (`curl` to vendor sites / the public favicon service returned 000 or 404). The plugin stays fully offline.
 - Writing splits by format: `responses` / `chat` go through the `codex` adapters, `messages` through the `claude` adapters. Each family keeps its own adapters, config path shape and access key; no backend wire contract was rewritten. The result panel merges both groups' outcomes, and the stored selection is written back under both keys so the backend's per-platform lookup stays compatible.
@@ -15,6 +26,7 @@ Follow-up to the released v0.1.3 UI. The four `Codex / Claude / Gemini / Grok` t
 - **Not done:** making the per-card wire format user-editable (it is derived from each client's adapter, not rewritable without changing every adapter); exposing `opencode` / `openclaw` / `hermes` single-client families in the list; consolidating every client onto one access key (would change `resolve_platform`'s key→protocol-family lookup).
 - Verification: native full suite **1983 passed, 0 failed, 6 ignored** (`cargo test --lib -- --test-threads=1`, log `dist-pack/cargo-test-single-page3.log`, RC=0), including 3 new slot-override unit tests. Fourteen pre-existing cases that implicitly relied on aggregate being the default were updated to pin their tested mode explicitly (`ServiceFixture`, `config_write_context`, two continuation cases, the handler model-listing case) and two default assertions were corrected. Frontend full suite **75 files, 871 tests passed** (`pnpm test:run`, log `dist-pack/vitest-single-page.log`, RC=0); `tests/ClientSetupScreen.test.tsx` 33/33; `pnpm typecheck` RC=0; `pnpm build` RC=0.
 - Not exercised: real provider credentials, a real user's OTools host, and a genuine Claude Code `/model` menu round-trip. Slot writes were verified through the resolver's unit tests and the dialog's save payload.
+- `scripts/smoke-native.py` was updated alongside the routing-mode default: the catalog now advertises `<account>/demo-chat`, so the smoke test reads the advertised id from the listing and uses it for the mapping/forwarding assertions instead of hardcoding the bare alias. All 7 isolated checks pass against the rebuilt release DLL.
 
 ## v0.1.3 release verification
 

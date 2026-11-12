@@ -3,8 +3,10 @@ node_modules/
 /lib/
 /dist-pack/
 native/target/
+native/target-*/
 native/*.log
 native/*.err
+.workbuddy-ai/
 artifacts/
 coverage/
 *.tsbuildinfo

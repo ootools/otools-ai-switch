@@ -46,9 +46,9 @@ node scripts/verify-plugin.mjs
 
 Native 默认构建 release 库并复制到 `lib/Windows.dll`、`lib/macOS.dylib` 或 `lib/Linux.so`。交叉编译可传 `--target <Rust target>`，需要自行安装对应工具链。烟测默认加载 Windows 库；其他平台通过 `--library lib/Linux.so` 等指定。
 
-`dist-pack/otools-ai-switch-0.1.3.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
+`dist-pack/otools-ai-switch-0.1.4.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
 
-分平台包用 `--suffix <platform>` 命名，例如 `node scripts/pack-plugin.mjs --suffix windows` 生成 `otools-ai-switch-0.1.3-windows.oplg`；校验时传同样的 `--suffix`，并可加 `--expect-library lib/Windows.dll` 强制断言包里**只含这一个** native 库。`SHA256SUMS` 会按实际包名生成。市场上的 `packageMode=1` 即依赖这三个单平台包，客户端优先下载平台包、失败才回退不带后缀的合包。
+分平台包用 `--suffix <platform>` 命名，例如 `node scripts/pack-plugin.mjs --suffix windows` 生成 `otools-ai-switch-0.1.4-windows.oplg`；校验时传同样的 `--suffix`，并可加 `--expect-library lib/Windows.dll` 强制断言包里**只含这一个** native 库。`SHA256SUMS` 会按实际包名生成。市场上的 `packageMode=1` 即依赖这三个单平台包，客户端优先下载平台包、失败才回退不带后缀的合包。
 
 `.github/workflows/build-plugin.yml` 提供 Windows x64、Linux x64、macOS ARM64 的分别构建和制品校验配置，不自动发布。每个 matrix job 只构建自己那一个 native 库，打包时带平台后缀并用 `--expect-library` 阻断多平台库混入。macOS 目前只有 ARM64 构建。CI 配置存在不代表这些平台已在当前工作区验证。
 
