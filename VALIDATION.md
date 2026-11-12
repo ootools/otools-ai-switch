@@ -2,7 +2,12 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
-## Unreleased: v0.1.3 — in-stream salvage and the "stopped after one attempt" fix
+## v0.1.3 release verification
+
+Released 2026-11-12. Package, frontend and native version are aligned at `0.1.3`. Commit `1b8b020`, annotated tag `v0.1.3`, GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.3> (non-draft, non-prerelease, 8 assets). Release notes are byte-identical to `docs/releases/0.1.3.md`. Market publication returned `code=200 插件更新成功` / `action=updated`; read-back confirmed `version=0.1.3`, `packageMode=1`, all three `packageUrl{Windows,Linux,Macos}`, `support*=1`, `logo` / `icon` on `v0.1.3`, and the manually curated `minOToolsVersion=0.5.0` / `categories=["latest"]` / `official=0` retained. All four package download URLs answered HTTP 206 to a ranged probe.
+
+- The three platform packages come from the fully green CI run `43208829019` (Windows / Linux / macOS jobs each `success`, 26 steps); the combined fallback package was built locally with the rebuilt Windows release DLL. Each archive was re-verified locally with `--expect-library` to contain exactly one native library (`lib/Windows.dll` / `lib/Linux.so` / `lib/macOS.dylib`); the macOS dylib reports Mach-O `cputype 0x0100000c` (ARM64). The published 7-entry `SHA256SUMS` was downloaded back from the Release and matched byte-for-byte: combined `af1475d7…b61c`, Windows `30342181…34d8`, Linux `e6fb11a2…0e96`, macOS `f9fe6dbf…a3`, source `cb1f712d…97cf`, `plugin.json` `b62504ea…2e80`, `logo.svg` `cea34d58…a424`.
+- The source zip was generated with `git archive` from `1b8b020` and checked against that commit before publication (README / VALIDATION / `route_proxy_service.rs` / `AccountsScreen.tsx` byte-identical); it includes the 0.1.3 release notes and the salvage implementation. It is a release snapshot, so post-release documentation edits after `1b8b020` are intentionally not backfilled into it. Rust Windows DLL rebuilds are not byte-reproducible, so the Release `SHA256SUMS` is the authoritative checksum list.
 
 Combines the four zero-output refusal fixes below with an opt-in recovery path for failures that arrive *after* content has already been streamed. Every new setting lives in `failure_policy` (`route_credentials.config_json`); no database migration.
 
@@ -14,7 +19,7 @@ Combines the four zero-output refusal fixes below with an opt-in recovery path f
 - Verification: native full suite **1975 passed, 0 failed, 6 ignored** (`cargo test --lib -- --test-threads=1`, log `dist-pack/cargo-test-0.1.3-final.log`, RC=0). Frontend full suite **75 files, 865 tests passed** (`pnpm test:run --maxWorkers=2 --minWorkers=1`, log `dist-pack/vitest-0.1.3-rerun.log`, RC=0); `pnpm typecheck` RC=0 (`dist-pack/typecheck-0.1.3.log`). One earlier frontend run returned RC=1 from an unrelated Vitest `EPERM` unhandled error in the WorkBuddyAI temp-cache shim while every collected test passed; the clean rerun collected all 75 files.
 - Not exercised: real provider credentials, paid generation, encrypted reasoning / half-tool-call continuation, pure Chat `messages` requests (no `input` array to rebuild), and a real user's OTools host.
 
-## Unreleased: HTTP 200 in-stream refusal retry fix
+## v0.1.3 (part 1): HTTP 200 in-stream refusal retry fix
 
 Follow-up to the `v0.1.2` report that a `response.created → response.failed` turn with `code: rate_limit_exceeded` / "exceeded token rate limit" still stopped after one attempt. Four independent causes were found and fixed; none of the changes require a database migration (`failure_policy` lives in `route_credentials.config_json`).
 
@@ -26,7 +31,7 @@ Follow-up to the `v0.1.2` report that a `response.created → response.failed` t
 - Native full suite: **1967 passed, 0 failed, 6 ignored** (`cargo test --lib -- --test-threads=1`, log `dist-pack/cargo-test-verify2.log`, RC=0).
 - Frontend full suite: **75 files, 863 tests passed** (`pnpm test:run --maxWorkers=2 --minWorkers=1`, log `dist-pack/vitest-final.log`, RC=0); `pnpm typecheck` RC=0. An earlier 4-worker run also passed all 820 assertions but returned RC=1 from two unrelated Vitest `EPERM` unhandled errors in the WorkBuddyAI `node-brokered-fs-shim` temp-cache writes.
 - New regressions: a refusal arriving after the old 3 s grace; the exact reported `eastus2` token-rate-limit payload mapped to the Capacity budget (`rate_limit` explicitly 0); a 70 KB opening echo delivered whole or in 9 KB chunks; a complete opening echo followed by a split refusal frame; `stream_prelude_wait_ms: 0` restoring immediate commit; classification of regional throughput vs account quota; and the frontend default/tuned/out-of-range values for the new field.
-- Not exercised: real provider credentials, paid generation, and a real user's OTools host. These are scripted local upstreams reproducing the reported frame shapes. No package, native release library, GitHub Release or market publication has been built or published for this fix.
+- Not exercised: real provider credentials, paid generation, and a real user's OTools host. These are scripted local upstreams reproducing the reported frame shapes. The native release library, GitHub Release and market publication for this fix were produced together with the v0.1.3 part-2 work above; see the v0.1.3 release verification section.
 
 ## v0.1.2 release verification
 
