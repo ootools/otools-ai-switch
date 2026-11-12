@@ -71,6 +71,35 @@ const RATE_LIMIT_MESSAGE_MARKERS: &[&str] = &[
     "tokens per minute",
     "please slow down",
 ];
+/// Azure / OpenAI regional deployment throughput verdicts reuse the generic
+/// `rate_limit_exceeded` code but describe a *token* rate limit on a region or
+/// deployment, not this account's fixed request window. They are upstream-side
+/// capacity: re-asking after a short wait often lands in a free window, and
+/// parking the key punishes it for the provider's load. Requiring both a
+/// rate-limit-family code and one of these phrases keeps ordinary account
+/// limits ("Rate limit reached, please slow down") in the RateLimit bucket.
+const REGIONAL_THROUGHPUT_CODES: &[&str] = &[
+    "rate_limit_exceeded",
+    "tokens_per_minute_limit",
+    "too_many_requests",
+];
+const REGIONAL_THROUGHPUT_MESSAGE_MARKERS: &[&str] = &[
+    "exceeded token rate limit",
+    "token rate limit exceeded",
+    "exceeded the token rate limit",
+    "exceeded tokens per minute limit",
+];
+/// An exhausted balance or plan is never an upstream capacity problem, even
+/// when the gateway stamps a rate-limit-looking code on the envelope.
+const ACCOUNT_QUOTA_MESSAGE_MARKERS: &[&str] = &[
+    "your current quota",
+    "insufficient_quota",
+    "plan and billing",
+    "check your plan",
+    "billing details",
+    "quota exhausted",
+    "额度",
+];
 
 fn normalized_failure_text(message: &str) -> String {
     message
@@ -105,8 +134,33 @@ pub fn is_capacity_response_failure(failure: &SemanticResponseFailure) -> bool {
     if code_matches(failure, CAPACITY_ERROR_CODES) {
         return true;
     }
+    if is_regional_throughput_rate_limit(failure) {
+        return true;
+    }
     let message = normalized_failure_text(&failure.message);
     CAPACITY_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// The regional/per-deployment token budget is a pool-side throughput window,
+/// not a verdict on this account. Only a rate-limit-family code plus an
+/// explicit "token rate limit" sentence counts; a bare `rate_limit_exceeded`
+/// stays in the ordinary RateLimit class.
+fn is_regional_throughput_rate_limit(failure: &SemanticResponseFailure) -> bool {
+    if !(code_matches(failure, REGIONAL_THROUGHPUT_CODES)
+        || error_type_matches(failure, REGIONAL_THROUGHPUT_CODES))
+    {
+        return false;
+    }
+    let message = normalized_failure_text(&failure.message);
+    if ACCOUNT_QUOTA_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        return false;
+    }
+    REGIONAL_THROUGHPUT_MESSAGE_MARKERS
         .iter()
         .any(|marker| message.contains(marker))
 }
@@ -855,6 +909,50 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"n
             message: "Our servers are currently overloaded. Please try again later.".to_string(),
         };
         assert!(is_capacity_response_failure(&overload));
+    }
+
+    /// The exact refusal reported after v0.1.2: HTTP 200, `response.created`,
+    /// then a generic `rate_limit_exceeded` naming an Azure region's token
+    /// budget. It describes the upstream pool, not this account, so it belongs
+    /// to the long-retry Capacity class.
+    #[test]
+    fn classifies_regional_token_rate_limit_as_capacity() {
+        let body = br#"event: error
+data: {"type":"error","error":{"type":"too_many_requests","code":"rate_limit_exceeded","message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.","param":null}}
+
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit."}}}
+"#;
+        let failure = detect_response_failed(body).expect("semantic failure");
+        assert_eq!(failure.code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(failure.error_type.as_deref(), Some("too_many_requests"));
+        assert!(is_capacity_response_failure(&failure));
+        assert!(!is_rate_limit_response_failure(&failure));
+
+        let bare = SemanticResponseFailure {
+            code: Some("tokens_per_minute_limit".to_string()),
+            error_type: None,
+            message: "Exceeded tokens per minute limit, please retry.".to_string(),
+        };
+        assert!(is_capacity_response_failure(&bare));
+    }
+
+    #[test]
+    fn regional_throughput_rule_does_not_swallow_account_limits() {
+        let candidates = [
+            r#"{"error":{"code":"rate_limit_exceeded","type":"too_many_requests","message":"Rate limit reached, please slow down"}}"#,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"You exceeded your current quota, please check your plan and billing details"}}"#,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"Requests per minute limit reached for this account"}}"#,
+            r#"{"error":{"code":"insufficient_quota","message":"Your requests have exceeded token rate limit"}}"#,
+        ];
+        for body in candidates {
+            let failure = detect_response_failed(body.as_bytes()).expect("semantic failure");
+            assert!(
+                !is_capacity_response_failure(&failure),
+                "misclassified as capacity: {}",
+                failure.message
+            );
+        }
     }
 
     /// Broad words must not turn a hard verdict into a hundred-retry class.

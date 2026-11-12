@@ -6216,6 +6216,90 @@ describe("AccountsScreen", () => {
     expect(updateRouteCredential).not.toHaveBeenCalled();
   });
 
+  it("defaults the stream prelude window to 60s and writes a tuned value on save", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    expect(screen.getByLabelText("建流等待窗口（毫秒）")).toHaveValue(60_000);
+
+    fireEvent.change(screen.getByLabelText("建流等待窗口（毫秒）"), {
+      target: { value: "120000" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
+    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
+      stream_prelude_wait_ms: 120_000,
+    });
+  });
+
+  it("hydrates a stored stream prelude window and rejects an oversized one", async () => {
+    const api = {
+      ...credentialsFixture[1],
+      config_json: JSON.stringify({
+        base_url: "https://api.example.com/v1",
+        interface_format: "openai",
+        model_mappings: [],
+        failure_policy: { retry_count: 2, stream_prelude_wait_ms: 0 },
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+    vi.mocked(updateRouteCredential).mockResolvedValue(api);
+
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("故障处理");
+    expect(screen.getByLabelText("建流等待窗口（毫秒）")).toHaveValue(0);
+
+    fireEvent.change(screen.getByLabelText("建流等待窗口（毫秒）"), {
+      target: { value: "600001" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    expect(
+      await screen.findAllByText("建流等待窗口必须是 0-600000 毫秒的整数"),
+    ).not.toHaveLength(0);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+  });
+
+  it("keeps in-stream salvage off by default and writes the opt-in on save", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    const toggle = screen.getByLabelText("流内失败时自动救回") as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+
+    await userEvent.click(toggle);
+    expect(toggle.checked).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
+    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
+      stream_salvage_enabled: true,
+    });
+  });
+
+  it("hydrates a stored in-stream salvage opt-in", async () => {
+    const api = {
+      ...credentialsFixture[1],
+      config_json: JSON.stringify({
+        base_url: "https://api.example.com/v1",
+        interface_format: "openai",
+        model_mappings: [],
+        failure_policy: { retry_count: 2, stream_salvage_enabled: true },
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+
+    renderScreen();
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("故障处理");
+    expect((screen.getByLabelText("流内失败时自动救回") as HTMLInputElement).checked).toBe(true);
+  });
+
   it("recognizes an API key from a clipboard image while editing an API credential", async () => {
     const imageBlob = new Blob(["fake"], { type: "image/png" });
     const clipboardItem = {

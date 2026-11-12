@@ -61,6 +61,20 @@ pub const MAX_ROUTE_CREDENTIAL_CAPACITY_RETRY_INTERVAL_MS: u32 = 60_000;
 /// Wall-clock guard for long retry loops. `0` means no time limit.
 pub const DEFAULT_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS: u32 = 0;
 pub const MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS: u32 = 86_400;
+/// How long a zero-output Responses opening frame (`response.created` /
+/// `response.in_progress`) may be held back before the 200 is committed.
+///
+/// Upstreams that are about to refuse a turn for capacity reasons often emit
+/// `response.created` first and only report the `error` / `response.failed`
+/// frames many seconds later (a real Azure "token rate limit" refusal took 14s).
+/// The old hard-coded 3s grace committed the stream before that verdict arrived,
+/// which made the failure unretryable. `0` disables the hold-back entirely.
+pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS: u32 = 60_000;
+pub const MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS: u32 = 600_000;
+/// Default for "salvage an in-stream refusal by continuing the same response".
+/// Off by default: continuing spends another billed request and the client
+/// receives an answer the model did not write in one pass.
+pub const DEFAULT_ROUTE_CREDENTIAL_STREAM_SALVAGE_ENABLED: bool = false;
 
 /// Buckets a single failed attempt falls into. Only these five are retryable;
 /// the hard verdicts (quota, permissions, content policy, oversized request,
@@ -151,6 +165,14 @@ pub struct RouteCredentialFailurePolicy {
     pub capacity_retry_interval_ms: u32,
     /// 整次请求的重试总时长上限（秒）；0 表示只按次数限制，不按时间。
     pub max_retry_elapsed_seconds: u32,
+    /// 流式响应开头只有零输出的 Responses 建流帧时，最多扣住多久等后续帧。
+    /// 0 表示不扣留（收到建流帧立刻提交），单位毫秒。
+    pub stream_prelude_wait_ms: u32,
+    /// 已经输出正文后上游才在流内报「容量不足 / 限流 / 5xx」时，是否扣住失败帧
+    /// 并复用断流续写管线把这一轮接完。默认关闭：客户端拿到的是模型分多次写成
+    /// 的答案，且每轮续写都是一次完整计费请求。额度、内容审核、上下文超长等
+    /// 硬判决永远不进入这条路径。
+    pub stream_salvage_enabled: bool,
 }
 
 impl Default for RouteCredentialFailurePolicy {
@@ -168,6 +190,8 @@ impl Default for RouteCredentialFailurePolicy {
             retry_class_limits: RouteRetryClassLimits::default(),
             capacity_retry_interval_ms: DEFAULT_ROUTE_CREDENTIAL_CAPACITY_RETRY_INTERVAL_MS,
             max_retry_elapsed_seconds: DEFAULT_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS,
+            stream_prelude_wait_ms: DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS,
+            stream_salvage_enabled: DEFAULT_ROUTE_CREDENTIAL_STREAM_SALVAGE_ENABLED,
         }
     }
 }
@@ -218,6 +242,16 @@ impl RouteCredentialFailurePolicy {
             && elapsed >= std::time::Duration::from_secs(self.max_retry_elapsed_seconds.into())
     }
 
+    /// Total time the proxy may keep a zero-output Responses opening frame to
+    /// itself while waiting for either the first output or a failure frame.
+    /// `None` means the hold-back is switched off: commit the announcement at
+    /// once, which restores the pre-hold-back behaviour for upstreams that
+    /// legitimately sit on `response.created` for minutes.
+    pub fn stream_prelude_wait(&self) -> Option<std::time::Duration> {
+        (self.stream_prelude_wait_ms > 0)
+            .then(|| std::time::Duration::from_millis(self.stream_prelude_wait_ms.into()))
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.retry_count > MAX_ROUTE_CREDENTIAL_RETRY_COUNT {
             return Err(format!(
@@ -256,6 +290,11 @@ impl RouteCredentialFailurePolicy {
         if self.max_retry_elapsed_seconds > MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS {
             return Err(format!(
                 "max_retry_elapsed_seconds must be between 0 and {MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS}"
+            ));
+        }
+        if self.stream_prelude_wait_ms > MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS {
+            return Err(format!(
+                "stream_prelude_wait_ms must be between 0 and {MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS}"
             ));
         }
         self.retry_class_limits.validate()?;
@@ -733,8 +772,10 @@ mod tests {
         DEFAULT_ROUTE_CREDENTIAL_COOLDOWN_SECONDS, DEFAULT_ROUTE_CREDENTIAL_RETRY_COUNT,
         DEFAULT_ROUTE_CREDENTIAL_RETRY_INTERVAL_MS,
         DEFAULT_ROUTE_CREDENTIAL_SEMANTIC_ERROR_THRESHOLD,
-        DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX, MAX_ROUTE_CREDENTIAL_CLASS_RETRY_COUNT,
+        DEFAULT_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
+        DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS, MAX_ROUTE_CREDENTIAL_CLASS_RETRY_COUNT,
         MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS, MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX,
+        MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -933,5 +974,66 @@ mod tests {
         }))
         .expect_err("above interval ceiling");
         assert!(bad_interval.contains("capacity_retry_interval_ms"));
+    }
+
+    /// A refusal that arrives 14s after `response.created` must still be
+    /// retriable: the old hard-coded 3s grace committed the stream first.
+    #[test]
+    fn stream_prelude_wait_defaults_to_a_window_longer_than_slow_refusals() {
+        let policy = RouteCredentialFailurePolicy::default();
+        assert_eq!(
+            policy.stream_prelude_wait(),
+            Some(Duration::from_millis(
+                DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS.into()
+            ))
+        );
+        assert!(policy.stream_prelude_wait().unwrap() > Duration::from_secs(14));
+        // Legacy configs stay valid and get the new default.
+        let legacy = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {"retry_count": 3}
+        }))
+        .expect("legacy policy");
+        assert_eq!(legacy.stream_prelude_wait(), policy.stream_prelude_wait());
+    }
+
+    #[test]
+    fn stream_prelude_wait_is_configurable_and_can_be_disabled() {
+        let tuned = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {"stream_prelude_wait_ms": 1_500}
+        }))
+        .expect("tuned policy");
+        assert_eq!(tuned.stream_prelude_wait(), Some(Duration::from_millis(1_500)));
+
+        let disabled = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {"stream_prelude_wait_ms": 0}
+        }))
+        .expect("disabled policy");
+        assert_eq!(disabled.stream_prelude_wait(), None);
+
+        let too_long = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {
+                "stream_prelude_wait_ms": MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS + 1
+            }
+        }))
+        .expect_err("above ceiling");
+        assert!(too_long.contains("stream_prelude_wait_ms"));
+    }
+
+    /// Salvaging an in-stream refusal is opt-in: upgrading from an older
+    /// release must not silently start spending extra billed requests.
+    #[test]
+    fn stream_salvage_is_off_by_default_and_opt_in() {
+        assert!(!RouteCredentialFailurePolicy::default().stream_salvage_enabled);
+        let legacy = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {"retry_count": 3}
+        }))
+        .expect("legacy policy");
+        assert!(!legacy.stream_salvage_enabled);
+
+        let enabled = RouteCredentialFailurePolicy::from_config_value(&json!({
+            "failure_policy": {"stream_salvage_enabled": true}
+        }))
+        .expect("enabled policy");
+        assert!(enabled.stream_salvage_enabled);
     }
 }

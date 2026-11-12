@@ -73,7 +73,8 @@ use crate::services::route_proxy_live_log::{
     LIVE_LOG_ELISION_MARKER, LIVE_LOG_RAW_PREVIEW_LIMIT, LIVE_LOG_STAGE_LIMIT,
 };
 use crate::services::route_proxy_stream::{
-    sse_is_chat_role_prelude, sse_is_responses_prelude, sse_payload_started, StreamObserver,
+    sse_has_complete_data_frame, sse_has_partial_data_line, sse_is_chat_role_prelude,
+    sse_is_responses_prelude, sse_payload_started, SseFramer, StreamObserver,
 };
 use crate::services::route_stream_continuation::plan_continuation;
 use axum::body::Body;
@@ -117,18 +118,11 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long to wait before re-sending a streamed request whose upstream
 /// reported a failure frame instead of answering.
 ///
-/// Deliberately short and fixed rather than read from the credential's failure
-/// policy: an upstream that fails this way has already answered, in
-/// milliseconds, so a policy-sized backoff — commonly seconds — would cost the
-/// caller far more than the retry is worth. The failure is transient on the
-/// upstream's side and re-asking usually lands on a healthy provider.
+/// Applies only to generic transient failures. Capacity and rate-limit classes
+/// have their own (usually much longer) configured backoff, because a hundred
+/// retries at 500 ms would be a burst rather than a wait — see the prime loop's
+/// class-aware `retry_delay`.
 const STREAM_DISCONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-/// How long a Responses stream-opening frame may be held back while waiting
-/// for either the first output or a `response.failed`. Bounded so a queued or
-/// thinking upstream cannot sit on the response headers indefinitely: past the
-/// grace period the prefix is committed and behaviour is exactly as before.
-const RESPONSES_PRELUDE_GRACE: Duration = Duration::from_secs(3);
 
 /// The most keepalive padding to hold back while waiting for real content.
 ///
@@ -136,6 +130,13 @@ const RESPONSES_PRELUDE_GRACE: Duration = Duration::from_secs(3);
 /// that only ever emits comment frames could hold the request open indefinitely
 /// in the hope that a payload frame is still coming.
 const STREAM_PRIME_HOLDBACK_LIMIT: usize = 64 * 1024;
+/// A `response.created` frame echoes the entire request — system prompt plus
+/// every tool schema — and a real Codex turn can easily exceed the 64 KB stage
+/// budget with that one frame alone. Those bytes are scaffolding, not output:
+/// committing on the ordinary cap would hand the client a 200 before a late
+/// `response.failed` could be retried. Prelude-only buffers get a much larger
+/// (still bounded) ceiling; the configurable prelude deadline always ends them.
+const STREAM_RESPONSES_PRELUDE_HOLDBACK_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Public xAI Grok CLI OAuth client ID (CLIProxyAPI / Grok CLI).
 const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -214,6 +215,36 @@ fn class_for_failure(
 fn class_for_body(status: StatusCode, body: Option<&[u8]>) -> RouteFailureClass {
     let failure = body.and_then(detect_response_failed);
     class_for_failure(status, failure.as_ref())
+}
+
+/// Whether one client-visible SSE block is an upstream-side transient refusal
+/// that may be held back and answered by the continuation pipeline.
+///
+/// Output bytes have already reached the client at this point, so a plain retry
+/// would duplicate the answer. Holding the failure frame and resuming the same
+/// response is the only shape that keeps the turn coherent. Hard verdicts on
+/// the request body or the account are deliberately excluded: re-asking a
+/// different account cannot fix an overlong prompt, a content rejection or an
+/// exhausted balance, and would only burn the pool.
+fn salvageable_failure_class(status: StatusCode, block: &[u8]) -> Option<RouteFailureClass> {
+    let failure = detect_response_failed(block)?;
+    if is_definitive_quota_exhaustion_failure(&failure)
+        || is_content_rejection(&failure)
+        || is_context_length_failure(&failure)
+        || is_too_many_images_failure(&failure)
+        || is_insufficient_permissions_failure(&failure)
+    {
+        return None;
+    }
+    let class = class_for_failure(status, Some(&failure));
+    matches!(
+        class,
+        RouteFailureClass::Capacity
+            | RouteFailureClass::RateLimit
+            | RouteFailureClass::ServerError
+            | RouteFailureClass::Transport
+    )
+    .then_some(class)
 }
 
 /// The single gate every same-account retry goes through.
@@ -1801,18 +1832,48 @@ pub(crate) async fn forward_request(
             // `provider_unavailable` used to reach the client as
             // `stream disconnected before completion` with nothing to retry on.
             let mut primed: Vec<u8> = Vec::new();
+            // A `response.created` frame carries no output, so it can be held
+            // back while waiting for either the first output or a failure. The
+            // window is per-account configurable and measured from the *first*
+            // prelude frame: an upstream dribbling `response.in_progress`
+            // keepalives must not pin the client's headers open forever.
+            //
+            // The default is deliberately much longer than the old fixed 3s:
+            // a real Azure "exceeded token rate limit" refusal arrived ~14s
+            // after `response.created`, by which time v0.1.2 had already
+            // committed the 200 and could only forward the broken turn.
+            let prelude_wait = failure_policy.stream_prelude_wait();
+            let mut prelude_deadline: Option<Instant> = None;
             // `Some((message, delay))` ends the attempt before any payload byte
-            // reached the client, so it is still a retry. The delay is carried
-            // per failure kind rather than read once from the policy: see
-            // `STREAM_DISCONNECT_RETRY_DELAY`.
+            // reached the client, so it is still a retry. `Some(delay)` overrides
+            // the class-specific backoff for generic stream failures; `None`
+            // lets `wait_for_class_retry` honour the configured interval.
             let prime_failure: Option<(String, Option<Duration>)> = loop {
-                // A `response.created` frame carries no output. Holding it for
-                // one bounded read keeps the attempt retryable when the next
-                // frame is `response.failed` (an upstream capacity refusal).
-                // Once any output has arrived the prefix is committed as usual.
-                let next_chunk = if sse_is_responses_prelude(&primed) {
+                // An incomplete `data:` line (a large `response.created` echo
+                // or a late `response.failed` split across network chunks)
+                // counts as opening too — otherwise the half-written line would
+                // look like real output and commit the stream before the
+                // refusal arrives. Before any byte at all, keep the old
+                // unbounded wait for the first chunk.
+                let partial_data_line = sse_has_partial_data_line(&primed);
+                let still_opening = !primed.is_empty()
+                    && (sse_is_responses_prelude(&primed)
+                        || partial_data_line
+                        || !sse_has_complete_data_frame(&primed));
+                let next_chunk = if !still_opening {
+                    prelude_deadline = None;
+                    futures_util::StreamExt::next(&mut stream).await
+                } else {
+                    // `None` = the user turned the hold-back off: commit the
+                    // announcement immediately, restoring the old behaviour.
+                    let Some(wait) = prelude_wait else { break None };
+                    let deadline = *prelude_deadline.get_or_insert_with(|| Instant::now() + wait);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break None;
+                    }
                     match tokio::time::timeout(
-                        RESPONSES_PRELUDE_GRACE,
+                        remaining,
                         futures_util::StreamExt::next(&mut stream),
                     )
                     .await
@@ -1820,19 +1881,40 @@ pub(crate) async fn forward_request(
                         Ok(chunk) => chunk,
                         Err(_) => break None,
                     }
-                } else {
-                    futures_util::StreamExt::next(&mut stream).await
                 };
                 match next_chunk {
                     Some(Ok(chunk)) => {
                         primed.extend_from_slice(&chunk);
-                        if primed.len() >= STREAM_PRIME_HOLDBACK_LIMIT {
-                            // Nothing left worth protecting: hand it on and let
-                            // the observer judge how the stream ends.
-                            break None;
+                        let opening_failure = detect_response_failed(&primed);
+                        // A huge `response.created` echo is still scaffolding,
+                        // not output. Count it against the larger prelude-only
+                        // budget so a late refusal stays inside the retry
+                        // window instead of being committed by a byte cap.
+                        // A parsed failure always wins over the byte cap — the
+                        // echo alone can already be larger than 64 KB, and that
+                        // must not turn a retryable refusal into a forward.
+                        //
+                        // Pure comment padding is NOT scaffolding: it has no
+                        // `data:` line in progress, so it keeps the ordinary
+                        // cap. Otherwise a gateway dribbling keepalives could
+                        // pin the client's headers open for the whole window.
+                        if opening_failure.is_none() {
+                            let holdback_limit = if sse_is_responses_prelude(&primed)
+                                || sse_has_partial_data_line(&primed)
+                            {
+                                STREAM_RESPONSES_PRELUDE_HOLDBACK_LIMIT
+                            } else {
+                                STREAM_PRIME_HOLDBACK_LIMIT
+                            };
+                            if primed.len() >= holdback_limit {
+                                // Nothing left worth protecting: hand it on and
+                                // let the observer judge how the stream ends.
+                                break None;
+                            }
                         }
-                        if let Some(failure) = detect_response_failed(&primed)
-                            .filter(is_definitive_quota_exhaustion_failure)
+                        if let Some(failure) = opening_failure
+                            .as_ref()
+                            .filter(|failure| is_definitive_quota_exhaustion_failure(failure))
                         {
                             break Some((format!("{}: {}", credential.display_name, failure.message), None));
                         }
@@ -1849,8 +1931,9 @@ pub(crate) async fn forward_request(
                                     | Some(ProtocolBridgeKind::ResponsesToChat)
                                     | Some(ProtocolBridgeKind::ClaudeToChat)
                             )
-                            && detect_response_failed(&primed)
-                                .is_some_and(|failure| is_missing_reasoning_failure(&failure))
+                            && opening_failure
+                                .as_ref()
+                                .is_some_and(|failure| is_missing_reasoning_failure(failure))
                         {
                             reasoning_forced = true;
                             let heal_pool = pool.clone();
@@ -1863,7 +1946,16 @@ pub(crate) async fn forward_request(
                                 .await;
                             });
                         }
-                        if !sse_payload_started(&primed) {
+                        // A partial `data:` line is not a frame yet. Keep
+                        // priming until the event is whole — including when a
+                        // complete `response.created` is followed by a split
+                        // `response.failed` — otherwise the client receives a
+                        // truncated SSE event and the attempt is committed just
+                        // before its refusal arrives.
+                        if !sse_payload_started(&primed)
+                            || !sse_has_complete_data_frame(&primed)
+                            || sse_has_partial_data_line(&primed)
+                        {
                             continue;
                         }
                         // A Chat upstream often opens with a content-less
@@ -1880,11 +1972,23 @@ pub(crate) async fn forward_request(
                         }
                         // A gateway that reports failure in a 200 body usually
                         // does it in the opening payload frame. Catch it here,
-                        // where failover still works.
-                        break detect_response_failed(&primed).map(|failure| {
+                        // where failover still works. Capacity / rate-limit
+                        // refusals must use the configured per-class interval:
+                        // a hundred retries on the fixed 500 ms stream delay
+                        // would hammer the very pool that is out of capacity.
+                        break opening_failure.map(|failure| {
+                            let class = class_for_failure(status, Some(&failure));
+                            let delay = if matches!(
+                                class,
+                                RouteFailureClass::Capacity | RouteFailureClass::RateLimit
+                            ) {
+                                None
+                            } else {
+                                Some(STREAM_DISCONNECT_RETRY_DELAY)
+                            };
                             (
                                 format!("{}: {}", credential.display_name, failure.message),
-                                Some(STREAM_DISCONNECT_RETRY_DELAY),
+                                delay,
                             )
                         });
                     }
@@ -4336,9 +4440,59 @@ struct StreamPump {
     pending_output: Option<axum::body::Bytes>,
     upstream_ended: bool,
     upstream_error: Option<String>,
+    /// 客户端可见字节的分帧器：只有整帧才能判定并扣住失败帧。
+    client_framer: SseFramer,
+    /// 已扣住的失败帧类别；`Some` 表示这一轮允许走「流内救回」续写。
+    salvage_class: Option<RouteFailureClass>,
+    /// 被扣住但还没确定能否救回的原始 SSE 块。救回成功就丢掉；救不回时
+    /// 必须原样补发给客户端，否则它只看到半截正文、连错误提示都没有。
+    held_failure_blocks: String,
+    /// 这次请求是否曾经救回过一轮。用于结账时把「上游失败过但已续完」判成成功。
+    salvaged: bool,
+    /// 账号是否开启流内救回。关闭时完全绕过帧过滤，字节原样透传。
+    salvage_enabled: bool,
 }
 
 impl StreamPump {
+    /// 扣住「上游侧瞬时失败」帧，其余客户端可见字节原样返回。
+    ///
+    /// 只有完整帧才参与判定：半帧留在 framer 里等下一个 chunk，避免把失败帧
+    /// 劈成两截发出去、破坏 SSE 帧边界。扣住后 `salvage_class` 被点亮，
+    /// `try_continue` 才知道这一轮的语义失败是可以救回的。
+    fn filter_client_blocks(&mut self, bytes: axum::body::Bytes) -> axum::body::Bytes {
+        if !self.salvage_enabled {
+            return bytes;
+        }
+        let status = StatusCode::from_u16(self.current_status).unwrap_or(StatusCode::OK);
+        let mut out = Vec::with_capacity(bytes.len());
+        for block in self.client_framer.push_blocks(bytes.as_ref()) {
+            if let Some(class) = salvageable_failure_class(status, block.as_bytes()) {
+                self.salvage_class = Some(class);
+                self.held_failure_blocks.push_str(&block);
+                continue;
+            }
+            out.extend_from_slice(block.as_bytes());
+        }
+        axum::body::Bytes::from(out)
+    }
+
+    /// 上游结束时把 framer 里残留的尾块按同样规则处理并接到收尾字节后面。
+    /// 不 flush 的话，一个不带空行的最后帧会永远留在缓冲区里。
+    fn finish_client_blocks(&mut self, output: &mut String) {
+        if !self.salvage_enabled {
+            return;
+        }
+        let status = StatusCode::from_u16(self.current_status).unwrap_or(StatusCode::OK);
+        if let Some(tail) = self.client_framer.finish_block() {
+            if let Some(class) = salvageable_failure_class(status, tail.as_bytes()) {
+                self.salvage_class = Some(class);
+                self.held_failure_blocks.push_str(&tail);
+            } else {
+                output.push_str(&tail);
+            }
+        }
+    }
+
     /// 已下发内容的流不重放；收到明确额度错误即标记实际账号，并停止继续读取上游。
     async fn record_observed_quota_failure(&mut self) {
         if self.quota_error_handled {
@@ -4436,6 +4590,9 @@ impl StreamPump {
             completion.observer.flush_pending_frame(self.continuing);
         }
         let clean = self.ended_with_terminal();
+        // 尾部半帧必须先于 transform 补出的收尾事件发出；它属于断流前的正文。
+        let mut client_tail = String::new();
+        self.finish_client_blocks(&mut client_tail);
         let mut output = String::new();
         match &mut self.stage {
             StreamStage::Primary(Some(transform)) => {
@@ -4460,7 +4617,7 @@ impl StreamPump {
             }
             _ => {}
         }
-        Ok(output)
+        Ok(format!("{client_tail}{output}"))
     }
 
     /// 断流时尝试把内层流换成一次续写请求的响应流。
@@ -4468,17 +4625,35 @@ impl StreamPump {
     /// 返回 `true` 表示新流已经接上（`stage` / `rounds` 一并更新），调用方应回到
     /// 循环顶部继续 poll；`false` 表示这轮不续写，按既有断流路径收尾。
     async fn try_continue(&mut self) -> bool {
-        if self.ended_with_terminal()
-            || self
-                .guard
-                .completion
-                .as_ref()
-                .is_some_and(|completion| completion.observer.has_semantic_failure())
+        if self.ended_with_terminal() {
+            return false;
+        }
+        // 原先任何语义失败都直接否决续写：额度、内容审核、上下文超长这类
+        // 对请求体的判决换号重发也没用。现在只有「被帧过滤器扣住、且归类为
+        // 上游侧瞬时失败」的那一轮才放行——`salvage_class` 就是这个凭据。
+        // 用 take 而不是复制：凭据只对当前这一轮有效，否则后续普通断流续写
+        // 也会误用容量类预算与间隔，甚至绕过语义失败这道门。
+        let salvage = self.salvage_class.take();
+        if self
+            .guard
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.observer.has_semantic_failure())
+            && salvage.is_none()
         {
             return false;
         }
         match &self.stage {
-            StreamStage::Primary(Some(transform)) if !transform.can_continue() => return false,
+            StreamStage::Primary(Some(transform)) if !transform.can_continue() => {
+                // 流内救回时，协议桥已经先看过那条失败帧，把自己标记成
+                // `failed`。但这一轮会丢掉原 transform、换成一个全新的
+                // `ResponsesResumeRewriter`（见下面建 ResumeStage 的分支），
+                // 旧桥不再处理任何后续字节，它的状态不该否决换流。
+                // 只有「跨轮沿用同一个 bridge 实例」的 Chat 桥还必须受约束。
+                if salvage.is_none() || transform.is_chat_bridge() {
+                    return false;
+                }
+            }
             StreamStage::Resume(resume) if !resume.rewriter.can_continue() => return false,
             _ => {}
         }
@@ -4495,6 +4670,7 @@ impl StreamPump {
             headers,
             current_id,
             failover_enabled,
+            policy,
         )) = ({
             let Some(completion) = self.guard.completion.as_ref() else {
                 return false;
@@ -4504,8 +4680,17 @@ impl StreamPump {
             // 否则两个账号的策略会互相引用，绕不出来。
             let policy =
                 RouteCredentialFailurePolicy::from_config_json(&completion.credential.config_json);
-            if !policy.stream_continue_enabled
-                || self.rounds >= policy.stream_continue_max
+            // 普通断流续写沿用原来的开关与轮次；流内救回是「容量类重试」在
+            // 已输出内容之后的延续，因此借同一个按类别预算和专用间隔。
+            let (allowed, max_rounds) = match salvage {
+                Some(class) => (policy.stream_salvage_enabled, policy.retry_limit_for(class)),
+                None => (policy.stream_continue_enabled, policy.stream_continue_max),
+            };
+            // 整次请求的总时长上限也要管住流内救回：允许 100 轮续写但用户
+            // 只想最多等 60 秒时，不能靠续写把这个封顶绕过去。
+            if !allowed
+                || self.rounds >= max_rounds
+                || policy.retry_elapsed_exceeded(completion.request_start.elapsed())
             {
                 return false;
             }
@@ -4526,11 +4711,18 @@ impl StreamPump {
                     completion.client_headers.clone(),
                     completion.credential.id.clone(),
                     policy.failover_enabled,
+                    policy,
                 )
             })
         }) else {
             return false;
         };
+
+        // 断流续写立刻重发是合理的；容量类救回必须按专用间隔等，否则一百轮
+        // 无间隔续写只会继续打那个已经满载的上游池。
+        if let Some(class) = salvage {
+            wait_for_class_retry(policy, class).await;
+        }
 
         let mut rejected = HashSet::new();
         let (credential, status, stream, resume_bridge, resume_custom_tools) = 'candidates: loop {
@@ -4765,6 +4957,19 @@ impl StreamPump {
         self.upstream_error = None;
         self.rounds += 1;
         self.continuing = true;
+        if salvage.is_some() {
+            // 失败帧确实被救回了一次：原轮那个「语义失败」不能再留着，否则
+            // 下一轮续写会被 `has_semantic_failure` 门挡住，结账也会把这次
+            // 已恢复的请求记成账号故障。续写流自己若再失败，
+            // `observe_continuation` 会重新点亮这两位。
+            if let Some(completion) = self.guard.completion.as_mut() {
+                completion.observer.clear_semantic_failure();
+            }
+            self.held_failure_blocks.clear();
+            self.salvaged = true;
+        }
+        // 上一条流的半帧不能拼到新流的第一个字节上。
+        self.client_framer = SseFramer::new();
         true
     }
 }
@@ -4907,6 +5112,10 @@ fn observed_upstream_stream(
         futures_util::stream::once(async move { Ok(first_chunk) }),
         rest,
     ));
+    let salvage_enabled = RouteCredentialFailurePolicy::from_config_json(
+        &completion.credential.config_json,
+    )
+    .stream_salvage_enabled;
     let pump = StreamPump {
         stream: replayed,
         current_credential: completion.credential.clone(),
@@ -4922,6 +5131,11 @@ fn observed_upstream_stream(
         pending_output: None,
         upstream_ended: false,
         upstream_error: None,
+        client_framer: SseFramer::new(),
+        salvage_class: None,
+        held_failure_blocks: String::new(),
+        salvaged: false,
+        salvage_enabled,
     };
     futures_util::stream::unfold(pump, |mut pump| async move {
         loop {
@@ -5003,7 +5217,15 @@ fn observed_upstream_stream(
                         }
                     }
                     match converted {
-                        Some(converted) => return Some((Ok(converted), pump)),
+                        Some(converted) => {
+                            let filtered = pump.filter_client_blocks(converted);
+                            if !filtered.is_empty() {
+                                return Some((Ok(filtered), pump));
+                            }
+                            // 整块都是被扣住的失败帧：observer 已经记下类别，
+                            // 但客户端不该看到它把这一轮判死。
+                            continue;
+                        }
                         // Still mid-record: nothing to forward yet.
                         None => continue,
                     }
@@ -5038,8 +5260,19 @@ fn observed_upstream_stream(
                     pump.done = true;
                     // 先在动 `stage` 之前把要读 completion 的判定做完，
                     // 免得同时借 `pump.stage` 与 `pump.guard`。
-                    let can_synthesize = pump.can_synthesize_primary();
                     let ended_cleanly = pump.ended_with_terminal();
+                    // 流内救回成功后，续写流的收尾事件已经补给了客户端，但
+                    // observer 的 `saw_terminal_marker` 只认原上游流的帧。不补
+                    // 这一位，结账仍会把已恢复的请求判成断流并惩罚账号。
+                    if pump.salvaged && ended_cleanly {
+                        if let Some(completion) = pump.guard.completion.as_mut() {
+                            completion.observer.mark_completed();
+                        }
+                    }
+                    // 扣住过失败帧却没能救回：不能合成一条 `response.completed`
+                    // 把错误盖掉，稍后要把原帧补发给客户端。
+                    let salvage_failed = !pump.held_failure_blocks.is_empty();
+                    let can_synthesize = pump.can_synthesize_primary() && !salvage_failed;
                     let usage = pump
                         .guard
                         .completion
@@ -5091,6 +5324,12 @@ fn observed_upstream_stream(
                             completion.finish().await;
                         }
                         return Some((Err(std::io::Error::other(error)), pump));
+                    }
+                    // 救回预算耗尽 / 续写条件不满足时，把扣住的失败帧原样还给
+                    // 客户端：正文已经发出去了，但至少要让调用方看到真实的失败
+                    // 事件，而不是一条莫名其妙截断的「成功」流。
+                    if !pump.held_failure_blocks.is_empty() {
+                        output.push_str(&std::mem::take(&mut pump.held_failure_blocks));
                     }
                     if can_synthesize {
                         // 内容已经完整、只缺收尾事件：补一条 response.completed，
@@ -10664,6 +10903,58 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve scripted sse");
+        });
+        (format!("http://{address}/v1"), calls)
+    }
+
+    /// Like `start_scripted_sse_upstream`, but each frame may be preceded by a
+    /// delay in milliseconds. This reproduces relays that announce
+    /// `response.created` and only report the refusal many seconds later —
+    /// exactly the shape that used to slip past the fixed 3s prelude grace.
+    async fn start_delayed_scripted_sse_upstream(
+        scripts: Vec<Vec<(&'static str, u64)>>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = Router::new().fallback(move || {
+            let scripts = scripts.clone();
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let frames = scripts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| scripts.last().cloned().unwrap_or_default());
+                let stream = futures_util::stream::unfold(
+                    (frames, 0usize),
+                    |(frames, index)| async move {
+                        let (frame, delay_ms) = *frames.get(index)?;
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                frame.as_bytes(),
+                            )),
+                            (frames, index + 1),
+                        ))
+                    },
+                );
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .expect("delayed scripted sse response")
+            }
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind delayed scripted sse upstream");
+        let address = listener.local_addr().expect("delayed scripted sse address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed scripted sse");
         });
         (format!("http://{address}/v1"), calls)
     }
@@ -21964,6 +22255,489 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Regression for the report that v0.1.2 "stopped after a single attempt":
+    /// a real relay announced `response.created` and only emitted the refusal
+    /// ~14s later. The old fixed 3s grace committed the 200 before the verdict
+    /// arrived, so the failure frame could only be forwarded.
+    #[tokio::test]
+    async fn late_in_stream_refusal_is_retried_past_the_old_prelude_grace() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        const FAILED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}}\n\n";
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        // 3.4s is deliberately just beyond the old hard-coded 3s grace.
+        let (upstream, calls) = start_delayed_scripted_sse_upstream(vec![
+            vec![(CREATED, 0), (FAILED, 3_400)],
+            vec![(HEALTHY, 0)],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "late-capacity",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "stream_prelude_wait_ms":8_000
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-late-capacity",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a refusal arriving after 3s must still be retried: {text}"
+        );
+        assert!(
+            !text.contains("response.failed") && !text.contains("token rate limit"),
+            "the client must get the retried stream, never the failure frame: {text}"
+        );
+    }
+
+    /// `response.created` echoes the whole request — a real turn's system
+    /// prompt plus tool schemas can exceed the 64 KB prime holdback cap with
+    /// that single frame. v0.1.2 committed it on the byte cap, so the refusal
+    /// in the very next frame could not be retried.
+    #[tokio::test]
+    async fn a_huge_response_created_echo_does_not_commit_before_the_refusal() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_1",
+                "status": "in_progress",
+                "output": [],
+                "error": null,
+                "instructions": "s".repeat(70 * 1024)
+            }
+        });
+        let created_frame: &'static str = Box::leak(
+            format!("event: response.created\ndata: {created}\n\n").into_boxed_str(),
+        );
+        assert!(created_frame.len() > STREAM_PRIME_HOLDBACK_LIMIT);
+        const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}}\n\n";
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        let (upstream, calls) =
+            start_scripted_sse_upstream(vec![vec![created_frame, FAILED], vec![HEALTHY]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "huge-echo",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "stream_prelude_wait_ms":8_000
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-huge-echo",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a 70KB opening echo must not end the retry window: {}",
+            &text[..text.len().min(400)]
+        );
+        assert!(!text.contains("response.failed"));
+    }
+
+    /// The same 70 KB echo delivered as several network chunks: each partial
+    /// `data:` line looks like payload but is not a complete frame. None of
+    /// them may commit the stream before the refusal arrives.
+    #[tokio::test]
+    async fn a_split_opening_echo_keeps_the_attempt_retriable() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        let created = json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_1",
+                "status": "in_progress",
+                "output": [],
+                "error": null,
+                "instructions": "s".repeat(70 * 1024)
+            }
+        });
+        let created_frame = format!("event: response.created\ndata: {created}\n\n");
+        assert!(created_frame.len() > STREAM_PRIME_HOLDBACK_LIMIT);
+        let mut frames: Vec<(&'static str, u64)> = Vec::new();
+        for piece in created_frame.as_bytes().chunks(9 * 1024) {
+            let owned: &'static str =
+                Box::leak(String::from_utf8_lossy(piece).into_owned().into_boxed_str());
+            frames.push((owned, 2));
+        }
+        const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"no_capacity\",\"message\":\"high demand\"}}}\n\n";
+        frames.push((FAILED, 2));
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        let (upstream, calls) = start_delayed_scripted_sse_upstream(vec![
+            frames,
+            vec![(HEALTHY, 0)],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "split-echo",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "stream_prelude_wait_ms":8_000
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-split-echo",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "split opening frames must not commit the stream: {}",
+            &text[..text.len().min(400)]
+        );
+    }
+
+    /// A complete `response.created` followed by a `response.failed` that is
+    /// itself split across chunks. The buffer already has one whole frame, so
+    /// "at least one complete data frame" is true; the unfinished trailing
+    /// line is what must keep the attempt inside the retry window.
+    #[tokio::test]
+    async fn a_split_failure_frame_after_a_whole_opening_echo_is_still_retried() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"no_capacity\",\"message\":\"high demand\"}}}\n\n";
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        // Split inside the JSON so the second chunk ends with a genuinely
+        // half-written `data:` line rather than a bare `event:` header.
+        let split_at = FAILED.find("\"code\"").expect("failure marker");
+        let first_half: &'static str = Box::leak(FAILED[..split_at].to_string().into_boxed_str());
+        let second_half: &'static str = Box::leak(FAILED[split_at..].to_string().into_boxed_str());
+        let (upstream, calls) = start_delayed_scripted_sse_upstream(vec![
+            vec![(CREATED, 0), (first_half, 2), (second_half, 2)],
+            vec![(HEALTHY, 0)],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "split-failure",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "stream_prelude_wait_ms":8_000
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-split-failure",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a split refusal must not commit the stream: {}",
+            &text[..text.len().min(400)]
+        );
+        assert!(!text.contains("response.failed"));
+    }
+
+    /// The user's exact error: a regional token rate limit that reuses the
+    /// generic `rate_limit_exceeded` code. It must draw from the Capacity
+    /// budget (2 here), not the RateLimit budget (explicitly 0).
+    #[tokio::test]
+    async fn regional_token_rate_limit_uses_the_capacity_retry_budget() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        const FAILED: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol for gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}\n\n";
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        let (upstream, calls) =
+            start_scripted_sse_upstream(vec![vec![CREATED, FAILED], vec![HEALTHY]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "regional-capacity",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "retry_class_limits":{"capacity":2,"rate_limit":0},
+                    "stream_prelude_wait_ms":8_000
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-regional-capacity",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a regional token rate limit must use the Capacity budget: {text}"
+        );
+    }
+
+    /// Turning the window off is a real escape hatch for upstreams that sit on
+    /// `response.created` while thinking: commit at once, no retry.
+    #[tokio::test]
+    async fn stream_prelude_wait_zero_commits_the_announcement_immediately() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"no_capacity\",\"message\":\"high demand\"}}}\n\n";
+        let (upstream, calls) = start_delayed_scripted_sse_upstream(vec![vec![
+            (CREATED, 0),
+            (FAILED, 200),
+        ]])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "no-holdback",
+            &upstream,
+            json!({
+                "interface_format":"openai-responses",
+                "failure_policy":{
+                    "retry_count":2,
+                    "retry_interval_ms":0,
+                    "stream_prelude_wait_ms":0
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-no-holdback",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hold-back disabled means the failure is past the retry window: {text}"
+        );
+        assert!(text.contains("response.failed"), "client sees the frame: {text}");
+    }
+
     fn b1_chat_body(model: &str) -> Value {
         json!({
             "model": model,
@@ -22430,5 +23204,339 @@ data: [DONE]\n\n";
         );
 
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    // ---------------------------------------------------------------------
+    // 流内救回：正文已经发给客户端后，上游才在 SSE 流里报「容量不足 / 区域级
+    // token rate limit / 限流」。字节不能重放，只能扣住失败帧并复用断流续写
+    // 管线把同一条 response 接完。
+    // ---------------------------------------------------------------------
+
+    /// 只有「换个通道/等一会儿就能成功」的失败才值得扣住；对请求体或账号
+    /// 的硬判决必须原样透传，否则续写只会反复烧同一个注定失败的请求。
+    #[test]
+    fn salvageable_failure_class_only_admits_recoverable_in_stream_refusals() {
+        let regional = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}}\n\n";
+        assert_eq!(
+            salvageable_failure_class(StatusCode::OK, regional),
+            Some(RouteFailureClass::Capacity),
+            "用户实测的「一次就停」样本必须走容量类预算"
+        );
+
+        let no_capacity = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"no_capacity\",\"message\":\"high demand\"}}\n\n";
+        assert_eq!(
+            salvageable_failure_class(StatusCode::OK, no_capacity),
+            Some(RouteFailureClass::Capacity)
+        );
+
+        let rate_limited = b"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_exceeded\",\"code\":\"too_many_requests\",\"message\":\"Too many requests, please retry later\"}}\n\n";
+        assert_eq!(
+            salvageable_failure_class(StatusCode::OK, rate_limited),
+            Some(RouteFailureClass::RateLimit)
+        );
+
+        let quota = b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"You exceeded your current quota, please check your plan and billing details.\"}}}\n\n";
+        assert_eq!(salvageable_failure_class(StatusCode::OK, quota), None);
+
+        let context = b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"maximum context length is 128000 tokens\"}}}\n\n";
+        assert_eq!(salvageable_failure_class(StatusCode::OK, context), None);
+
+        let content = b"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"code\":\"content_policy_violation\",\"message\":\"Your request was rejected by the content filter\"}}}\n\n";
+        assert_eq!(salvageable_failure_class(StatusCode::OK, content), None);
+
+        // 普通正文帧绝不能被误判成失败，否则每条 SSE 都会被扣住。
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"delta\":\"hello\"}\n\n";
+        assert_eq!(salvageable_failure_class(StatusCode::OK, delta), None);
+        assert_eq!(salvageable_failure_class(StatusCode::OK, b": keepalive\n\n"), None);
+    }
+
+    /// 帧过滤器只拿到原始 SSE 块：有些中继不给 `event:` 行，只发 `data:`。
+    #[test]
+    fn salvageable_failure_class_accepts_bare_data_blocks() {
+        let bare = b"data: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}}\n\n";
+        assert_eq!(
+            salvageable_failure_class(StatusCode::OK, bare),
+            Some(RouteFailureClass::Capacity),
+            "SseFramer 切出的块没有 event: 行，也必须能识别"
+        );
+    }
+
+    const SALVAGE_OPENING: &str = concat!(
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r1\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m1\",\"content_index\":0,\"delta\":\"前半句，\"}\n\n",
+    );
+    const SALVAGE_CAPACITY_FAILED: &str = "data: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"type\":\"too_many_requests\",\"code\":\"rate_limit_exceeded\",\"message\":\"Your requests to gpt-6.1-sol in eastus2 have exceeded token rate limit.\"}}}\n\n";
+    const SALVAGE_QUOTA_FAILED: &str = "data: {\"type\":\"response.failed\",\"sequence_number\":3,\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"You exceeded your current quota, please check your plan and billing details.\"}}}\n\n";
+    const SALVAGE_RESUME: &str = concat!(
+        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"r2\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"m2\",\"content_index\":0,\"delta\":\"后半句。\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"m2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"后半句。\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"r2\",\"status\":\"completed\"}}\n\n",
+    );
+
+    /// 起两个账号（聚合模式续写会换号）并跑一次真实的代理请求，返回客户端
+    /// 看到的字节与两个账号 id，供调用方断言换号与账号健康。
+    async fn run_salvage_request(
+        pool: &SqlitePool,
+        upstream: &str,
+        failure_policy: Value,
+        key_seed: &str,
+    ) -> (String, Vec<String>) {
+        let config = json!({
+            "interface_format": "openai-responses",
+            "failure_policy": failure_policy,
+        });
+        let first = create_proxy_api_credential_with_config(
+            pool,
+            "salvage-first",
+            upstream,
+            config.clone(),
+        )
+        .await;
+        let second =
+            create_proxy_api_credential_with_config(pool, "salvage-second", upstream, config).await;
+        RoutePoolRepository::replace_members(pool, "codex", &[first.clone(), second.clone()])
+            .await
+            .expect("pool members");
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            pool,
+            "codex",
+            &format!("sk-ai-switch-salvage-{key_seed}"),
+        )
+        .await
+        .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(
+                json!({
+                    "model": "gpt-6-astra",
+                    "stream": true,
+                    "input": [{"type":"message","role":"user",
+                               "content":[{"type":"input_text","text":"hi"}]}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        (String::from_utf8_lossy(&bytes).into_owned(), vec![first, second])
+    }
+
+    /// 客户端已经拿到半句正文后，上游才在流里报区域级 token rate limit：
+    /// 开启救回时失败帧被扣住，续写把同一条 response 接完。
+    #[tokio::test]
+    async fn an_in_stream_capacity_refusal_is_salvaged_by_continuation() {
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            vec![SALVAGE_OPENING, SALVAGE_CAPACITY_FAILED],
+            vec![SALVAGE_RESUME],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (body, ids) = run_salvage_request(
+            &pool,
+            &upstream,
+            json!({
+                "retry_count": 2,
+                "retry_interval_ms": 0,
+                "capacity_retry_interval_ms": 0,
+                "stream_salvage_enabled": true
+            }),
+            "capacity",
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "救回必须再打一次上游并把答案接回来: {body}"
+        );
+        assert!(body.contains("前半句，"), "已下发的正文不能重放/丢失: {body}");
+        assert!(body.contains("后半句。"), "续写的正文没接上: {body}");
+        assert!(
+            !body.contains("response.failed") && !body.contains("token rate limit"),
+            "客户端不该看到被扣住的失败帧: {body}"
+        );
+        assert!(body.contains("\"id\":\"r1\""), "必须沿用原 response id: {body}");
+        assert!(!body.contains("\"id\":\"r2\""), "续写流的 id 不能泄漏: {body}");
+        let events = responses_events(&body);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "response.created")
+                .count(),
+            1,
+            "客户端只应看到一条 created: {body}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "response.completed"),
+            "救回后必须补收尾事件，否则客户端按断流处理: {body}"
+        );
+        let mut total_failures = 0;
+        for id in &ids {
+            let credential = RouteCredentialRepository::get(&pool, id)
+                .await
+                .expect("credential");
+            total_failures += credential.transient_failure_count;
+        }
+        assert_eq!(
+            total_failures, 0,
+            "已经救回的请求不能再给账号记一次瞬时故障"
+        );
+    }
+
+    /// 开关默认关闭：字节必须原样透传，不能偷偷多打一次计费请求。
+    #[tokio::test]
+    async fn in_stream_salvage_is_off_by_default() {
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            vec![SALVAGE_OPENING, SALVAGE_CAPACITY_FAILED],
+            vec![SALVAGE_RESUME],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (body, _) = run_salvage_request(
+            &pool,
+            &upstream,
+            json!({ "retry_count": 2, "retry_interval_ms": 0 }),
+            "default-off",
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "默认关闭时不该发起续写请求: {body}"
+        );
+        assert!(
+            body.contains("response.failed") && body.contains("token rate limit"),
+            "默认关闭时失败帧必须原样透传: {body}"
+        );
+        assert!(body.contains("前半句，"), "已下发的正文不能丢: {body}");
+    }
+
+    /// 额度耗尽是对账号的硬判决：换号、等待、续写都修不好，必须原样透传。
+    #[tokio::test]
+    async fn a_hard_verdict_in_stream_is_never_salvaged() {
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            vec![SALVAGE_OPENING, SALVAGE_QUOTA_FAILED],
+            vec![SALVAGE_RESUME],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (body, _) = run_salvage_request(
+            &pool,
+            &upstream,
+            json!({
+                "retry_count": 2,
+                "retry_interval_ms": 0,
+                "stream_salvage_enabled": true
+            }),
+            "quota",
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "额度错误不该触发任何续写: {body}"
+        );
+        assert!(
+            body.contains("insufficient_quota"),
+            "硬判决必须照常透传给客户端: {body}"
+        );
+    }
+
+    /// 扣住了失败帧但预算耗尽：不能把错误盖掉，也不能补一条假的
+    /// `response.completed` 让客户端以为成功；原帧必须原样还给客户端。
+    #[tokio::test]
+    async fn salvage_without_budget_replays_the_failure_frame() {
+        let (upstream, calls) = start_scripted_sse_upstream(vec![
+            vec![SALVAGE_OPENING, SALVAGE_CAPACITY_FAILED],
+            vec![SALVAGE_RESUME],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (body, _) = run_salvage_request(
+            &pool,
+            &upstream,
+            json!({
+                "retry_count": 5,
+                "retry_interval_ms": 0,
+                "retry_class_limits": { "capacity": 0 },
+                "stream_salvage_enabled": true
+            }),
+            "no-budget",
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "容量类预算为 0 时不能再打上游: {body}"
+        );
+        assert!(
+            body.contains("response.failed") && body.contains("token rate limit"),
+            "救不回时失败帧必须补发，客户端不能只看到半截正文: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"response.completed\""),
+            "救不回时不能合成假的完成事件: {body}"
+        );
+    }
+
+    /// 「容量类 100 次 + 整次请求最多等 60 秒」这类组合里，时间封顶必须连
+    /// 流内救回一起管住，否则续写会绕过它一直打到次数用尽。
+    #[tokio::test]
+    async fn salvage_respects_the_total_retry_elapsed_ceiling() {
+        let (upstream, calls) = start_delayed_scripted_sse_upstream(vec![
+            vec![(SALVAGE_OPENING, 1_200), (SALVAGE_CAPACITY_FAILED, 0)],
+            vec![(SALVAGE_RESUME, 0)],
+        ])
+        .await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let (body, _) = run_salvage_request(
+            &pool,
+            &upstream,
+            json!({
+                "retry_count": 100,
+                "retry_interval_ms": 0,
+                "max_retry_elapsed_seconds": 1,
+                "stream_salvage_enabled": true
+            }),
+            "elapsed",
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "超过总时长上限后不该再发起续写: {body}"
+        );
+        assert!(
+            body.contains("response.failed"),
+            "救不回时被扣住的失败帧必须补发: {body}"
+        );
     }
 }

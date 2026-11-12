@@ -50,6 +50,17 @@ export type RouteCredentialFailurePolicy = {
   capacity_retry_interval_ms: number;
   /** 整次请求重试总时长上限（秒）；0 表示只按次数限制。 */
   max_retry_elapsed_seconds: number;
+  /**
+   * 流式响应开头只有零输出建流帧时，最多扣住多久等后续帧（毫秒）。
+   * 0 表示收到建流帧立即提交、不再等待失败帧。
+   */
+  stream_prelude_wait_ms: number;
+  /**
+   * 已经输出正文后，上游才在 SSE 流里报容量不足 / 限流 / 5xx 时，是否扣住
+   * 失败帧并复用续写管线把同一条响应接完。默认关闭；额度、内容审核、
+   * 上下文超长等硬判决永远不进入这条路径。
+   */
+  stream_salvage_enabled: boolean;
 };
 
 export type PlatformId =

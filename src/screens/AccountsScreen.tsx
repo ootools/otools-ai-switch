@@ -303,6 +303,12 @@ const MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX = 10;
 const MAX_ROUTE_CREDENTIAL_CLASS_RETRY_COUNT = 1_000;
 const MAX_ROUTE_CREDENTIAL_CAPACITY_RETRY_INTERVAL_MS = 60_000;
 const MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS = 86_400;
+// A refusal can arrive many seconds after `response.created` (a real regional
+// token-rate-limit verdict took ~14s). The window must be longer than that, and
+// user-tunable: some upstreams legitimately sit on the opening frame while
+// thinking, in which case 0 restores the old "commit immediately" behaviour.
+const DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS = 60_000;
+const MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS = 600_000;
 const EMPTY_RETRY_CLASS_LIMITS: RouteRetryClassLimits = {
   transport: null,
   server_error: null,
@@ -334,7 +340,7 @@ const RETRY_CLASS_ROWS: Array<{
     key: "capacity",
     label: "容量不足 / 高负载",
     description:
-      "no_capacity、high demand、服务器过载类提示；包括 HTTP 200 流里先 response.created 再 response.failed",
+      "no_capacity、high demand、服务器过载、区域级 token rate limit（rate_limit_exceeded）；含 HTTP 200 流里先 response.created 再 response.failed",
   },
   {
     key: "semantic",
@@ -423,6 +429,8 @@ const defaultRouteCredentialFailurePolicy: RouteCredentialFailurePolicy = {
   retry_class_limits: EMPTY_RETRY_CLASS_LIMITS,
   capacity_retry_interval_ms: 0,
   max_retry_elapsed_seconds: 0,
+  stream_prelude_wait_ms: DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS,
+  stream_salvage_enabled: false,
 };
 
 const createTabs: Array<FormTab<CreateTab>> = [
@@ -1348,7 +1356,8 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
       | "retry_interval_ms"
       | "semantic_error_threshold"
       | "cooldown_seconds"
-      | "stream_continue_max",
+      | "stream_continue_max"
+      | "stream_prelude_wait_ms",
   ) => {
     const value = record[key];
     return typeof value === "number" && Number.isInteger(value)
@@ -1356,7 +1365,12 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
       : defaultRouteCredentialFailurePolicy[key];
   };
   const booleanOrDefault = (
-    key: "cooldown_enabled" | "error_status_enabled" | "stream_continue_enabled" | "failover_enabled",
+    key:
+      | "cooldown_enabled"
+      | "error_status_enabled"
+      | "stream_continue_enabled"
+      | "failover_enabled"
+      | "stream_salvage_enabled",
   ) => {
     const value = record[key];
     return typeof value === "boolean" ? value : defaultRouteCredentialFailurePolicy[key];
@@ -1379,6 +1393,7 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
   }
   const capacityInterval = record.capacity_retry_interval_ms;
   const elapsedLimit = record.max_retry_elapsed_seconds;
+  const preludeWait = record.stream_prelude_wait_ms;
   return {
     retry_count: integerOrDefault("retry_count"),
     retry_interval_ms: integerOrDefault("retry_interval_ms"),
@@ -1404,6 +1419,14 @@ function failurePolicyFromConfig(config: Record<string, unknown>): RouteCredenti
       elapsedLimit <= MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS
         ? elapsedLimit
         : 0,
+    stream_prelude_wait_ms:
+      typeof preludeWait === "number" &&
+      Number.isInteger(preludeWait) &&
+      preludeWait >= 0 &&
+      preludeWait <= MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS
+        ? preludeWait
+        : DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS,
+    stream_salvage_enabled: booleanOrDefault("stream_salvage_enabled"),
   };
 }
 
@@ -3670,6 +3693,10 @@ export function AccountsScreen({
   );
   const [editCapacityRetryIntervalMs, setEditCapacityRetryIntervalMs] = useState("0");
   const [editMaxRetryElapsedSeconds, setEditMaxRetryElapsedSeconds] = useState("0");
+  const [editStreamPreludeWaitMs, setEditStreamPreludeWaitMs] = useState(
+    String(DEFAULT_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS),
+  );
+  const [editStreamSalvageEnabled, setEditStreamSalvageEnabled] = useState(false);
   const [editFailurePolicyError, setEditFailurePolicyError] = useState<string | null>(null);
   const [editRecoveryMode, setEditRecoveryMode] = useState<RecoveryMode>("off");
   const [editRecoveryTimes, setEditRecoveryTimes] = useState<string[]>([]);
@@ -4363,6 +4390,8 @@ export function AccountsScreen({
     setEditClassRetryLimits(retryClassLimitInputs(failurePolicy.retry_class_limits));
     setEditCapacityRetryIntervalMs(String(failurePolicy.capacity_retry_interval_ms));
     setEditMaxRetryElapsedSeconds(String(failurePolicy.max_retry_elapsed_seconds));
+    setEditStreamPreludeWaitMs(String(failurePolicy.stream_prelude_wait_ms));
+    setEditStreamSalvageEnabled(failurePolicy.stream_salvage_enabled);
     setEditFailurePolicyError(null);
     setEditSecretJson(parseJsonPreview(editingCredential.secret_payload_json, editingCredential.secret_payload_json));
     setEditConfigJson(parseJsonPreview(editingCredential.config_json, editingCredential.config_json));
@@ -5393,6 +5422,7 @@ export function AccountsScreen({
       const streamContinueMax = Number(editStreamContinueMax);
       const capacityRetryIntervalMs = Number(editCapacityRetryIntervalMs);
       const maxRetryElapsedSeconds = Number(editMaxRetryElapsedSeconds);
+      const streamPreludeWaitMs = Number(editStreamPreludeWaitMs);
       let failurePolicyError: string | null = null;
       if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 10) {
         failurePolicyError = "额外重试次数必须是 0-10 的整数";
@@ -5432,6 +5462,12 @@ export function AccountsScreen({
         maxRetryElapsedSeconds > MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS
       ) {
         failurePolicyError = `重试总时长上限必须是 0-${MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS} 秒的整数`;
+      } else if (
+        !Number.isInteger(streamPreludeWaitMs) ||
+        streamPreludeWaitMs < 0 ||
+        streamPreludeWaitMs > MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS
+      ) {
+        failurePolicyError = `建流等待窗口必须是 0-${MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS} 毫秒的整数`;
       }
       const retryClassLimits: RouteRetryClassLimits = { ...EMPTY_RETRY_CLASS_LIMITS };
       if (!failurePolicyError) {
@@ -5470,6 +5506,8 @@ export function AccountsScreen({
         retry_class_limits: retryClassLimits,
         capacity_retry_interval_ms: capacityRetryIntervalMs,
         max_retry_elapsed_seconds: maxRetryElapsedSeconds,
+        stream_prelude_wait_ms: streamPreludeWaitMs,
+        stream_salvage_enabled: editStreamSalvageEnabled,
       };
       setEditFailurePolicyError(null);
       setEditModelMappingsError(null);
@@ -10064,7 +10102,7 @@ export function AccountsScreen({
                       ))}
                     </div>
                     <p className="mt-2.5 text-[11px] leading-5 text-stone-600">
-                      「容量不足 / 高负载」包括 no_capacity、high demand、服务器过载类提示，以及 HTTP 200 流里先 response.created 再 response.failed 的情况。这类失败是上游暂时没余量，不是账号坏了，所以给再多次重试也不会让账号进入冷却或异常状态。容量类间隔填 0 表示沿用「① 通用重试」的间隔；要等 100 次时建议单独调大，别用 200 毫秒连续打爆上游。注意：开启「④ 失败后切换到池内其它账号」时，换号后次数会从 0 重新算，想给整次请求封顶请同时设置「重试总时长上限（秒）」。
+                      「容量不足 / 高负载」包括 no_capacity、high demand、服务器过载类提示，以及区域级吞吐限流（code 是 rate_limit_exceeded 但消息写的是「exceeded token rate limit」这类上游区域/部署的 token 预算，不是账号配额），也覆盖 HTTP 200 流里先 response.created 再 response.failed 的情况。这类失败是上游暂时没余量，不是账号坏了，所以给再多次重试也不会让账号进入冷却或异常状态。容量类间隔填 0 表示沿用「① 通用重试」的间隔；要等 100 次时建议单独调大，别用 200 毫秒连续打爆上游。注意：开启「④ 失败后切换到池内其它账号」时，换号后次数会从 0 重新算，想给整次请求封顶请同时设置「重试总时长上限（秒）」。容量与限流类失败会按本类间隔等待，不再套用流式断流的固定 500 毫秒。
                     </p>
                   </section>
 
@@ -10153,10 +10191,52 @@ export function AccountsScreen({
                       ④ 流式断流与账号切换
                     </p>
                     <p className="mt-0.5 text-[11px] text-stone-500">
-                      上游已经吐出内容却没发出收尾标记时出现（客户端看到 stream disconnected before
-                      completion）。
+                      分三个阶段：响应开头只有建流帧、失败帧迟到时的等待窗口；正文已经发出但上游在流内报错时是否救回；以及上游吐出内容却没发收尾标记时的断流续写。
+                    </p>
+                    <label className={`${labelClass} mt-2.5`}>
+                      建流等待窗口（毫秒）
+                      <input
+                        aria-label="建流等待窗口（毫秒）"
+                        className={fieldClass}
+                        max={MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS}
+                        min={0}
+                        onChange={(event) => {
+                          setEditStreamPreludeWaitMs(event.target.value);
+                          setEditFailurePolicyError(null);
+                        }}
+                        step={1000}
+                        type="number"
+                        value={editStreamPreludeWaitMs}
+                      />
+                    </label>
+                    <p className="text-[11px] leading-5 text-stone-600">
+                      Responses 上游常先发 <code>response.created</code>（没有任何输出），隔十几秒才发{" "}
+                      <code>error</code> / <code>response.failed</code>。在这段窗口内网关会扣住建流帧，
+                      等到真正的输出或失败帧：失败帧仍在窗口内就能自动重试，超过窗口才把 200 提交给客户端、失败帧只能透传。
+                      默认 60000（60 秒），覆盖已观测到的 14 秒迟到拒绝；最大 600000。填 0
+                      表示收到建流帧立刻提交，适合上游确实会长时间停在 <code>response.created</code> 上思考的情况——代价是迟到的失败不会再重试。
+                      窗口从第一条建流帧开始计时，不受上游持续发心跳帧影响。
                     </p>
                     <div className="mt-2.5 grid gap-2">
+                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
+                        <input
+                          aria-label="流内失败时自动救回"
+                          checked={editStreamSalvageEnabled}
+                          className="mt-0.5"
+                          onChange={(event) => {
+                            setEditStreamSalvageEnabled(event.target.checked);
+                            setEditFailurePolicyError(null);
+                          }}
+                          type="checkbox"
+                        />
+                        <span>
+                          <span className="font-semibold">流内失败时自动救回</span>
+                          <span className="block text-[11px] text-stone-600">
+                            正文已经发给客户端后，上游才在 SSE 流里报「容量不足 / 区域级 token rate
+                            limit / 限流 / 5xx」时，网关扣住这条失败帧，用「原会话 + 已写出的半截回答」再问一次，把答案接回同一条响应，客户端看不到中断。重试次数取第 ② 组里该错误类别的上限，间隔也走该类别的专用间隔。默认关闭：每轮救回都是一次完整计费请求。额度耗尽、内容审核、上下文超长、图片过多、权限不足这类硬判决永不救回，照常把错误透传给客户端。仅对 Responses 协议生效。
+                          </span>
+                        </span>
+                      </label>
                       <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
                         <input
                           aria-label="断流后自动续写"
@@ -10219,7 +10299,7 @@ export function AccountsScreen({
                     <div className="mt-2 grid gap-2 text-[11px] leading-5 text-stone-600">
                       <p>
                         <span className="font-semibold text-emerald-700">会自动重试：</span>
-                        网络连接失败、请求超时、响应读取失败、HTTP 408 / 429 / 5xx，以及 Codex“服务器当前过载”。“容量不足 / 高负载”单独归为第 ② 类，可按自己的次数上限一直重试，直到次数或总时长用尽。
+                        网络连接失败、请求超时、响应读取失败、HTTP 408 / 429 / 5xx，以及 Codex“服务器当前过载”。“容量不足 / 高负载”单独归为第 ② 类，可按自己的次数上限一直重试，直到次数或总时长用尽。HTTP 200 流内的 response.failed：输出尚未发出且在「④ 建流等待窗口」内 → 直接回滚重试；正文已发出且开启「流内失败时自动救回」→ 扣住失败帧并续写接完；两者都不满足 → 只能透传。
                       </p>
                       <p>
                         <span className="font-semibold text-amber-700">会累计为异常：</span>

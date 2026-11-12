@@ -1,6 +1,6 @@
 [package]
 name = "otools-ai-switch-native"
-version = "0.1.2"
+version = "0.1.3"
 description = "AI Switch business core for the OTools native plugin ABI"
 authors = ["xyito"]
 edition = "2021"
