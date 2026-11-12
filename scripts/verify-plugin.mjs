@@ -11,7 +11,9 @@ try {
   const manifest = JSON.parse(manifestBytes);
   validateManifest(manifest);
   if (manifest.devUrl || manifest.quickDev || manifest.native.autoReload) throw new Error('Development settings in production package');
-  const filename = `${manifest.packid}-${manifest.version}.oplg`;
+  const suffix = option('suffix', '');
+  if (suffix && !/^[a-z0-9][a-z0-9-]*$/.test(suffix)) throw new Error('Invalid platform suffix');
+  const filename = `${manifest.packid}-${manifest.version}${suffix ? `-${suffix}` : ''}.oplg`;
   const requiredSums = new Set([filename, 'plugin.json', 'logo.svg']);
   for (const line of fs.readFileSync(path.join(directory, 'SHA256SUMS'), 'utf8').trim().split(/\r?\n/)) {
     const match = /^([a-f0-9]{64})  (.+)$/.exec(line);
@@ -24,6 +26,10 @@ try {
   if (!entries.get('plugin.json')?.equals(manifestBytes)) throw new Error('Packaged manifest mismatch');
   if (!entries.get('logo.svg')?.equals(fs.readFileSync(path.join(directory, 'logo.svg')))) throw new Error('Packaged icon mismatch');
   const libraries = validateEntries(manifest, entries);
+  const expectedLibrary = option('expect-library', '');
+  if (expectedLibrary && (libraries.length !== 1 || libraries[0] !== expectedLibrary)) {
+    throw new Error(`Expected only ${expectedLibrary}, found ${libraries.join(', ') || 'none'}`);
+  }
   for (const name of entries.keys()) {
     if (!/^(plugin\.json|logo\.svg|LICENSE|THIRD_PARTY_NOTICES\.md|UPSTREAM\.md|dist\/.*|lib\/.*|LICENSES\/.*|resources\/.*)$/.test(name)) {
       throw new Error(`Unexpected packaged file: ${name}`);

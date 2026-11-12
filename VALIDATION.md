@@ -11,7 +11,8 @@ Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 an
 - AI listener default port moved from `10888` to `29527`; the port is not persisted in the database, so changing the native default is sufficient. Smoke, autostart and endpoint fixtures were migrated accordingly. Clients configured with the old address must be updated manually.
 - Final rebuilt release DLL: **7 FFI / listener checks** (`smoke-native.py`), **3 background startup tests** (`test_autostart.py`) and **2 Nano Banana native integration tests** (`test_nano_banana.py`) passed with isolated storage and local mock upstreams.
 - Release package: `dist-pack/release-0.1.2/otools-ai-switch-0.1.2.oplg`; verified 12 entries, CRC/SHA256/relative assets/native exports/panel manifest. SHA256: `4397b693ace167feab8eb438e8056eec1e095184989e10d6766d510c2b757bc0`.
-- Platform scope is Windows x64. macOS/Linux packages, real account OAuth, paid generation and actual OTools desktop/CLI restart acceptance were not exercised. Older release sections below record earlier versions.
+- Platform packages: CI builds one native library per matrix job and verifies with `--expect-library` that each `<packid>-<version>-<platform>.oplg` contains exactly that single library; a deliberately wrong expectation was confirmed to be rejected locally. POSIX hosts needed `SO_REUSEADDR` in the autostart port-conflict test because earlier probes leave 29527 in `TIME_WAIT`.
+- Platform scope of the locally built package is Windows x64; Linux x64 and macOS ARM64 packages come from the CI matrix. Real account OAuth, paid generation and actual OTools desktop/CLI restart acceptance were not exercised. Older release sections below record earlier versions.
 
 ## v0.1.1 release verification
 

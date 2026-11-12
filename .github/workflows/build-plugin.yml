@@ -18,12 +18,15 @@ jobs:
           - os: windows-latest
             artifact: windows-x64
             library: Windows.dll
+            platform: windows
           - os: ubuntu-latest
             artifact: linux-x64
             library: Linux.so
+            platform: linux
           - os: macos-14
             artifact: macos-arm64
             library: macOS.dylib
+            platform: macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -53,8 +56,10 @@ jobs:
       - run: python -I scripts/test_nano_banana.py
         env:
           OTOOLS_AI_SWITCH_TEST_LIBRARY: lib/${{ matrix.library }}
-      - run: node scripts/pack-plugin.mjs
-      - run: node scripts/verify-plugin.mjs
+      # Each matrix job builds exactly one native library. Name the package by
+      # platform and assert that no other platform's library leaked into it.
+      - run: node scripts/pack-plugin.mjs --suffix ${{ matrix.platform }}
+      - run: node scripts/verify-plugin.mjs --suffix ${{ matrix.platform }} --expect-library lib/${{ matrix.library }}
       - uses: actions/upload-artifact@v4
         with:
           name: otools-ai-switch-${{ matrix.artifact }}

@@ -4,6 +4,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -91,7 +92,20 @@ class PluginAutostartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="otools-ai-switch-autostart-") as directory, socket.socket() as port:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 port.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            port.bind(("127.0.0.1", 29527))
+            else:
+                # Earlier host processes probe the listener with connect() before
+                # shutting down, which leaves the port in TIME_WAIT on POSIX.
+                # SO_REUSEADDR lets us bind that state; a live LISTEN socket from
+                # a leaked host still blocks the bind, which is what this test needs.
+                port.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            for _ in range(50):
+                try:
+                    port.bind(("127.0.0.1", 29527))
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                self.fail("port 29527 is still held by a previous test host")
             port.listen(1)
             state = self.run_host(directory)
             self.assertTrue(state["results"], "No native autostart task is configured")

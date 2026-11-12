@@ -21,7 +21,9 @@ try {
     for (const relative of walk(full)) entries.set(`${directory}/${relative}`, fs.readFileSync(path.join(full, relative)));
   }
   const libraries = validateEntries(manifest, entries);
-  const filename = `${manifest.packid}-${manifest.version}.oplg`;
+  const suffix = option('suffix', '');
+  if (suffix && !/^[a-z0-9][a-z0-9-]*$/.test(suffix)) throw new Error('Invalid platform suffix');
+  const filename = `${manifest.packid}-${manifest.version}${suffix ? `-${suffix}` : ''}.oplg`;
   const output = path.resolve(root, option('out', 'dist-pack'));
   fs.mkdirSync(output, { recursive: true });
   fs.writeFileSync(path.join(output, filename), writeZip([...entries].map(([name, data]) => ({ name, data }))));
