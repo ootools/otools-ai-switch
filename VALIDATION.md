@@ -2,6 +2,17 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
+## v0.1.2 release verification
+
+- Package, frontend and native version are aligned at `0.1.2`.
+- Frontend: **75 files, 861 tests passed** (`pnpm test:run --maxWorkers=4 --minWorkers=1`), typecheck and production build passed; packaging unit tests **5 passed**.
+- Native: **1955 unit tests passed**, 6 intentionally ignored (`cargo test --lib -- --test-threads=1`). The Windows release DLL was rebuilt because the Rust retry logic changed.
+- New regression coverage: `response.created → response.failed` retried before any client output; a `capacity` class configured for 100 retries while the global count is zero; an unrelated semantic failure unaffected by the capacity override; capacity exhaustion does not increment `transient_failure_count` or cool the account; failure-class word list does not misclassify context-length, quota or storage errors as capacity.
+- AI listener default port moved from `10888` to `29527`; the port is not persisted in the database, so changing the native default is sufficient. Smoke, autostart and endpoint fixtures were migrated accordingly. Clients configured with the old address must be updated manually.
+- Final rebuilt release DLL: **7 FFI / listener checks** (`smoke-native.py`), **3 background startup tests** (`test_autostart.py`) and **2 Nano Banana native integration tests** (`test_nano_banana.py`) passed with isolated storage and local mock upstreams.
+- Release package: `dist-pack/release-0.1.2/otools-ai-switch-0.1.2.oplg`; verified 12 entries, CRC/SHA256/relative assets/native exports/panel manifest. SHA256: `4397b693ace167feab8eb438e8056eec1e095184989e10d6766d510c2b757bc0`.
+- Platform scope is Windows x64. macOS/Linux packages, real account OAuth, paid generation and actual OTools desktop/CLI restart acceptance were not exercised. Older release sections below record earlier versions.
+
 ## v0.1.1 release verification
 
 - Package, frontend and native version are aligned at `0.1.1`.
@@ -30,7 +41,7 @@ Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 an
 
 - Settings/database isolation, command boundaries, event polling and FFI response/free.
 - Exact selected export path without silently changing the overwrite target.
-- Fixed port 10888 and visible port-conflict failure.
+- Fixed port 29527 and visible port-conflict failure.
 - Missing/invalid local API keys rejected; platform-header bypass rejected.
 - Codex login token plus explicit local key supported; invalid explicit key never falls back to another identity.
 - Browser CORS preflight accepted while management/static/unrelated upstream API paths are rejected.
@@ -73,7 +84,7 @@ This is not an actual OTools desktop installation or remote-host acceptance run.
 - Latest full frontend regression: **74 files, 839 tests passed**, no failures. Log: `artifacts/pool-media-full-tests-final.log`.
 - TypeScript and production build passed. Log: `artifacts/pool-media-build.log`.
 - The latest real release-library smoke passed account access, port conflicts, start/stop, JSON/SSE forwarding and shutdown. Log: `artifacts/pool-media-native-smoke.log`. No native implementation changes were needed for this update.
-- Added native error summaries with code/details and retry for account reads and AI-service start/stop. The original user-reported installed-host failure was **not reproduced** in this environment; the current test facade and release DLL read accounts and start 10888 successfully. Simulation tests explicitly inject failures to verify UI recovery and do not count as reproducing that original failure.
+- Added native error summaries with code/details and retry for account reads and AI-service start/stop. The original user-reported installed-host failure was **not reproduced** in this environment; the current test facade and release DLL read accounts and start 29527 successfully. Simulation tests explicitly inject failures to verify UI recovery and do not count as reproducing that original failure.
 - Image/video/audio endpoints and the shared masked key render inside one account-workspace shell. Text curl/config-write/generation-test controls and baseline settings are absent from non-general views. General baseline settings live inside the full-width compute-pool strip. Vector inference remains unavailable and no embeddings endpoint is advertised.
 - Rendered image-page geometry at a 1200×700 test viewport: workspace height 700; toolbar 60; access panel approximately 129; list scroll region approximately 479; footer 32 fixed at y=668. The pool strip spans the full content line within its 12px side padding. Image Studio navigation is absent from the image TAB; the separate system Image Studio remains available.
 - `dist-pack/pool-media-update/otools-ai-switch-0.1.0.oplg` verified: 12 entries, CRC/SHA256/relative assets/native library valid, original upstream logo, no custom panel size, and the `start_route_proxy` autostart task included. This local update was not committed, pushed or republished over the existing release.
@@ -82,7 +93,7 @@ This is not an actual OTools desktop installation or remote-host acceptance run.
 
 The plugin declares the desktop host's native startup task in `plugin.json`: `autostart.enabled=true`, `once=true`, command `start_route_proxy`. `once` is the host's per-main-window session deduplication, not a once-ever installation marker. Opening the plugin Panel is not part of this path.
 
-`python -I scripts/test_autostart.py` passed three real-DLL tests with separate temporary-data processes: cold startup before any page, startup again after a process restart, repeated-task idempotency, and a clear failed result when 10888 is occupied. This simulates the native requests made by the desktop host runner; it does not claim an actual user's OTools process was restarted. The test is wired into the build workflow.
+`python -I scripts/test_autostart.py` passed three real-DLL tests with separate temporary-data processes: cold startup before any page, startup again after a process restart, repeated-task idempotency, and a clear failed result when 29527 is occupied. This simulates the native requests made by the desktop host runner; it does not claim an actual user's OTools process was restarted. The test is wired into the build workflow.
 
 The CLI host currently lacks the desktop Tools startup-task runner; CLI autonomous startup was not added or verified. Installing/updating a plugin in a currently running desktop host refreshes the plugin list but does not rerun startup tasks until host restart; the page start switch remains available for immediate startup.
 

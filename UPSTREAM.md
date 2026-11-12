@@ -11,6 +11,6 @@ Source files were copied from the user's local checkouts. Frontend build configu
 
 Local SDK compatibility patches are limited to remote file dialogs and panel lifecycle cleanup. Remote file selection uses the SDK host file tree rather than a native dialog on the server; panel close releases page subscriptions while preserving the AI service. These patches are kept inside the SDK boundary so business components retain the same APIs in both host runtimes.
 
-Changes replace the application shell and desktop/web transport with the OTools SDK and native plugin ABI. The plugin excludes Vibe terminals, Tailscale, standalone management Web service, the original plugin runtime and SaaS site/operations. AI model protocol serving remains in the native backend with default port 10888. Storage is isolated from the original app.
+Changes replace the application shell and desktop/web transport with the OTools SDK and native plugin ABI. The plugin excludes Vibe terminals, Tailscale, standalone management Web service, the original plugin runtime and SaaS site/operations. AI model protocol serving remains in the native backend with default port 29527. Storage is isolated from the original app.
 
 AI Switch and the SDK are MIT licensed; see `LICENSE` and `LICENSES/otools-plugin-sdk-MIT.txt`. The upstream MCP/Skills portions retain Apache-2.0 notices; see `THIRD_PARTY_NOTICES.md` and `LICENSES/Apache-2.0.txt`.

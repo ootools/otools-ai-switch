@@ -1,6 +1,6 @@
 # AI Switch for OTools
 
-AI Switch 的独立 OTools 插件版本，默认以 Panel 打开。窗口尺寸沿用 OTools 的默认或记忆尺寸，插件不设置 `panelWidth` / `panelHeight`。Logo 使用原版 AI Switch 设计。管理界面通过 OTools SDK 使用宿主的桌面或远程 Web 通道；本地 AI 协议接口默认地址为 `http://127.0.0.1:10888`。
+AI Switch 的独立 OTools 插件版本，默认以 Panel 打开。窗口尺寸沿用 OTools 的默认或记忆尺寸，插件不设置 `panelWidth` / `panelHeight`。Logo 使用原版 AI Switch 设计。管理界面通过 OTools SDK 使用宿主的桌面或远程 Web 通道；本地 AI 协议接口默认地址为 `http://127.0.0.1:29527`。
 
 通用 TAB 的账号来源筛选会根据当前可用宽度，将放不下的 provider 收到“更多”下拉；窗口变宽后恢复行内显示，并保持已选来源。
 
@@ -42,7 +42,7 @@ node scripts/verify-plugin.mjs
 
 Native 默认构建 release 库并复制到 `lib/Windows.dll`、`lib/macOS.dylib` 或 `lib/Linux.so`。交叉编译可传 `--target <Rust target>`，需要自行安装对应工具链。烟测默认加载 Windows 库；其他平台通过 `--library lib/Linux.so` 等指定。
 
-`dist-pack/otools-ai-switch-0.1.1.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
+`dist-pack/otools-ai-switch-0.1.2.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
 
 `.github/workflows/build-plugin.yml` 提供 Windows x64、Linux x64、macOS ARM64 的分别构建和制品校验配置，不自动发布。每份包只适用于其包含的 native 平台和 CPU 架构。CI 配置存在不代表这些平台已在当前工作区验证。
 
@@ -52,9 +52,9 @@ Native 默认构建 release 库并复制到 `lib/Windows.dll`、`lib/macOS.dylib
 
 1. 在 OTools 插件管理中选择本地安装，导入 `.oplg`。
 2. 搜索 AI Switch 打开管理 Panel，添加或导入账号。
-3. 在账号池开启路由服务，按需使用账号池工具栏写入客户端配置。AI 默认地址为 `http://127.0.0.1:10888`。
+3. 在账号池开启路由服务，按需使用账号池工具栏写入客户端配置。AI 默认地址为 `http://127.0.0.1:29527`。
 
-10888 被占用时会明确报错，不自动切换到另一个端口。AI 接口需要本地 API Key；管理命令不会暴露在 10888。OTools 远程 Web 运行需要远端宿主安装匹配平台的 native 库。
+29527 被占用时会明确报错，不自动切换到另一个端口。AI 接口需要本地 API Key；管理命令不会暴露在 29527。OTools 远程 Web 运行需要远端宿主安装匹配平台的 native 库。
 
 ## 来源和许可
 
