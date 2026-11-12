@@ -7,7 +7,7 @@ use crate::error::{ApiError, AppError};
 use crate::models::platform::{ApiDialect, CapabilityRule, PlatformId, PlatformOperation};
 use crate::models::route_credential::{
     normalize_anthropic_api_key_field, ModelMapping, RouteCredentialFailurePolicy,
-    ANTHROPIC_API_KEY_FIELD, ANTHROPIC_AUTH_TOKEN_FIELD, CLAUDE_ONE_M_SUFFIX,
+    RouteFailureClass, ANTHROPIC_API_KEY_FIELD, ANTHROPIC_AUTH_TOKEN_FIELD, CLAUDE_ONE_M_SUFFIX,
 };
 use crate::models::route_credential_model::{
     FailureScope, RouteCredentialModelState, MODEL_STATUS_OK,
@@ -31,12 +31,14 @@ use crate::services::request_compression;
 use crate::services::request_content_rejection;
 use crate::services::request_image_limit;
 use crate::services::response_failure_service::{
-    detect_response_failed, is_content_rejection, is_context_length_failure,
-    is_cross_resource_item_failure, is_definitive_quota_exhaustion_failure,
-    is_encrypted_content_failure, is_insufficient_permissions_failure,
-    is_missing_reasoning_failure, is_quota_exhaustion_failure, is_text_only_chat_content_failure,
-    is_thinking_signature_failure, is_too_many_images_failure,
-    stream_disconnected_before_completion, STREAM_DISCONNECTED_FAILURE_MESSAGE,
+    detect_response_failed, is_capacity_response_failure, is_content_rejection,
+    is_context_length_failure, is_cross_resource_item_failure,
+    is_definitive_quota_exhaustion_failure, is_encrypted_content_failure,
+    is_insufficient_permissions_failure, is_missing_reasoning_failure,
+    is_quota_exhaustion_failure, is_rate_limit_response_failure,
+    is_text_only_chat_content_failure, is_thinking_signature_failure,
+    is_too_many_images_failure, stream_disconnected_before_completion, SemanticResponseFailure,
+    STREAM_DISCONNECTED_FAILURE_MESSAGE,
 };
 use crate::services::responses_encrypted_content::{
     sanitize_reasoning_from_bytes, sanitize_replayed_reasoning_from_bytes, ReasoningCleanupMode,
@@ -71,7 +73,7 @@ use crate::services::route_proxy_live_log::{
     LIVE_LOG_ELISION_MARKER, LIVE_LOG_RAW_PREVIEW_LIMIT, LIVE_LOG_STAGE_LIMIT,
 };
 use crate::services::route_proxy_stream::{
-    sse_is_chat_role_prelude, sse_payload_started, StreamObserver,
+    sse_is_chat_role_prelude, sse_is_responses_prelude, sse_payload_started, StreamObserver,
 };
 use crate::services::route_stream_continuation::plan_continuation;
 use axum::body::Body;
@@ -96,7 +98,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 const BIND_HOST: &str = "127.0.0.1";
-const DEFAULT_ROUTE_PROXY_PORT: u16 = 10888;
+const DEFAULT_ROUTE_PROXY_PORT: u16 = 29527;
 const ROUTE_PROXY_KEY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Upstream connect-phase ceiling. If the handshake does not complete there is
 /// nothing to wait for — fail the attempt so the retry queue moves on.
@@ -121,6 +123,12 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(180);
 /// caller far more than the retry is worth. The failure is transient on the
 /// upstream's side and re-asking usually lands on a healthy provider.
 const STREAM_DISCONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a Responses stream-opening frame may be held back while waiting
+/// for either the first output or a `response.failed`. Bounded so a queued or
+/// thinking upstream cannot sit on the response headers indefinitely: past the
+/// grace period the prefix is committed and behaviour is exactly as before.
+const RESPONSES_PRELUDE_GRACE: Duration = Duration::from_secs(3);
 
 /// The most keepalive padding to hold back while waiting for real content.
 ///
@@ -175,10 +183,76 @@ pub const ROUTE_PROXY_RESPONSE_BODY_ENCODED_KEY: &str = "response_body_br";
 pub const ROUTE_PROXY_RESPONSE_BODY_KEY: &str = "response_body";
 const TEXT_ONLY_CHAT_CONTENT_MESSAGE: &str = "当前会话包含多模态内容，但目标模型只支持纯文本；请换回多模态模型，或开启新会话后继续。 This conversation contains multimodal content, but the target model only accepts text; switch back to a multimodal model or start a new session.";
 
-async fn wait_for_credential_retry(policy: RouteCredentialFailurePolicy) {
-    if policy.retry_interval_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(policy.retry_interval_ms.into())).await;
+/// Bucket one failed attempt so its retry budget comes from the right dial.
+///
+/// Capacity is checked first: a "high demand" relay answers HTTP 200 with
+/// `error.type = too_many_requests` but `error.code = no_capacity`, and that
+/// verdict must not be mistaken for a per-account rate-limit window.
+fn class_for_failure(
+    status: StatusCode,
+    failure: Option<&SemanticResponseFailure>,
+) -> RouteFailureClass {
+    if failure.is_some_and(is_capacity_response_failure) {
+        return RouteFailureClass::Capacity;
     }
+    if failure.is_some_and(is_rate_limit_response_failure) {
+        return RouteFailureClass::RateLimit;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return RouteFailureClass::RateLimit;
+    }
+    if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+        return RouteFailureClass::ServerError;
+    }
+    if failure.is_some() {
+        return RouteFailureClass::Semantic;
+    }
+    RouteFailureClass::Other
+}
+
+/// Classify a streamed/primed body whose opening frames already carry the error.
+fn class_for_body(status: StatusCode, body: Option<&[u8]>) -> RouteFailureClass {
+    let failure = body.and_then(detect_response_failed);
+    class_for_failure(status, failure.as_ref())
+}
+
+/// The single gate every same-account retry goes through.
+///
+/// `credential_retry_count` is shared across classes within one client request
+/// (a request that alternated between a timeout and a capacity error still has
+/// one budget counter), so the effective ceiling is the one for the failure
+/// currently in hand. That is conservative by design: mixed failures can retry
+/// fewer times than an individual class allows, never more.
+fn retry_allowed(
+    policy: RouteCredentialFailurePolicy,
+    class: RouteFailureClass,
+    credential_retry_count: usize,
+    request_start: Instant,
+) -> bool {
+    !policy.retry_elapsed_exceeded(request_start.elapsed())
+        && credential_retry_count < policy.retry_limit_for(class) as usize
+}
+
+async fn wait_for_class_retry(
+    policy: RouteCredentialFailurePolicy,
+    class: RouteFailureClass,
+) {
+    let delay = policy.retry_interval_for(class);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// A capacity / high-demand verdict describes the upstream pool, not this key.
+///
+/// Parking the account after a hundred `no_capacity` retries would take a
+/// perfectly healthy key out of rotation for every model, which is the exact
+/// opposite of "keep this task alive until the upstream has room". When such a
+/// retry budget is exhausted we still report the failed request and let the
+/// aggregate-mode queue try the next account, but we do not charge the account's
+/// transient-failure counter, cooldown or error status.
+fn is_upstream_side_failure(class: RouteFailureClass) -> bool {
+    matches!(class, RouteFailureClass::Capacity)
 }
 
 /// 账号关掉故障转移后，它自己的失败就是这次请求的最终答案。
@@ -1504,8 +1578,13 @@ pub(crate) async fn forward_request(
                     &error,
                     state.upstream_timeouts,
                 );
-                let should_retry_same_credential =
-                    credential_retry_count < failure_policy.retry_count as usize;
+                let failure_class = RouteFailureClass::Transport;
+                let should_retry_same_credential = retry_allowed(
+                    failure_policy,
+                    failure_class,
+                    credential_retry_count,
+                    request_start,
+                );
                 let metadata = route_proxy_request_metadata(
                     attempt,
                     &platform,
@@ -1552,7 +1631,7 @@ pub(crate) async fn forward_request(
                     None,
                 );
                 if should_retry_same_credential {
-                    wait_for_credential_retry(failure_policy).await;
+                    wait_for_class_retry(failure_policy, failure_class).await;
                     retry_queue.push_front((credential_index, credential_retry_count + 1));
                 } else {
                     record_route_credential_failure(
@@ -1583,6 +1662,7 @@ pub(crate) async fn forward_request(
                 Ok(primed) => primed,
                 Err((message, raw)) => {
                     let error_message = format!("{}: {message}", credential.display_name);
+                    let failure_class = class_for_body(status, Some(&raw));
                     let terminal = handle_stream_prime_failure(
                         state,
                         pool,
@@ -1605,7 +1685,13 @@ pub(crate) async fn forward_request(
                             upstream_headers: &request_headers,
                             response_body: Some(&raw),
                         },
-                        credential_retry_count < failure_policy.retry_count as usize,
+                        retry_allowed(
+                            failure_policy,
+                            failure_class,
+                            credential_retry_count,
+                            request_start,
+                        ),
+                        failure_class,
                         failure_policy,
                         None,
                         &mut retry_queue,
@@ -1720,7 +1806,24 @@ pub(crate) async fn forward_request(
             // per failure kind rather than read once from the policy: see
             // `STREAM_DISCONNECT_RETRY_DELAY`.
             let prime_failure: Option<(String, Option<Duration>)> = loop {
-                match futures_util::StreamExt::next(&mut stream).await {
+                // A `response.created` frame carries no output. Holding it for
+                // one bounded read keeps the attempt retryable when the next
+                // frame is `response.failed` (an upstream capacity refusal).
+                // Once any output has arrived the prefix is committed as usual.
+                let next_chunk = if sse_is_responses_prelude(&primed) {
+                    match tokio::time::timeout(
+                        RESPONSES_PRELUDE_GRACE,
+                        futures_util::StreamExt::next(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(chunk) => chunk,
+                        Err(_) => break None,
+                    }
+                } else {
+                    futures_util::StreamExt::next(&mut stream).await
+                };
+                match next_chunk {
                     Some(Ok(chunk)) => {
                         primed.extend_from_slice(&chunk);
                         if primed.len() >= STREAM_PRIME_HOLDBACK_LIMIT {
@@ -1764,12 +1867,15 @@ pub(crate) async fn forward_request(
                             continue;
                         }
                         // A Chat upstream often opens with a content-less
-                        // `role: assistant` chunk and only then sends either the
-                        // first token or a failure frame. Committing on that
-                        // announcement would hand the client a 200 before the
-                        // failure is known, so keep priming until real output
-                        // (or an error) arrives.
-                        if sse_is_chat_role_prelude(&primed) {
+                        // `role: assistant` chunk, and a Responses upstream
+                        // with `response.created`; both only then send either
+                        // the first output or a failure frame. Committing on
+                        // those announcements would hand the client a 200
+                        // before the failure is known, so keep priming until
+                        // real output (or an error) arrives.
+                        if sse_is_chat_role_prelude(&primed)
+                            || sse_is_responses_prelude(&primed)
+                        {
                             continue;
                         }
                         // A gateway that reports failure in a 200 body usually
@@ -1805,6 +1911,10 @@ pub(crate) async fn forward_request(
                 }
             };
             if let Some((error_message, retry_delay)) = prime_failure {
+                let failure_class = class_for_body(
+                    status,
+                    (!primed.is_empty()).then_some(primed.as_slice()),
+                );
                 // The image limit reported in a 200 opening frame gets the same
                 // self-heal as the buffered path: switch the account's
                 // compatibility on, drop the older images, ask the same account
@@ -1846,7 +1956,13 @@ pub(crate) async fn forward_request(
                         response_body: (!primed.is_empty()).then_some(primed.as_slice()),
                     },
                     !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-                        && credential_retry_count < failure_policy.retry_count as usize,
+                        && retry_allowed(
+                            failure_policy,
+                            failure_class,
+                            credential_retry_count,
+                            request_start,
+                        ),
+                    failure_class,
                     failure_policy,
                     retry_delay,
                     &mut retry_queue,
@@ -1937,8 +2053,13 @@ pub(crate) async fn forward_request(
                     &error,
                     state.upstream_timeouts,
                 );
-                let should_retry_same_credential =
-                    credential_retry_count < failure_policy.retry_count as usize;
+                let failure_class = RouteFailureClass::Transport;
+                let should_retry_same_credential = retry_allowed(
+                    failure_policy,
+                    failure_class,
+                    credential_retry_count,
+                    request_start,
+                );
                 let metadata = route_proxy_request_metadata(
                     attempt,
                     &platform,
@@ -1985,7 +2106,7 @@ pub(crate) async fn forward_request(
                     None,
                 );
                 if should_retry_same_credential {
-                    wait_for_credential_retry(failure_policy).await;
+                    wait_for_class_retry(failure_policy, failure_class).await;
                     retry_queue.push_front((credential_index, credential_retry_count + 1));
                 } else {
                     record_route_credential_failure(
@@ -2491,26 +2612,34 @@ pub(crate) async fn forward_request(
             continue;
         }
         if let Some(failure) = semantic_failure.as_ref() {
+            let failure_class = class_for_failure(status, Some(failure));
             let can_retry_same_credential = !matches!(status, StatusCode::UNAUTHORIZED
                 | StatusCode::FORBIDDEN)
                 && !is_invalid_parameter_failure(status, &failure.message);
             if can_retry_same_credential
-                && credential_retry_count < failure_policy.retry_count as usize
+                && retry_allowed(
+                    failure_policy,
+                    failure_class,
+                    credential_retry_count,
+                    request_start,
+                )
             {
-                wait_for_credential_retry(failure_policy).await;
+                wait_for_class_retry(failure_policy, failure_class).await;
                 retry_queue.push_front((credential_index, credential_retry_count + 1));
             } else {
-                record_route_credential_failure(
-                    &state.activity,
-                    &platform,
-                    pool,
-                    &credential,
-                    selected_model_key.as_deref(),
-                    "semantic_response_transient",
-                    &failure.message,
-                    Some(&response_bytes),
-                )
-                .await;
+                if !is_upstream_side_failure(failure_class) {
+                    record_route_credential_failure(
+                        &state.activity,
+                        &platform,
+                        pool,
+                        &credential,
+                        selected_model_key.as_deref(),
+                        "semantic_response_transient",
+                        &failure.message,
+                        Some(&response_bytes),
+                    )
+                    .await;
+                }
                 retry_errors.push(format!("{}: {}", credential.display_name, failure.message));
                 stop_failover_when_disabled(&mut retry_queue, failure_policy.failover_enabled);
             }
@@ -2518,8 +2647,14 @@ pub(crate) async fn forward_request(
         }
         if should_retry_same_credential_status(status) {
             let error_message = format!("upstream returned {}", status.as_u16());
-            if credential_retry_count < failure_policy.retry_count as usize {
-                wait_for_credential_retry(failure_policy).await;
+            let failure_class = class_for_failure(status, None);
+            if retry_allowed(
+                failure_policy,
+                failure_class,
+                credential_retry_count,
+                request_start,
+            ) {
+                wait_for_class_retry(failure_policy, failure_class).await;
                 retry_queue.push_front((credential_index, credential_retry_count + 1));
             } else {
                 record_route_credential_failure_with_status(
@@ -3537,9 +3672,10 @@ async fn handle_stream_prime_failure(
     error_message: &str,
     context: StreamPrimeContext<'_>,
     retry_same_credential: bool,
+    failure_class: RouteFailureClass,
     failure_policy: RouteCredentialFailurePolicy,
     // Overrides the policy's own backoff when this failure kind has a better
-    // delay than a generic one. `None` keeps the policy's interval.
+    // delay than a generic one. `None` keeps the class-specific interval.
     retry_delay: Option<Duration>,
     retry_queue: &mut VecDeque<(usize, usize)>,
     credential_index: usize,
@@ -3657,21 +3793,23 @@ async fn handle_stream_prime_failure(
     if retry_same_credential {
         match retry_delay {
             Some(delay) => tokio::time::sleep(delay).await,
-            None => wait_for_credential_retry(failure_policy).await,
+            None => wait_for_class_retry(failure_policy, failure_class).await,
         }
         retry_queue.push_front((credential_index, credential_retry_count + 1));
     } else {
-        record_route_credential_failure(
-            &state.activity,
-            platform,
-            pool,
-            credential,
-            context.model_key,
-            "transport",
-            error_message,
-            None,
-        )
-        .await;
+        if !is_upstream_side_failure(failure_class) {
+            record_route_credential_failure(
+                &state.activity,
+                platform,
+                pool,
+                credential,
+                context.model_key,
+                "transport",
+                error_message,
+                None,
+            )
+            .await;
+        }
         retry_errors.push(error_message.to_string());
         stop_failover_when_disabled(retry_queue, failure_policy.failover_enabled);
     }
@@ -3874,7 +4012,14 @@ impl StreamCompletion {
             {
                 enable_image_limit_compat_in_background(&state.pool, &credential.id);
             }
-            if !request_verdict {
+            // A late `no_capacity` frame says nothing about this key's health.
+            // Treat it like the other request-body verdicts: report the request,
+            // but leave the account's failure counter and cooldown untouched.
+            let upstream_capacity_failure = outcome
+                .failure
+                .as_ref()
+                .is_some_and(is_capacity_response_failure);
+            if !request_verdict && !upstream_capacity_failure {
                 record_route_credential_failure(
                     &state.activity,
                     &platform,
@@ -11240,7 +11385,7 @@ mod tests {
     async fn start_fails_when_default_route_proxy_port_is_unavailable() {
         // If another listener already owns the default port, it is the conflict
         // fixture; otherwise keep our own socket alive until start returns.
-        let _default_port_guard = TcpListener::bind((BIND_HOST, 10888)).await.ok();
+        let _default_port_guard = TcpListener::bind((BIND_HOST, 29527)).await.ok();
         let pool = create_memory_pool().await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         let runtime = RouteProxyRuntimeState::default();
@@ -11248,7 +11393,7 @@ mod tests {
         // Release an accidentally started listener before asserting the regression.
         RouteProxyService::stop(&runtime).await.expect("stop");
         let error = result.expect_err("default port conflicts must fail");
-        assert!(error.to_string().contains("127.0.0.1:10888"));
+        assert!(error.to_string().contains("127.0.0.1:29527"));
         assert!(!RouteProxyService::status(&runtime).await.running);
     }
 
@@ -11268,16 +11413,16 @@ mod tests {
         let status = RouteProxyService::start_with_router(
             &runtime, pool, RouteProxyTransport::HttpOnly, router,
         ).await.unwrap();
-        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:10888"));
+        assert_eq!(status.base_url.as_deref(), Some("http://127.0.0.1:29527"));
         let request = tokio::spawn(async move {
-            reqwest::Client::new().get("http://127.0.0.1:10888/v1/models").send().await
+            reqwest::Client::new().get("http://127.0.0.1:29527/v1/models").send().await
         });
         tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
         let status = tokio::time::timeout(
             Duration::from_millis(500), RouteProxyService::force_stop(&runtime),
         ).await.expect("plugin shutdown must not wait for request completion").unwrap();
         assert!(!status.running);
-        let rebound = TcpListener::bind((BIND_HOST, 10888)).await.expect("listener released");
+        let rebound = TcpListener::bind((BIND_HOST, 29527)).await.expect("listener released");
         request.abort();
         drop(rebound);
     }
@@ -14691,8 +14836,12 @@ mod tests {
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
 
+    /// Capacity / overload is a property of the upstream pool, not of the key.
+    /// It must not mark the account as an error, and since the per-class work it
+    /// must not even charge a transient failure (which would eventually park a
+    /// healthy account via the cooldown / error-status counters).
     #[tokio::test]
-    async fn overloaded_response_does_not_mark_account_error() {
+    async fn overloaded_response_does_not_charge_the_account() {
         use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
         use crate::database::{create_memory_pool, run_migrations};
 
@@ -14729,7 +14878,8 @@ mod tests {
             .await
             .expect("credential");
         assert_eq!(credential.status, "ok");
-        assert_eq!(credential.transient_failure_count, 1);
+        assert_eq!(credential.transient_failure_count, 0);
+        assert!(credential.cooldown_until.is_none());
 
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
@@ -14958,6 +15108,211 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// The whole point of per-class limits: an overload/high-demand verdict can
+    /// be given a hundred attempts while the global ceiling stays at zero, and
+    /// no other class inherits that budget.
+    #[tokio::test]
+    async fn capacity_class_can_retry_a_hundred_times_while_global_count_is_zero() {
+        use crate::database::{create_memory_pool, run_migrations};
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        const CAPACITY_FAILURES: usize = 100;
+        let (upstream, calls) =
+            start_sequence_upstream(CAPACITY_FAILURES, r#"{"ok":true}"#).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "capacity retries",
+            &upstream,
+            json!({
+                "failure_policy": {
+                    "retry_count": 0,
+                    "retry_interval_ms": 0,
+                    "capacity_retry_interval_ms": 0,
+                    "retry_class_limits": {"capacity": 100}
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), CAPACITY_FAILURES + 1);
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// A high capacity ceiling must not leak into an ordinary semantic failure:
+    /// an unclassified `response.failed` still stops at the global budget.
+    #[tokio::test]
+    async fn capacity_override_does_not_extend_unrelated_semantic_failures() {
+        use crate::database::{create_memory_pool, run_migrations};
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind plain failure upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = Router::new().fallback(move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"upstream rejected the payload"}}}"#,
+                    )
+                }
+            });
+            axum::serve(listener, app).await.expect("serve upstream");
+        });
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "semantic failures",
+            &format!("http://{address}/v1"),
+            json!({
+                "failure_policy": {
+                    "retry_count": 0,
+                    "retry_interval_ms": 0,
+                    "retry_class_limits": {"capacity": 100}
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool, RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let _ = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        RouteProxyService::stop(&runtime).await.expect("stop proxy");
+    }
+
+    /// An exhausted capacity budget must not park a healthy key. Otherwise a
+    /// long "keep this task alive" wait would quietly remove the account from
+    /// every model's rotation once it finally gives up.
+    #[tokio::test]
+    async fn exhausted_capacity_retries_leave_the_account_healthy() {
+        use crate::database::{create_memory_pool, run_migrations};
+        use crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind capacity failure upstream");
+        let address = listener.local_addr().expect("upstream address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        tokio::spawn(async move {
+            let app = Router::new().fallback(move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"no_capacity","message":"The system is currently experiencing high demand"}}}"#,
+                    )
+                }
+            });
+            axum::serve(listener, app).await.expect("serve upstream");
+        });
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let credential_id = create_proxy_api_credential_with_config(
+            &pool,
+            "capacity exhaustion",
+            &format!("http://{address}/v1"),
+            json!({
+                "failure_policy": {
+                    "retry_count": 0,
+                    "retry_interval_ms": 0,
+                    "cooldown_enabled": true,
+                    "cooldown_seconds": 600,
+                    "retry_class_limits": {"capacity": 2}
+                }
+            }),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&credential_id))
+            .await
+            .expect("pool members");
+        let route_key =
+            RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-ai-switch-test")
+                .await
+                .expect("route key");
+        let runtime = RouteProxyRuntimeState::default();
+        let proxy = RouteProxyService::start(&runtime, pool.clone(), RouteProxyTransport::HttpOnly)
+            .await
+            .expect("start proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/chat/completions",
+                proxy.base_url.as_deref().expect("base url")
+            ))
+            .bearer_auth(route_key)
+            .json(&json!({"model":"gpt-5.5","messages":[]}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert!(!response.status().is_success());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let stored = RouteCredentialRepository::get(&pool, &credential_id)
+            .await
+            .expect("account row");
+        assert_eq!(stored.transient_failure_count, 0);
+        assert!(stored.cooldown_until.is_none());
+        assert_eq!(stored.status, "ok");
         RouteProxyService::stop(&runtime).await.expect("stop proxy");
     }
 
@@ -21534,6 +21889,78 @@ data: [DONE]\n\n";
         assert_eq!(
             account.last_failure_kind.as_deref(),
             Some("content_rejected")
+        );
+    }
+
+    /// A 200 stream that announces the response and *then* reports a capacity
+    /// failure used to reach the client verbatim: `response.created` had already
+    /// committed the stream, so the retry window was gone before the failure
+    /// arrived. The opening frame is now held back until real output appears,
+    /// which lets the failure be retried instead.
+    #[tokio::test]
+    async fn responses_created_then_failed_is_retried_before_any_output() {
+        use crate::database::{create_memory_pool, run_migrations};
+
+        const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        const FAILED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"The system is currently experiencing high demand\"}}}\n\n";
+        const HEALTHY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"status\":\"completed\"}}\n\n",
+        );
+        let (upstream, calls) =
+            start_scripted_sse_upstream(vec![vec![CREATED, FAILED], vec![HEALTHY]]).await;
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let id = create_proxy_api_credential_with_config(
+            &pool,
+            "stream-capacity",
+            &upstream,
+            json!({"interface_format":"openai-responses","failure_policy":{"retry_count":2,"retry_interval_ms":0}}),
+        )
+        .await;
+        RoutePoolRepository::replace_members(&pool, "codex", std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let route_key = RouteProxyKeyRepository::ensure_platform_key(
+            &pool,
+            "codex",
+            "sk-ai-switch-test-capacity",
+        )
+        .await
+        .unwrap();
+        let runtime = RouteProxyRuntimeState::default();
+        let state = build_proxy_state(pool.clone(), &runtime);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {route_key}")).unwrap(),
+        );
+
+        let response = proxy_handler(
+            AxumState(state),
+            Method::POST,
+            headers,
+            "/v1/responses".parse().unwrap(),
+            Body::from(json!({"model":"gpt-5.5","stream":true,"input":"hi"}).to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the capacity refusal must be retried exactly once: {text}"
+        );
+        assert!(
+            !text.contains("high demand") && !text.contains("response.failed"),
+            "the client must get the retried stream, never the failure frame: {text}"
         );
     }
 

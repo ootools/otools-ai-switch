@@ -44,8 +44,8 @@ describe("routeProxyEndpointForPlatform", () => {
 
 describe("routeProxyApiEndpoint", () => {
   it.each([
-    ["http://127.0.0.1:10888", "/v1/images/edits", "http://127.0.0.1:10888/v1/images/edits"],
-    [" http://127.0.0.1:10888/v1/ ", "/v1/video/generations", "http://127.0.0.1:10888/v1/video/generations"],
+    ["http://127.0.0.1:29527", "/v1/images/edits", "http://127.0.0.1:29527/v1/images/edits"],
+    [" http://127.0.0.1:29527/v1/ ", "/v1/video/generations", "http://127.0.0.1:29527/v1/video/generations"],
     ["https://host.example/api/v1", "/v1/audio/speech", "https://host.example/api/v1/audio/speech"],
     ["", "/v1/videos", ""],
   ])("joins %s and %s without repeating the version", (base, path, expected) => {

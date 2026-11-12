@@ -226,9 +226,72 @@ pub fn sse_is_chat_role_prelude(bytes: &[u8]) -> bool {
     saw_payload
 }
 
+/// Whether every data frame buffered so far is a zero-output Responses
+/// stream-opening event (`response.created` / `response.in_progress`).
+///
+/// A Responses upstream announces the response object before it emits any
+/// output — and so does a gateway that is about to refuse the turn for capacity
+/// reasons: it sends `response.created` and then `response.failed` (e.g. the
+/// "The system is currently experiencing high demand" refusal). Committing the
+/// stream on that announcement spends the only moment the attempt can still be
+/// retried; once the 200 and its first frame reached the client, a late
+/// `response.failed` can only be forwarded as a broken turn.
+///
+/// Only a prefix made entirely of such frames counts. Output, errors, terminal
+/// events, malformed JSON and Chat chunks all return `false`, so this never
+/// widens the hold-back window beyond the shape understood here.
+pub fn sse_is_responses_prelude(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_payload = false;
+    for line in text.lines() {
+        let Some(data) = line.trim_start().strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        saw_payload = true;
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+        {
+            return false;
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.created" | "response.in_progress") => {}
+            // A few relays omit the envelope `type` and send the bare response
+            // object. Accept that shape only while it still says in progress —
+            // the status check below is what keeps a failed envelope out.
+            None => {}
+            _ => return false,
+        }
+        let Some(response) = value.get("response") else {
+            return false;
+        };
+        if response
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "in_progress" && status != "queued")
+        {
+            return false;
+        }
+        if response
+            .get("output")
+            .is_some_and(|output| output.as_array().is_some_and(|items| !items.is_empty()))
+        {
+            return false;
+        }
+    }
+    saw_payload
+}
+
 #[cfg(test)]
 mod payload_started_tests {
-    use super::{sse_is_chat_role_prelude, sse_payload_started};
+    use super::{sse_is_chat_role_prelude, sse_is_responses_prelude, sse_payload_started};
 
     /// The shape that made this rule necessary: a gateway parks the client on
     /// comment frames, then reports the failure. Nothing was delivered, so the
@@ -298,6 +361,39 @@ mod payload_started_tests {
         assert!(!sse_is_chat_role_prelude(usage_only.as_bytes()));
         assert!(!sse_is_chat_role_prelude(b"data: [DONE]\n\n"));
         assert!(!sse_is_chat_role_prelude(b""));
+    }
+
+    /// The exact shape that used to leak a `response.failed` to the client:
+    /// the upstream creates the response, then refuses it for capacity reasons.
+    /// Nothing was produced, so the attempt is still retryable.
+    #[test]
+    fn responses_stream_opening_frames_are_a_prelude() {
+        let created = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[],\"error\":null}}\n\n";
+        let in_progress = "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n";
+        let bare = "data: {\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n";
+        assert!(sse_is_responses_prelude(created.as_bytes()));
+        assert!(sse_is_responses_prelude(in_progress.as_bytes()));
+        assert!(sse_is_responses_prelude(bare.as_bytes()));
+        assert!(sse_is_responses_prelude(
+            format!(": ping\n\n{created}").as_bytes()
+        ));
+    }
+
+    #[test]
+    fn a_failed_or_output_responses_frame_ends_the_prelude() {
+        let created = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n";
+        let failed = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"The system is currently experiencing high demand\"}}}\n\n";
+        let output = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        let chat = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+        for frame in [failed, output, completed, chat] {
+            assert!(!sse_is_responses_prelude(
+                format!("{created}{frame}").as_bytes()
+            ));
+        }
+        assert!(!sse_is_responses_prelude(b"data: [DONE]\n\n"));
+        assert!(!sse_is_responses_prelude(b""));
+        assert!(!sse_is_responses_prelude(b"data: not-json\n\n"));
     }
 }
 

@@ -992,7 +992,7 @@ describe("AccountsScreen", () => {
     vi.mocked(startRouteProxy).mockRejectedValueOnce({
       code: "ROUTE_PROXY_BIND_FAILED",
       message: "AI 服务启动失败",
-      details: "127.0.0.1:10888: Address already in use (os error 10048)",
+      details: "127.0.0.1:29527: Address already in use (os error 10048)",
       recoverable: true,
     });
     renderScreen();
@@ -1011,7 +1011,7 @@ describe("AccountsScreen", () => {
   it("shows a failed AI-service stop and keeps the actual running state until a retry succeeds", async () => {
     vi.mocked(getRouteProxyStatus).mockResolvedValue({
       running: true, route_access_enabled: true, bind_host: "127.0.0.1",
-      port: 10888, base_url: "http://127.0.0.1:10888",
+      port: 29527, base_url: "http://127.0.0.1:29527",
     });
     vi.mocked(stopRouteProxy).mockRejectedValueOnce(new Error("停止服务失败：native worker disconnected"));
     renderScreen();
@@ -1096,7 +1096,7 @@ describe("AccountsScreen", () => {
       <AccountsScreen platform="codex" capabilityFilter="image.generate" />
     </I18nProvider></QueryClientProvider>);
     const panel = await screen.findByRole("region", { name: "图片接入信息" });
-    expect(within(panel).getByLabelText("图片端点")).toHaveValue("http://127.0.0.1:10888/v1/images/generations");
+    expect(within(panel).getByLabelText("图片端点")).toHaveValue("http://127.0.0.1:29527/v1/images/generations");
     await waitFor(() => expect(within(panel).getByRole("status")).toHaveTextContent(/未启动/));
     expect(within(panel).getByRole("status")).toHaveTextContent(/默认地址/);
   });
@@ -6103,6 +6103,116 @@ describe("AccountsScreen", () => {
     expect(
       await screen.findAllByText("额外重试次数必须是 0-10 的整数"),
     ).toHaveLength(2);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+  });
+
+  it("offers per-error-class retry budgets and a one-click 100-retry capacity preset", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+
+    expect(screen.getByLabelText("重试总时长上限（秒）")).toHaveValue(0);
+    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(0);
+    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(null);
+    expect(screen.getByLabelText("网络连接 / 超时的额外重试次数")).toHaveValue(null);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "一键设为容量类重试100次、间隔5000毫秒" }),
+    );
+    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(100);
+    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(5000);
+
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
+    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
+      retry_class_limits: {
+        transport: null,
+        server_error: null,
+        rate_limit: null,
+        capacity: 100,
+        semantic: null,
+      },
+      capacity_retry_interval_ms: 5000,
+      max_retry_elapsed_seconds: 0,
+    });
+  });
+
+  it("hydrates stored per-class retry limits without inventing values for the others", async () => {
+    const api = {
+      ...credentialsFixture[1],
+      config_json: JSON.stringify({
+        base_url: "https://api.example.com/v1",
+        interface_format: "openai",
+        model_mappings: [],
+        failure_policy: {
+          retry_count: 2,
+          retry_class_limits: { capacity: 100, rate_limit: 0 },
+          capacity_retry_interval_ms: 3000,
+          max_retry_elapsed_seconds: 900,
+        },
+      }),
+    };
+    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
+    vi.mocked(updateRouteCredential).mockResolvedValue(api);
+
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
+    await openFormTab("故障处理");
+
+    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(100);
+    expect(screen.getByLabelText("限流 429的额外重试次数")).toHaveValue(0);
+    expect(screen.getByLabelText("网络连接 / 超时的额外重试次数")).toHaveValue(null);
+    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(3000);
+    expect(screen.getByLabelText("重试总时长上限（秒）")).toHaveValue(900);
+  });
+
+  it("rejects a per-class retry limit above the safe ceiling", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    fireEvent.change(screen.getByLabelText("容量不足 / 高负载的额外重试次数"), {
+      target: { value: "1001" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(
+      await screen.findAllByText(
+        /「容量不足 \/ 高负载」的额外重试次数必须是 0-1000 的整数/,
+      ),
+    ).not.toHaveLength(0);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+  });
+
+  it("validates the capacity retry interval and the total elapsed ceiling", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
+    await openFormTab("故障处理");
+    fireEvent.change(screen.getByLabelText("容量类重试间隔（毫秒）"), {
+      target: { value: "60001" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(
+      await screen.findAllByText("容量类重试间隔必须是 0-60000 毫秒的整数"),
+    ).not.toHaveLength(0);
+    expect(updateRouteCredential).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("容量类重试间隔（毫秒）"), {
+      target: { value: "5000" },
+    });
+    fireEvent.change(screen.getByLabelText("重试总时长上限（秒）"), {
+      target: { value: "86401" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(
+      await screen.findAllByText("重试总时长上限必须是 0-86400 秒的整数"),
+    ).not.toHaveLength(0);
     expect(updateRouteCredential).not.toHaveBeenCalled();
   });
 

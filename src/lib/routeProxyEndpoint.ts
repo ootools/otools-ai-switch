@@ -31,7 +31,7 @@ export function routeProxyEndpointForPlatform(baseUrl: string, platform: string)
  * 已经带 `/v1`（客户端自己接 `/responses`），gemini 的是裸的（客户端自己接
  * `/v1beta/...`），同一个绝对路径因此要接在两段不同的位置上。
  */
-export const DEFAULT_ROUTE_PROXY_BASE_URL = "http://127.0.0.1:10888";
+export const DEFAULT_ROUTE_PROXY_BASE_URL = "http://127.0.0.1:29527";
 
 /** Join a native listener address with an absolute API path without doubling /v1. */
 export function routeProxyApiEndpoint(baseUrl: string, apiPath: string): string {

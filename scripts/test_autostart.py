@@ -43,7 +43,7 @@ try:
             results.append(call(task["command"], task.get("args", {})))
     connected = False
     with socket.socket() as check:
-        connected = check.connect_ex(("127.0.0.1", 10888)) == 0
+        connected = check.connect_ex(("127.0.0.1", 29527)) == 0
     # Report only the public service state, never local keys or account details.
     print(json.dumps({"results": [{"ok": value.get("ok"), "error": value.get("error")} for value in results], "running": status.get("data", {}).get("running"), "port": status.get("data", {}).get("port"), "connected": connected}))
 finally:
@@ -58,8 +58,8 @@ class PluginAutostartTests(unittest.TestCase):
         if not cls.library.is_file():
             raise RuntimeError("Build the native library before running autostart tests")
         with socket.socket() as port:
-            if port.connect_ex(("127.0.0.1", 10888)) == 0:
-                raise RuntimeError("Stop the test AI listener before running autostart tests; port 10888 is in use")
+            if port.connect_ex(("127.0.0.1", 29527)) == 0:
+                raise RuntimeError("Stop the test AI listener before running autostart tests; port 29527 is in use")
 
     def run_host(self, data_dir, mode="once"):
         env = {**os.environ, "OTOOLS_AI_SWITCH_DATA_DIR": str(data_dir)}
@@ -77,7 +77,7 @@ class PluginAutostartTests(unittest.TestCase):
                 self.assertTrue(state["results"], "No native autostart task is configured")
                 self.assertTrue(all(value["ok"] for value in state["results"]), state["results"])
                 self.assertTrue(state["running"], f"Host restart {cycle}: listener not started")
-                self.assertEqual(state["port"], 10888)
+                self.assertEqual(state["port"], 29527)
                 self.assertTrue(state["connected"])
 
     def test_repeated_startup_is_idempotent(self):
@@ -91,7 +91,7 @@ class PluginAutostartTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="otools-ai-switch-autostart-") as directory, socket.socket() as port:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                 port.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            port.bind(("127.0.0.1", 10888))
+            port.bind(("127.0.0.1", 29527))
             port.listen(1)
             state = self.run_host(directory)
             self.assertTrue(state["results"], "No native autostart task is configured")

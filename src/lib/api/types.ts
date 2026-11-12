@@ -20,6 +20,17 @@ export type AccountStatus = "ok" | "warning" | "error" | "revoked" | "paused";
 
 export type RouteCredentialKind = "official" | "api";
 
+/** 可重试的失败类别。硬判定错误（额度/权限/内容/参数/401/403）不在此列。 */
+export type RouteRetryClassKey =
+  | "transport"
+  | "server_error"
+  | "rate_limit"
+  | "capacity"
+  | "semantic";
+
+/** null / 字段缺失 = 跟随通用「额外重试次数」。 */
+export type RouteRetryClassLimits = Record<RouteRetryClassKey, number | null>;
+
 export type RouteCredentialFailurePolicy = {
   retry_count: number;
   retry_interval_ms: number;
@@ -33,6 +44,12 @@ export type RouteCredentialFailurePolicy = {
   stream_continue_max: number;
   /** 重试/续写都失败后，是否切到池内其它账号（仅聚合模式有效）。 */
   failover_enabled: boolean;
+  /** 按错误类别单独设置额外重试次数；null 表示跟随 retry_count。 */
+  retry_class_limits: RouteRetryClassLimits;
+  /** 容量不足类专用重试间隔（毫秒）；0 表示跟随 retry_interval_ms。 */
+  capacity_retry_interval_ms: number;
+  /** 整次请求重试总时长上限（秒）；0 表示只按次数限制。 */
+  max_retry_elapsed_seconds: number;
 };
 
 export type PlatformId =

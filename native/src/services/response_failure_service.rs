@@ -25,15 +25,117 @@ pub(crate) fn is_content_rejection(failure: &SemanticResponseFailure) -> bool {
     })
 }
 
-/// Returns whether a semantic response failure is a temporary upstream
-/// capacity issue rather than an account-specific failure.
-pub fn is_transient_response_failure(message: &str) -> bool {
+/// Upstream codes that name a capacity/overload verdict. These arrive either on
+/// a 200 SSE stream (`event: error` / `response.failed`) or as a plain JSON
+/// error, so matching the structured code is far more reliable than prose.
+const CAPACITY_ERROR_CODES: &[&str] = &[
+    "no_capacity",
+    "capacity_exceeded",
+    "insufficient_capacity",
+    "overloaded",
+    "overloaded_error",
+    "server_overloaded",
+    "model_overloaded",
+    "high_demand",
+];
+/// Azure/OpenAI-style "high demand" relays answer with HTTP 200 and this error
+/// family; `no_capacity` takes precedence over the generic `too_many_requests`.
+///
+/// Deliberately phrase-based. A bare "capacity" or "service unavailable" also
+/// shows up in context-length, storage and 503 errors that have nothing to do
+/// with an exhausted upstream pool — misclassifying those would hand a hard
+/// verdict a hundred retries and skip its account penalty.
+const CAPACITY_MESSAGE_MARKERS: &[&str] = &[
+    "high demand",
+    "peak load",
+    "provisioned throughput",
+    "no capacity",
+    "insufficient capacity",
+    "out of capacity",
+    "currently overloaded",
+    "servers are overloaded",
+    "model is overloaded",
+    "at capacity",
+];
+const RATE_LIMIT_ERROR_CODES: &[&str] = &[
+    "rate_limit_exceeded",
+    "rate_limit_error",
+    "too_many_requests",
+    "requests_per_minute_limit",
+    "tokens_per_minute_limit",
+];
+const RATE_LIMIT_MESSAGE_MARKERS: &[&str] = &[
+    "rate limit",
+    "too many requests",
+    "requests per minute",
+    "tokens per minute",
+    "please slow down",
+];
+
+fn normalized_failure_text(message: &str) -> String {
     message
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
-        .contains("our servers are currently overloaded")
+}
+
+fn code_matches(failure: &SemanticResponseFailure, known: &[&str]) -> bool {
+    failure.code.as_deref().is_some_and(|code| {
+        let code = code.trim();
+        known
+            .iter()
+            .any(|candidate| code.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn error_type_matches(failure: &SemanticResponseFailure, known: &[&str]) -> bool {
+    failure.error_type.as_deref().is_some_and(|kind| {
+        let kind = kind.trim();
+        known
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    })
+}
+
+/// Whether the upstream refused because it is out of capacity right now, not
+/// because this account or this request is at fault. This is the class users
+/// most want to keep retrying long after ordinary errors have given up.
+pub fn is_capacity_response_failure(failure: &SemanticResponseFailure) -> bool {
+    if code_matches(failure, CAPACITY_ERROR_CODES) {
+        return true;
+    }
+    let message = normalized_failure_text(&failure.message);
+    CAPACITY_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Whether the failure is an ordinary rate limit, distinct from capacity: the
+/// account has a fixed window to wait out, so hammering it 100 times is wrong.
+pub fn is_rate_limit_response_failure(failure: &SemanticResponseFailure) -> bool {
+    if is_capacity_response_failure(failure) {
+        return false;
+    }
+    if code_matches(failure, RATE_LIMIT_ERROR_CODES)
+        || error_type_matches(failure, RATE_LIMIT_ERROR_CODES)
+    {
+        return true;
+    }
+    let message = normalized_failure_text(&failure.message);
+    RATE_LIMIT_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Kept for callers that only have the message; equivalent to recognising the
+/// "overloaded" family. The classifier above is the one the proxy uses.
+pub fn is_transient_response_failure(message: &str) -> bool {
+    is_capacity_response_failure(&SemanticResponseFailure {
+        code: None,
+        error_type: None,
+        message: message.to_string(),
+    })
 }
 
 /// The `error.type` new-api style gateways stamp on their own errors, as
@@ -711,6 +813,67 @@ data: {"type":"response.failed","error":{"message":"down"}}
             " our   servers are currently overloaded "
         ));
         assert!(!is_transient_response_failure("invalid model"));
+    }
+
+    /// The real 200 SSE failure from the live log: `event: error` carries
+    /// `too_many_requests` + `no_capacity`, then `response.failed` repeats it.
+    #[test]
+    fn classifies_high_demand_relay_failure_as_capacity() {
+        let body = br#"event: error
+data: {"type":"error","error":{"type":"too_many_requests","code":"no_capacity","message":"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput."}}
+
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"no_capacity","message":"The system is currently experiencing high demand"}}}
+"#;
+        let failure = detect_response_failed(body).expect("semantic failure");
+        assert_eq!(failure.code.as_deref(), Some("no_capacity"));
+        assert_eq!(failure.error_type.as_deref(), Some("too_many_requests"));
+        assert!(is_capacity_response_failure(&failure));
+        // Capacity wins over the generic `too_many_requests` family.
+        assert!(!is_rate_limit_response_failure(&failure));
+    }
+
+    #[test]
+    fn separates_capacity_from_account_rate_limits_and_hard_verdicts() {
+        let rate_limit = detect_response_failed(
+            br#"{"error":{"code":"rate_limit_exceeded","type":"too_many_requests","message":"Rate limit reached, please slow down"}}"#,
+        )
+        .expect("rate limit failure");
+        assert!(!is_capacity_response_failure(&rate_limit));
+        assert!(is_rate_limit_response_failure(&rate_limit));
+
+        let quota = detect_response_failed(
+            br#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+        )
+        .expect("quota failure");
+        assert!(!is_capacity_response_failure(&quota));
+        assert!(!is_rate_limit_response_failure(&quota));
+
+        let overload = SemanticResponseFailure {
+            code: None,
+            error_type: None,
+            message: "Our servers are currently overloaded. Please try again later.".to_string(),
+        };
+        assert!(is_capacity_response_failure(&overload));
+    }
+
+    /// Broad words must not turn a hard verdict into a hundred-retry class.
+    #[test]
+    fn generic_capacity_wording_does_not_claim_an_upstream_shortage() {
+        let candidates = [
+            r#"{"error":{"message":"This model's maximum context capacity is 128000 tokens"}}"#,
+            r#"{"error":{"message":"Service Unavailable"}}"#,
+            r#"{"error":{"message":"The upstream is temporarily unavailable"}}"#,
+            r#"{"error":{"code":"storage_capacity_exceeded","message":"Storage capacity is full"}}"#,
+        ];
+        for body in candidates {
+            let failure = detect_response_failed(body.as_bytes()).expect("semantic failure");
+            assert!(
+                !is_capacity_response_failure(&failure),
+                "misclassified as capacity: {}",
+                failure.message
+            );
+        }
     }
 
     #[test]

@@ -563,7 +563,7 @@ describe("UsageOverviewPanel", () => {
   });
 
   it("discovers model prices through the host catalog without exposing its key", async () => {
-    vi.mocked(getRouteProxyStatus).mockResolvedValue({ running: true, bind_host: "127.0.0.1", base_url: "http://127.0.0.1:10888" });
+    vi.mocked(getRouteProxyStatus).mockResolvedValue({ running: true, bind_host: "127.0.0.1", base_url: "http://127.0.0.1:29527" });
     vi.mocked(getRouteProxyKey).mockClear();
     vi.mocked(fetchRouteProxyModels).mockResolvedValue([{ id: "unified-model", owned_by: "ai-switch" }]);
     const { ModelPricingDialog } = await import("../src/components/accounts/ModelPricingDialog");

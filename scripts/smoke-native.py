@@ -67,7 +67,7 @@ def check_proxy_forwarding(call, opener, key):
         for stream in [False, True]:
             body = {"model": "demo-chat", "messages": [{"role": "user", "content": "local test only"}], "stream": stream}
             request = urllib.request.Request(
-                "http://127.0.0.1:10888/v1/chat/completions", data=json.dumps(body).encode(),
+                "http://127.0.0.1:29527/v1/chat/completions", data=json.dumps(body).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
             )
             with opener.open(request, timeout=30) as response:
@@ -90,7 +90,7 @@ def check_proxy_forwarding(call, opener, key):
 
         def held_client():
             request = urllib.request.Request(
-                "http://127.0.0.1:10888/v1/chat/completions",
+                "http://127.0.0.1:29527/v1/chat/completions",
                 data=json.dumps({"model": "demo-chat", "messages": [{"role": "user", "content": "hold until shutdown"}], "stream": True}).encode(),
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
             )
@@ -151,7 +151,7 @@ def main():
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         def http(path, headers=None):
-            request = urllib.request.Request(f"http://127.0.0.1:10888{path}", headers=headers or {})
+            request = urllib.request.Request(f"http://127.0.0.1:29527{path}", headers=headers or {})
             try:
                 with opener.open(request, timeout=10) as response:
                     return response.status, response.read()
@@ -160,7 +160,7 @@ def main():
 
         def assert_port_released():
             with socket.socket() as check:
-                assert check.connect_ex(("127.0.0.1", 10888)) != 0, "AI port remains open after stopping"
+                assert check.connect_ex(("127.0.0.1", 29527)) != 0, "AI port remains open after stopping"
 
         try:
             settings = call("get_settings")
@@ -185,19 +185,19 @@ def main():
             with socket.socket() as occupied:
                 if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
                     occupied.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-                occupied.bind(("127.0.0.1", 10888))
+                occupied.bind(("127.0.0.1", 29527))
                 occupied.listen(1)
                 result = raw_call("start_route_proxy")
                 assert result["ok"] is False, "Port conflict must fail, not silently select a different port"
                 assert call("get_route_proxy_status")["running"] is False
-            print("PASS: occupied 10888 reports failure without switching ports")
+            print("PASS: occupied 29527 reports failure without switching ports")
 
             status = call("start_route_proxy")
-            assert status["running"] is True and status["port"] == 10888
-            assert status["base_url"] == "http://127.0.0.1:10888"
-            assert call("plugin_http_port")["port"] == 10888
+            assert status["running"] is True and status["port"] == 29527
+            assert status["base_url"] == "http://127.0.0.1:29527"
+            assert call("plugin_http_port")["port"] == 29527
             preflight = urllib.request.Request(
-                "http://127.0.0.1:10888/v1/chat/completions", method="OPTIONS",
+                "http://127.0.0.1:29527/v1/chat/completions", method="OPTIONS",
                 headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization,content-type"},
             )
             with opener.open(preflight, timeout=10) as response:
@@ -217,7 +217,7 @@ def main():
             for path in ["/", "/api/get_settings", "/ws/events", "/api/saas/admin", "/v1/files", "/other/messages"]:
                 code, _ = http(path, {"Authorization": f"Bearer {key}"})
                 assert code in (404, 405), f"Management/static route is mounted: {path} ({code})"
-            print("PASS: AI-only 10888 listener, local API-key authentication and rejected management routes")
+            print("PASS: AI-only 29527 listener, local API-key authentication and rejected management routes")
             check_proxy_forwarding(call, opener, key)
 
             assert call("stop_route_proxy")["running"] is False
@@ -232,7 +232,7 @@ def main():
             assert call("get_route_proxy_key", {"platform": "codex"}) == key
             restored = call("get_route_proxy_status")
             if restored["running"]:
-                assert restored["port"] == 10888, "Restored service changed its configured port"
+                assert restored["port"] == 29527, "Restored service changed its configured port"
                 call("stop_route_proxy")
             call("__otools_shutdown__")
             assert any(Path(directory).rglob("*.db")), "Database was not created in isolated data directory"

@@ -10,9 +10,9 @@ describe("OTools management transport", () => {
   beforeEach(() => vi.resetAllMocks());
 
   it("invokes the host without requiring Tauri globals at module load", async () => {
-    vi.mocked(invoke).mockResolvedValue({ running: true, port: 10888 });
-    await expect(getTransport().call("start_route_proxy", { port: 10888 })).resolves.toEqual({ running: true, port: 10888 });
-    expect(invoke).toHaveBeenCalledWith("start_route_proxy", { port: 10888 });
+    vi.mocked(invoke).mockResolvedValue({ running: true, port: 29527 });
+    await expect(getTransport().call("start_route_proxy", { port: 29527 })).resolves.toEqual({ running: true, port: 29527 });
+    expect(invoke).toHaveBeenCalledWith("start_route_proxy", { port: 29527 });
   });
 
   it("unwraps the native envelope when the host forwards it", async () => {
@@ -27,11 +27,11 @@ describe("OTools management transport", () => {
   });
 
   it.each([false, true])("preserves structured native errors (envelope=%s)", async (envelope) => {
-    const error = { code: "proxy.port_in_use", message: "Port 10888 is in use", recoverable: true, details: "10888", operation_id: "op-1" };
+    const error = { code: "proxy.port_in_use", message: "Port 29527 is in use", recoverable: true, details: "29527", operation_id: "op-1" };
     if (envelope) vi.mocked(invoke).mockResolvedValue({ ok: false, error });
     else vi.mocked(invoke).mockRejectedValue(error);
     await expect(getTransport().call("start_route_proxy")).rejects.toMatchObject({
-      name: "ApiClientError", message: error.message, code: error.code, details: "10888", operationId: "op-1",
+      name: "ApiClientError", message: error.message, code: error.code, details: "29527", operationId: "op-1",
     });
   });
 
