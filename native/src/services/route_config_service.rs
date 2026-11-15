@@ -1,6 +1,6 @@
 use crate::adapters::route_config::{
-    codex_model_catalog_path, ClaudeEnvPlan, ClientModel, RouteConfigInput, TargetAdapter,
-    TargetAdapterRegistry,
+    codex_model_catalog_path, route_proxy_key_for_client, ClaudeEnvPlan, ClientModel,
+    RouteConfigInput, TargetAdapter, TargetAdapterRegistry,
 };
 use crate::database::repositories::route_credential_repository::RouteCredentialRepository;
 use crate::database::repositories::route_pool_repository::RoutePoolRepository;
@@ -221,13 +221,14 @@ impl RouteConfigService {
         let mut any_succeeded = false;
         for adapter in adapters {
             let target_key = adapter.target_key();
+            let client_key = adapter.client_key();
             let request = ConfigWriteRequest {
                 adapter,
                 home: home.to_path_buf(),
                 path_context: path_context.clone(),
                 input: RouteConfigInput {
                     base_url: base_url.to_string(),
-                    route_proxy_key: route_proxy_key.clone(),
+                    route_proxy_key: route_proxy_key_for_client(&route_proxy_key, client_key),
                     route_proxy_key_aliases: aliases.clone(),
                     claude_env: claude_env.clone(),
                     client_models: client_models.clone(),
@@ -472,7 +473,7 @@ impl RouteConfigService {
             };
             let input = RouteConfigInput {
                 base_url: base_url.to_string(),
-                route_proxy_key: route_proxy_key.clone(),
+                route_proxy_key: route_proxy_key_for_client(&route_proxy_key, adapter.client_key()),
                 route_proxy_key_aliases: aliases.clone(),
                 claude_env: claude_env.clone(),
                 client_models: client_models.clone(),
@@ -512,13 +513,14 @@ impl RouteConfigService {
         let client_models =
             Self::resolve_models_for_config_input(pool, platform, adapter.requires_client_models())
                 .await?;
+        let route_proxy_key = route_proxy_key_for_client(route_proxy_key, adapter.client_key());
         let request = ConfigWriteRequest {
             adapter,
             home: home.to_path_buf(),
             path_context,
             input: RouteConfigInput {
                 base_url: base_url.to_string(),
-                route_proxy_key: route_proxy_key.to_string(),
+                route_proxy_key,
                 route_proxy_key_aliases: Vec::new(),
                 claude_env,
                 client_models,
@@ -1797,8 +1799,8 @@ command = "npx"
         assert!(written.contains("model_provider = \"ai-switch\""));
         assert!(written.contains("[model_providers.ai-switch]"));
         assert!(written.contains("base_url = \"http://127.0.0.1:43111/v1\""));
-        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
-        assert!(!written.contains("api_key = \"sk-ai-switch-test\""));
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test.codex\""));
+        assert!(!written.contains("api_key = \"sk-ai-switch-test"));
     }
 
     #[tokio::test]
@@ -1847,7 +1849,7 @@ command = "npx"
         // Default: the proxy key authenticates Codex, no login hand-off.
         write().await.expect("write config");
         let written = read().await;
-        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test.codex\""));
         assert!(!written.contains("requires_openai_auth"));
 
         // Switched on: Codex keeps its ChatGPT login and loses the proxy key.
@@ -1868,7 +1870,7 @@ command = "npx"
         set_switch(false).await;
         write().await.expect("write config");
         let written = read().await;
-        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test\""));
+        assert!(written.contains("experimental_bearer_token = \"sk-ai-switch-test.codex\""));
         assert!(!written.contains("requires_openai_auth"));
         assert!(!written.contains("x-ai-switch-platform"));
     }
@@ -2045,7 +2047,7 @@ command = "npx"
         assert_eq!(json["env"]["EXISTING_FLAG"], "1");
         assert_eq!(json["env"]["ANTHROPIC_BASE_URL"], "https://127.0.0.1:43111");
         // The key Claude Code actually authenticates with.
-        assert_eq!(json["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-ai-switch-test");
+        assert_eq!(json["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-ai-switch-test.claude_code");
         assert!(json["env"].get("AI_SWITCH_ROUTE_PROXY_API_KEY").is_none());
         assert_eq!(
             json["aiSwitch"]["routeProxy"]["baseUrl"],
@@ -2995,14 +2997,22 @@ command = "npx"
     }
 
     /// The sk the Codex CLI config was written with, read back from disk.
+    /// The base key the Codex CLI config carries, with the client suffix peeled
+    /// off. The stored platform key is always unsuffixed, so a comparison against
+    /// the file has to strip the client tag first.
     async fn codex_written_key(home: &Path) -> String {
         let raw = tokio::fs::read_to_string(home.join(".codex/config.toml"))
             .await
             .expect("read config.toml");
-        raw.lines()
+        let written = raw
+            .lines()
             .find_map(|line| line.trim().strip_prefix("experimental_bearer_token = "))
             .map(|value| value.trim().trim_matches('"').to_string())
-            .expect("bearer token")
+            .expect("bearer token");
+        written
+            .strip_suffix(".codex")
+            .expect("written key carries the codex client suffix")
+            .to_string()
     }
 
     #[tokio::test]
