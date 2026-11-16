@@ -2,7 +2,19 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
-## v0.1.7 release preparation
+## v0.1.7 release verification
+
+Released 2026-11-16 from commit `de57b36`, annotated tag `v0.1.7`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.7> is public, non-draft, non-prerelease and the latest stable release, with all **8 assets uploaded**. Release notes match `docs/releases/0.1.7.md`; downloaded `plugin.json` and `SHA256SUMS` match verified local files byte-for-byte. All eight GitHub asset digests and sizes match the publication files.
+
+- Three-platform CI run **43826048470** succeeded on `de57b36`: Windows x64, Linux x64 and macOS ARM64. Each job passed the **949-test frontend suite**, typecheck/build/package checks, native plugin boundaries, **7 FFI/listener smoke checks**, **3 autostart tests** and **2 Nano Banana tests**.
+- Published platform packages were taken from that CI run and re-verified locally: **23 entries** each, CRC/SHA256, exact expected native library and Windows PE/Linux ELF/macOS ARM64 Mach-O headers. Non-native content is byte-identical across platforms.
+- All four package variants include the exact verified WorkBuddy, CodeBuddy, ZCode and Qoder artwork hashes plus the original ZCode license/notice files. The unsuffixed fallback is Windows x64, repacked from the CI Windows package; platform-aware installation uses the separate platform packages (`packageMode=1`).
+- Published SHA256 prefixes: fallback/Windows `acfeb538…91e7`, Linux `e3e969a7…2a9e`, macOS `eef5aeb1…0fb2`, source `c0c0486b…e9ae`, manifest `a08474fc…a33a`, logo `cea34d58…f424`.
+- Source ZIP is byte-identical to a fresh `git archive` of public tag `v0.1.7` (**881 entries**). Local previews, build outputs, session state and node_modules are excluded.
+- Market publication returned **code=200 / 插件更新成功 / action=updated**. Public read-back confirms `version=0.1.7`, `packageMode=1`, all four package URLs and both icon/logo URLs on v0.1.7, and all three platform support flags enabled. Curated `minOToolsVersion=0.5.0`, `categories=["latest"]`, `screenshots=[]` and `official=0` were preserved.
+- The existing OTools AI service remained running on 29527. No installed-plugin replacement, real-account or paid upstream request, standalone sync or user data migration was performed.
+
+### Local pre-release verification
 
 Version `0.1.7` includes the approved single-screen compact routing layout and corrected offline WorkBuddy/WorkBuddy AI, CodeBuddy CLI, ZCode and Qoder CLI/CN artwork. Detailed evidence is in `docs/validation/2026-11-16-single-screen-traffic.md` and `docs/validation/2026-11-16-official-client-logos.md`.
 
