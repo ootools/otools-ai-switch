@@ -105,6 +105,15 @@ describe("AppLayout", () => {
 
 
 
+  it("gives live routing a bounded content shell without page scrolling", () => {
+    render(<I18nProvider initialLanguage="en"><AppLayout activeScreen="Traffic"
+      onNavigate={vi.fn()} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+      <div>bounded routing board</div>
+    </AppLayout></I18nProvider>);
+    expect(screen.getByText("bounded routing board").parentElement).toHaveClass("h-full", "overflow-hidden", "p-2", "sm:p-3");
+    expect(screen.getByText("bounded routing board").parentElement).not.toHaveClass("overflow-y-auto");
+  });
+
   it("opens live routing independently of account modalities", async () => {
     const navigate = vi.fn();
     render(<I18nProvider initialLanguage="en"><AppLayout activeScreen="Traffic"

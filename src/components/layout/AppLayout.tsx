@@ -510,7 +510,8 @@ export function AppLayout({
 
         <section
           className={`col-start-2 box-border h-full min-h-0 min-w-0 bg-stone-100 ${
-            accountWorkspaceActive || activeScreen === "ClientSetup" ? "overflow-hidden p-0" : "overflow-y-auto p-2 sm:p-3"
+            accountWorkspaceActive || activeScreen === "ClientSetup" ? "overflow-hidden p-0"
+              : activeScreen === "Traffic" ? "overflow-hidden p-2 sm:p-3" : "overflow-y-auto p-2 sm:p-3"
           }`}
         >
           {children}

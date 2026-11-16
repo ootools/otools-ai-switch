@@ -13,14 +13,25 @@ Retrieved/checked 2026-11-15–16. All images are bundled locally; no client log
 | Hermes Agent | [Official site logo](https://raw.githubusercontent.com/NousResearch/hermes-agent/main/website/static/img/logo.png), [MIT license](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE) | `public/brand/hermes-agent.png`, unmodified official website asset. Copyright notice preserved below. |
 | DeepSeek Harness | [Official favicon](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/website/public/favicon.svg), [MIT license](https://github.com/deepseek-ai/deepseek-harness/blob/master/LICENSE), [brand guidelines](https://github.com/deepseek-ai/deepseek-harness/blob/master/BRAND_GUIDELINES.md) | `public/brand/deepseek-harness.svg`, unmodified official project favicon. Identification only, no endorsement implied. |
 | DeepSeek Harness Desktop | [Official desktop icon](https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/apps/desktop/resources/icon.svg), same license/guidelines as above | `public/brand/deepseek-harness-desktop.svg`, unmodified official asset. |
-| ZCode | [Official repository](https://github.com/zai-org/ZCode), [terms](https://zcode.z.ai/cn/terms) | Existing Z monogram retained; no new logo authorization asserted. |
-| WorkBuddy | [Official site](https://www.workbuddy.cn/), [terms §9.3](https://www.workbuddy.cn/document/term) | Existing W monogram retained; terms require consent for Tencent marks. |
-| WorkBuddy AI | [Official site](https://www.workbuddy.ai/), [terms §9.3](https://www.workbuddy.ai/document/term) | Existing W monogram retained for the same reason. |
-| CodeBuddy CLI | [Official site](https://www.codebuddy.ai/), [terms §9.3](https://www.codebuddy.ai/document/term) | Existing CB monogram retained; CLI-specific redistribution permission not established. |
-| Qoder CLI | [Official CLI page](https://qoder.com/cli), [terms](https://qoder.com/product-service) | Existing Q monogram retained; no separate logo redistribution grant established. |
-| Qoder CN CLI | [Official CLI page](https://qoder.com.cn/cli), [user agreement](https://terms.alicdn.com/legal-agreement/terms/c_platform_service_agreement/20231023213402278/20231023213402278.html) | Existing Q monogram retained. |
+| ZCode | [Official pinned icon](https://raw.githubusercontent.com/zai-org/ZCode/fec975905a2abd4c07e35c40d51fa097a2258ec9/public/logo/icons/128x128.png), [LICENSE](https://github.com/zai-org/ZCode/blob/fec975905a2abd4c07e35c40d51fa097a2258ec9/LICENSE), [NOTICE](https://github.com/zai-org/ZCode/blob/fec975905a2abd4c07e35c40d51fa097a2258ec9/NOTICE.md) | `public/brand/zcode.png`, unmodified 128px official application icon, not a font monogram. Exact upstream license/notice bundled in `LICENSES/ZCode-*`. |
+| WorkBuddy | [Official homepage favicon](https://assets.workbuddy.cn/web/workbuddy/8e036eb06f87c6b08437546b3cbd58e60af45b10/assets/logo.svg), [terms §9.3](https://www.workbuddy.cn/document/term) | `public/brand/workbuddy.svg`, unmodified green Buddy symbol from the homepage's `rel=icon`. |
+| WorkBuddy AI | [Official homepage favicon](https://download.codebuddy.ai/web/workbuddy/05fd33c3609bc9cf5ae1fc387a142a2ad0fab64e/assets/logo.svg), [terms §9.3](https://www.workbuddy.ai/document/term) | The official AI and CN favicon files are byte-identical; shares `public/brand/workbuddy.svg`. |
+| CodeBuddy CLI | [Official CLI page](https://www.codebuddy.ai/cli), [its favicon](https://codebuddy-1328495429.cos.accelerate.myqcloud.com/web/ide/logo.svg), [terms §9.3](https://www.codebuddy.ai/document/term) | `public/brand/codebuddy.svg`, the original purple Buddy symbol explicitly used by the official CLI page. Not a recolored WorkBuddy icon or CB monogram. |
+| Qoder CLI | [Official CLI page](https://qoder.com/cli), [official favicon](https://qoder.com/favIcon.svg), [terms](https://qoder.com/product-service) | `public/brand/qoder.svg`, unmodified official square icon with interlocking emblem. The favicon path is case-sensitive. |
+| Qoder CN CLI | [Official CLI page](https://qoder.com.cn/cli), [official favicon](https://qoder.com.cn/favIcon.svg), [user agreement](https://terms.alicdn.com/legal-agreement/terms/c_platform_service_agreement/20231023213402278/20231023213402278.html) | CN and international originals are byte-identical; shares `public/brand/qoder.svg`. |
 
-A software license is not a general trademark authorization. The new project assets above are used unmodified for identification under their project distribution licenses; users should not infer official sponsorship. Restricted vendor marks remain fallbacks rather than being copied from third-party icon aggregators.
+The WorkBuddy/CodeBuddy, ZCode and Qoder source checks above were repeated on 2026-11-16 after the reported logo mismatch. Previously the application displayed W/CB/Z/Q placeholders for these clients; those placeholders are not official artwork. The corrected assets identify the named third-party client only, without recoloring, redesign or endorsement claims. Unknown clients still use a neutral fallback.
+
+Official provenance is not a blanket trademark or redistribution grant. Tencent's quoted terms §9.3 require prior written consent for Tencent Logos and do not explicitly state an identification exception; Qoder reserves rights not expressly granted; Apache-2.0 does not grant general trademark rights. No consent, affiliation or broad permission is asserted here. The original source links and relevant terms are retained for distribution review.
+
+## Verified official-asset hashes
+
+| Local file | SHA-256 |
+|---|---|
+| `workbuddy.svg` | `10ccbc099e7bc3d5ff12c315c4edd7b21386aa7166c1ec19997b3d55010d5c7d` |
+| `codebuddy.svg` | `149baa45b9f9370c15f20d599afe381aa138e4fc13acf503f435c571ac93ecf5` |
+| `zcode.png` | `1ec553f7eaeae4492c673e9d636692a3898d11800d912628d8c1e667222d6d19` |
+| `qoder.svg` | `5e1843cb50c4613855024453e76d5c06d2ca5562efebc12b4fcd80cf9ece1dd0` |
 
 ## MIT notices for bundled official project assets
 

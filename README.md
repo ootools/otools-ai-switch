@@ -46,9 +46,9 @@ node scripts/verify-plugin.mjs
 
 Native 默认构建 release 库并复制到 `lib/Windows.dll`、`lib/macOS.dylib` 或 `lib/Linux.so`。交叉编译可传 `--target <Rust target>`，需要自行安装对应工具链。烟测默认加载 Windows 库；其他平台通过 `--library lib/Linux.so` 等指定。
 
-`dist-pack/otools-ai-switch-0.1.6.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
+`dist-pack/otools-ai-switch-0.1.7.oplg` 是 ZIP 格式的插件安装包，旁边提供 `SHA256SUMS`。打包必须先有前端 `dist/` 和至少一个平台的 native 库；缺少后端时会拒绝生成不能工作的前端空包，并检查入口 HTML 引用的静态资源是否随包提供。
 
-分平台包用 `--suffix <platform>` 命名，例如 `node scripts/pack-plugin.mjs --suffix windows` 生成 `otools-ai-switch-0.1.6-windows.oplg`；校验时传同样的 `--suffix`，并可加 `--expect-library lib/Windows.dll` 强制断言包里**只含这一个** native 库。`SHA256SUMS` 会按实际包名生成。市场上的 `packageMode=1` 即依赖这三个单平台包，客户端优先下载平台包、失败才回退不带后缀的合包。
+分平台包用 `--suffix <platform>` 命名，例如 `node scripts/pack-plugin.mjs --suffix windows` 生成 `otools-ai-switch-0.1.7-windows.oplg`；校验时传同样的 `--suffix`，并可加 `--expect-library lib/Windows.dll` 强制断言包里**只含这一个** native 库。`SHA256SUMS` 会按实际包名生成。市场上的 `packageMode=1` 即依赖这三个单平台包，客户端优先下载平台包、失败才回退不带后缀的合包。
 
 `.github/workflows/build-plugin.yml` 提供 Windows x64、Linux x64、macOS ARM64 的分别构建和制品校验配置，不自动发布。每个 matrix job 只构建自己那一个 native 库，打包时带平台后缀并用 `--expect-library` 阻断多平台库混入。macOS 目前只有 ARM64 构建。CI 配置存在不代表这些平台已在当前工作区验证。
 
@@ -64,13 +64,13 @@ Native 默认构建 release 库并复制到 `lib/Windows.dll`、`lib/macOS.dylib
 
 ### 实时路由可视化
 
-账号池顶部工具栏的「实时路由」或侧栏同名入口打开三栏视图：Agent 客户端 → AI Switch 网关 → 当前账号池。展示账号按当前上游并发排序，空闲账号补足到 12 个（不足时显示全部）；真实请求用客户端颜色的移动光点表示，空闲时保留淡色静态虚线，无动画。
+账号池顶部工具栏的「实时路由」或侧栏同名入口打开三栏视图：Agent 客户端 → AI Switch 网关 → 当前账号池。采用单屏紧凑布局，900×600 下默认侧栏展开时可同屏显示 15 个客户端、12 条账号和网关；主图不横向滚动，也不随账号数量无限长高。账号按当前上游并发排序，空闲账号补足到 12 个（不足时显示全部）。更多节点通过「＋N」查看完整列表，额外活跃项单独标出数量；选择列表节点可在主图定位其真实关系。真实请求用客户端颜色的移动光点表示，空闲时保留淡色静态虚线，无动画。点击节点高亮关系，说明和错误详情通过按钮打开，不占用主图高度。
 
 页面顶部提供「模拟流量／停止模拟」按钮。模拟仅在当前页面本地生成连线、光点和变化的并发数，明确显示「模拟模式」，不发送真实请求、不记录日志或用量、不产生上游费用。没有账号或 native 服务未连接时，会补充演示客户端和 12 个演示账号。真实流量仍独立更新；停止模拟后立即恢复最新实时状态。模拟状态不保存，离开页面即结束。
 
 写入客户端配置时，使用 `sk-ai-switch-<base>.<client_key>` 格式，例如 `.zcode`、`.workbuddy`、`.codex`。数据库中的平台 Key 与轮换别名保持原样。已有无后缀 Key 仍有效，但来源显示为「未识别客户端」；重新写入一次客户端配置即可启用识别。后缀是调用方声明的来源标签，**不是独立权限或强身份验证**；知道 base Key 的调用方可以更改来源标签。
 
-活动视图记录每次实际发出的上游请求，结束、取消、重试及续写换号时同步更新；页面可见时每 3 秒用后端内存快照对账，修复宿主有界事件队列可能漏掉的结束事件。可视化只读取脱敏账号摘要和成员 ID，不加载账号凭据、配置或请求历史。图标离线随包；未取得明确再分发许可的第三方厂商品牌保留字标回退，来源记录见 `src/components/brand/agent-logo-sources.md`。
+活动视图记录每次实际发出的上游请求，结束、取消、重试及续写换号时同步更新；页面可见时每 3 秒用后端内存快照对账，修复宿主有界事件队列可能漏掉的结束事件。可视化只读取脱敏账号摘要和成员 ID，不加载账号凭据、配置或请求历史。图标离线随包；WorkBuddy／WorkBuddy AI、CodeBuddy CLI、ZCode、Qoder 两个版本使用核对过的官方原始图标，未知客户端才使用字标回退；来源与品牌使用说明见 `src/components/brand/agent-logo-sources.md`。
 
 ### 上游在 HTTP 200 流内才报错时
 

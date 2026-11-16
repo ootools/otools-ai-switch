@@ -81,6 +81,7 @@ export function buildTrafficModel(catalog: TrafficCatalog, active: ActiveProxyAt
       .map((client) => ({ ...client, active_count: clientRequests.get(client.client_key)?.size ?? 0 }))
       .sort((a, b) => b.active_count - a.active_count || a.display_name.localeCompare(b.display_name)),
     accounts: sortedAccounts.slice(0, Math.max(MIN_TRAFFIC_ACCOUNTS, busy)),
+    all_accounts: sortedAccounts,
     edges: [...edges.values()],
     total_attempts: active.length,
     total_accounts: accounts.size,

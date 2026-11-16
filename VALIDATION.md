@@ -2,6 +2,18 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
+## v0.1.7 release preparation
+
+Version `0.1.7` includes the approved single-screen compact routing layout and corrected offline WorkBuddy/WorkBuddy AI, CodeBuddy CLI, ZCode and Qoder CLI/CN artwork. Detailed evidence is in `docs/validation/2026-11-16-single-screen-traffic.md` and `docs/validation/2026-11-16-official-client-logos.md`.
+
+- Release-version frontend full suite: **81 files / 949 tests passed**; typecheck, production build and packaging regressions **5/5** passed.
+- Release-version native serial library suite: **2009 passed / 0 failed / 6 preexisting ignored**, no filtered tests. Plugin boundary tests **4/4** passed. Native logic is unchanged; manifests and the native package version are aligned at `0.1.7`.
+- Windows release library rebuilt/staged at **26.71 MiB**; Nano Banana integration tests **2/2** passed against it using temporary storage and a local mock upstream.
+- Local v0.1.7 package: **23 entries**, CRC/SHA256/relative assets/Windows native boundary/panel manifest verified. All four newly bundled official artwork files match their original hashes inside `dist/brand/`; both ZCode license/notice files are included.
+- Actual component acceptance at 900×600 with the default 216px sidebar confirms 15 clients / 12 accounts, a bounded gateway and no main horizontal/vertical overflow. Extra busy nodes remain in complete dialogs with explicit counts and exact-node reveal controls. Reviewed dynamic geometry/selection findings were reproduced and fixed before the final implementation suite.
+- Local listener smoke/autostart tests were not run because the existing OTools service is using 29527; the service was not stopped. Those checks remain required on all three clean CI runners before publication.
+- Existing native unused-code/import and OCRAD/eval/chunk-size warnings remain. No real credentials, paid upstream calls, installed-plugin replacement or standalone sync occurred during local preparation. Session-only files and build/preview artifacts are excluded from public sources.
+
 ## v0.1.6 release verification
 
 Released 2026-11-16 from commit `dda8943`, annotated tag `v0.1.6`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.6> is public, non-draft, non-prerelease and the latest release, with all **8 assets uploaded**. Release body matches `docs/releases/0.1.6.md`; downloaded `plugin.json` and `SHA256SUMS` match the publication files byte-for-byte. GitHub's asset digests match the published checksum list.

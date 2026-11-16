@@ -76,6 +76,12 @@ describe("traffic state", () => {
     expect(model.accounts.map((row) => row.id)).toEqual(["one", "two"]);
   });
 
+  it("retains all sorted account summaries for overflow without changing the default twelve rows", () => {
+    const model = buildTrafficModel(catalog, []);
+    expect(model.accounts).toHaveLength(12);
+    expect(model.all_accounts.map((row) => row.id)).toEqual(["13", "12", "11", "10", "9", "8", "7", "6", "5", "4", "3", "2", "1", "0"]);
+  });
+
   it("keeps idle nodes with zero activity and no animated edges", () => {
     const model = buildTrafficModel(catalog, []);
     expect(model.accounts).toHaveLength(12);

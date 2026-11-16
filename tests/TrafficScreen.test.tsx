@@ -60,6 +60,67 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe("TrafficScreen", () => {
+  it("shows the complete account pool in an overflow dialog without growing the twelve-row board", async () => {
+    vi.mocked(listRouteProxyAccountSummaries).mockResolvedValue(Array.from({ length: 14 }, (_, i) => ({
+      id: `account-${i}`, platform: "codex", display_name: `Account ${i}`, kind: "api", status: "ok",
+      route_priority: i, max_concurrency: 4, active_request_count: 0,
+    })));
+    vi.mocked(getRouteProxyPoolMemberIds).mockResolvedValue(Array.from({ length: 14 }, (_, i) => `account-${i}`));
+    const { container } = mount();
+    const more = await screen.findByRole("button", { name: "View all 14 accounts" });
+    expect(screen.getAllByTestId("traffic-account")).toHaveLength(12);
+    expect(container.querySelector(".traffic-network")?.getAttribute("style") ?? "").not.toMatch(/height:/);
+    fireEvent.click(more);
+    const dialog = screen.getByRole("dialog", { name: "Account pool" });
+    expect(within(dialog).getByRole("button", { name: "Account 13" })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Account 13" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("traffic-account")).toHaveLength(12);
+    expect(screen.getByRole("button", { name: "Account 13" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("reports extra busy accounts without losing total attempts or inventing hidden edges", async () => {
+    vi.mocked(listRouteProxyAccountSummaries).mockResolvedValue(Array.from({ length: 14 }, (_, i) => ({
+      id: `account-${i}`, platform: "codex", display_name: `Account ${i}`, kind: "api", status: "ok",
+      route_priority: i, max_concurrency: 4, active_request_count: 0,
+    })));
+    vi.mocked(getRouteProxyPoolMemberIds).mockResolvedValue(Array.from({ length: 14 }, (_, i) => `account-${i}`));
+    vi.mocked(getRouteProxyActiveAttempts).mockResolvedValue(snap(14, Array.from({ length: 14 }, (_, i) => ({
+      ...attempt, request_id: `request-${i}`, attempt_id: `attempt-${i}`, credential_id: `account-${i}`, credential_name: `Account ${i}`,
+    }))));
+    const { container } = mount();
+    await screen.findByText("2 active off-screen");
+    expect(screen.getAllByTestId("traffic-account")).toHaveLength(12);
+    const hub = screen.getByRole("heading", { name: "AI Switch" }).parentElement!;
+    expect(within(hub).getByText("in flight").parentElement).toHaveTextContent("14");
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Account 13" })).not.toBeInTheDocument());
+    expect(container.querySelector("[data-active-pair='zcode:account-13']")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View all 14 accounts" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Account 13" }));
+    expect(container.querySelector("[data-active-pair='zcode:account-13']")).toBeInTheDocument();
+  });
+
+  it("highlights a selected client relationship and clears emphasis with Escape", async () => {
+    vi.mocked(getRouteProxyActiveAttempts).mockResolvedValue(snap(2, [attempt, {
+      ...attempt, request_id: "workbuddy-request", attempt_id: "workbuddy-attempt", client_key: "workbuddy", credential_id: "account-7", credential_name: "Account 7",
+    }]));
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelector("[data-active-pair='workbuddy:account-7']")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "ZCode" }));
+    expect(container.querySelector("[data-active-pair='workbuddy:account-7']")).toHaveClass("traffic-flow-muted");
+    expect(container.querySelector("[data-active-pair='zcode:account-6']")).not.toHaveClass("traffic-flow-muted");
+    fireEvent.keyDown(screen.getByRole("button", { name: "ZCode" }), { key: "Escape" });
+    expect(container.querySelectorAll(".traffic-flow-muted")).toHaveLength(0);
+  });
+
+  it("moves the legacy-key explanation into an accessible help dialog", async () => {
+    mount();
+    await screen.findByText("WorkBuddy");
+    expect(screen.queryByText(/Rewrite a client's config once/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Routing help" }));
+    expect(within(screen.getByRole("dialog", { name: "Routing help" })).getByText(/Rewrite a client's config once/)).toBeInTheDocument();
+  });
+
   it("shows twelve accounts when the pool has enough members", async () => {
     vi.mocked(listRouteProxyAccountSummaries).mockResolvedValue(Array.from({ length: 14 }, (_, i) => ({
       id: `account-${i}`, platform: "codex", display_name: `Account ${i}`, kind: "api", status: "ok",
@@ -267,6 +328,25 @@ describe("TrafficScreen", () => {
     expect(container.querySelector("[data-active-pair='zcode:account-6']")).toBeInTheDocument();
   });
 
+  it("clears selection when an active non-pool account disappears rather than reselecting it later", async () => {
+    vi.mocked(listRouteProxyAccountSummaries).mockResolvedValue([{
+      id: "outside-account", platform: "codex", display_name: "External account", kind: "api", status: "ok",
+      route_priority: 7, max_concurrency: 5, active_request_count: 0,
+    }]);
+    vi.mocked(getRouteProxyPoolMemberIds).mockResolvedValue([]);
+    const external = { ...attempt, credential_id: "outside-account", credential_name: "External account" };
+    vi.mocked(getRouteProxyActiveAttempts).mockResolvedValue(snap(1, [external]));
+    mount();
+    const account = await screen.findByRole("button", { name: "External account" });
+    fireEvent.click(account);
+    expect(account).toHaveAttribute("aria-pressed", "true");
+    act(() => onEvent?.({ epoch: "test-runtime", sequence: 2, action: "finished", attempt: external }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "External account" })).not.toBeInTheDocument());
+    act(() => onEvent?.({ epoch: "test-runtime", sequence: 3, action: "started", attempt: { ...external, request_id: "next-request", attempt_id: "next-attempt" } }));
+    expect(await screen.findByRole("button", { name: "External account" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByText("Selected: External account")).not.toBeInTheDocument();
+  });
+
   it("preserves known account metadata for active requests outside the current pool", async () => {
     vi.mocked(listRouteProxyAccountSummaries).mockResolvedValue([{
       id: "outside-account", platform: "codex", display_name: "Known external account", kind: "official",
@@ -278,7 +358,7 @@ describe("TrafficScreen", () => {
     }]));
     mount();
     const account = await screen.findByTestId("traffic-account");
-    await waitFor(() => expect(account).toHaveTextContent("P7"));
+    await waitFor(() => expect(account).toHaveAttribute("title", expect.stringContaining("P7")));
     expect(account).toHaveTextContent("/ 13");
   });
 
