@@ -404,7 +404,8 @@ async fn resolve_video_platform(
     };
     let key = crate::services::route_proxy_service::extract_inbound_api_key(headers, query)
         .ok_or_else(unauthorized)?;
-    let platform = RouteProxyKeyRepository::get_platform_by_key(pool, &key)
+    let (base, _) = crate::services::route_proxy_service::split_route_proxy_client_key(&key);
+    let platform = RouteProxyKeyRepository::get_platform_by_key(pool, base)
         .await
         .map_err(app_error_response)?
         .ok_or_else(unauthorized)?;
@@ -886,6 +887,11 @@ mod tests {
                 .as_deref(),
             Some("codex")
         );
+
+        for (suffixed, accepted) in [(format!("{key}.zcode"), true), (format!("{key}.not_a_client"), false)] {
+            headers.insert(AUTHORIZATION, format!("Bearer {suffixed}").parse().unwrap());
+            assert_eq!(resolve_video_platform(&pool, &headers, None, b"{}").await.is_ok(), accepted);
+        }
 
         // 无效 key 且没有头/体字段 → 拒绝
         let mut bogus = HeaderMap::new();

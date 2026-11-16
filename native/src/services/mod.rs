@@ -44,6 +44,7 @@ pub(crate) mod route_pool_model_mode;
 pub mod route_pool_service;
 pub mod route_preview_service;
 pub mod route_protocol_bridge;
+pub mod route_proxy_active_attempts;
 pub mod route_proxy_diagnostics_service;
 pub mod route_proxy_https_service;
 pub mod route_proxy_https_trust;

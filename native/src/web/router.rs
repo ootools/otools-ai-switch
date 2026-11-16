@@ -1,7 +1,7 @@
 use crate::app_state::AppState;
 use crate::services::route_proxy_service::{
     build_proxy_state, extract_inbound_api_key, is_shared_model_api_path, is_video_generation_path,
-    proxy_handler, ProxyAppState,
+    proxy_handler, split_route_proxy_client_key, ProxyAppState,
 };
 use axum::{
     body::Body,
@@ -95,6 +95,29 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
     #[tokio::test]
+    async fn client_suffixes_authenticate_at_the_production_router_but_unknown_suffixes_do_not() {
+        let pool = crate::database::create_memory_pool().await.unwrap();
+        crate::database::run_migrations(&pool).await.unwrap();
+        crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository::ensure_platform_key(&pool, "codex", "sk-router-fixture").await.unwrap();
+        let state = Arc::new(AppState {
+            pool, paths: crate::paths::AppPaths::from_data_dir(std::env::temp_dir().join("router-client-key")),
+            config_writes: Default::default(), deeplink_protocols: Default::default(),
+            close_to_tray: Default::default(), route_proxy: Default::default(), event_broadcaster: Default::default(),
+        });
+        let app = build_ai_router(state);
+        for (key, expected) in [
+            ("sk-router-fixture", 200), ("sk-router-fixture.zcode", 200),
+            ("sk-router-fixture.codex", 200), ("sk-router-fixture.not_a_client", 401),
+            ("sk-router-fixture.", 401), ("wrong-key.zcode", 401),
+        ] {
+            let response = app.clone().oneshot(axum::http::Request::builder().uri("/v1/models")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{key}");
+        }
+    }
+
+    #[tokio::test]
     async fn browser_preflight_is_allowed_but_management_and_non_model_apis_are_not() {
         let pool = crate::database::create_memory_pool().await.unwrap();
         crate::database::run_migrations(&pool).await.unwrap();
@@ -158,7 +181,10 @@ async fn ai_request(
     };
     if !key
         .as_ref()
-        .is_some_and(|key| keys.iter().any(|(stored, _)| stored == key))
+        .is_some_and(|key| {
+            let (base, _) = split_route_proxy_client_key(key);
+            keys.iter().any(|(stored, _)| stored == base)
+        })
     {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error":{"code":"invalid_api_key","message":"A valid local API key is required"}}))).into_response();
     }

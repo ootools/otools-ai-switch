@@ -395,12 +395,14 @@ function renderScreen(
   queryClient = createQueryClient(),
   capabilityFilter?: string,
   onOpenClientSetup: (platform: string, clientKey?: string) => void = vi.fn(),
+  onOpenTraffic?: () => void,
 ) {
   const result = render(
     <QueryClientProvider client={queryClient}>
       <AccountsScreen
         capabilityFilter={capabilityFilter}
         onOpenClientSetup={onOpenClientSetup}
+        onOpenTraffic={onOpenTraffic}
         platform={platform}
         sidebarCollapsed={sidebarCollapsed}
       />
@@ -529,6 +531,16 @@ function dispatchPointerEvent(
 }
 
 describe("AccountsScreen", () => {
+  it("opens live routing from the top pool toolbar even while the service is idle", async () => {
+    const openTraffic = vi.fn();
+    renderScreen("codex", "in_pool", false, createQueryClient(), undefined, vi.fn(), openTraffic);
+    const toolbar = screen.getByRole("group", { name: "算力池操作" });
+    const button = within(toolbar).getByRole("button", { name: "实时路由" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(openTraffic).toHaveBeenCalledOnce();
+  });
+
   it("直连首次说明取消时不写入任何客户端", async () => {
     renderScreen();
     await userEvent.click(await screen.findByRole("button", { name: "启用 Team Account 的直连模式" }));

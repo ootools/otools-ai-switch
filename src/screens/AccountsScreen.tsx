@@ -26,6 +26,7 @@ import {
   List,
   MessageSquareText,
   MoreVertical,
+  Network,
   Package,
   Play,
   Plug,
@@ -699,6 +700,7 @@ type AccountsScreenProps = {
   onPoolScopeFocusConsumed?: (nonce: number) => void;
   /** 工具栏「写入配置」：跳到客户端接入页（可带直连恢复预选的客户端）。 */
   onOpenClientSetup?: (platform: string, clientKey?: string) => void;
+  onOpenTraffic?: () => void;
   onProviderFilterFocusConsumed?: (nonce: number) => void;
   providerFilterFocus?: { provider: string; nonce: number } | null;
   poolScopeFocus?: {
@@ -3450,6 +3452,7 @@ export function AccountsScreen({
   sidebarCollapsed = false,
   onPoolScopeFocusConsumed,
   onOpenClientSetup,
+  onOpenTraffic,
   onProviderFilterFocusConsumed,
   providerFilterFocus = null,
   poolScopeFocus = null,
@@ -6683,6 +6686,17 @@ export function AccountsScreen({
             </div>
 
             <div aria-label="算力池操作" role="group" className="flex shrink-0 items-center gap-1 sm:gap-2">
+              {!mediaView && onOpenTraffic ? (
+                <button
+                  aria-label="实时路由"
+                  className="grid h-6 w-6 shrink-0 place-items-center border border-stone-300 bg-white text-indigo-600 motion-control hover:bg-stone-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                  onClick={onOpenTraffic}
+                  title="实时路由：查看客户端与账号调用关系"
+                  type="button"
+                >
+                  <Network aria-hidden="true" className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
               {!mediaView && activePlatform === "codex" ? (
                 <button
                   aria-label="配置 Codex 基线模型"

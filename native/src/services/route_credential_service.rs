@@ -11,7 +11,7 @@ use crate::models::route_credential::{
     AccountProvider, CopyRouteCredentialInput, CreateApiRouteCredentialInput, ImportOfficialFilesInput,
     ImportOfficialTextInput, ModelMapping, ReorderRouteCredentialInput, RouteCredential,
     RouteCredentialFailurePolicy, RouteCredentialImportFailure, RouteCredentialImportResult,
-    RouteCredentialPage, RouteCredentialPageRequest, UpdateRouteCredentialInput,
+    RouteCredentialPage, RouteCredentialPageRequest, RouteProxyAccountSummary, UpdateRouteCredentialInput,
     MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS,
 };
 use crate::models::route_credential_model::{
@@ -49,6 +49,20 @@ enum ParsedBatchCredential {
 }
 
 impl RouteCredentialService {
+    pub async fn list_summaries(
+        pool: &SqlitePool,
+        activity: &RouteCredentialActivityRegistry,
+        platform: &str,
+    ) -> Result<Vec<RouteProxyAccountSummary>, AppError> {
+        let platform = PlatformId::parse(platform)?;
+        PlatformCapabilityService::require(platform, PlatformOperation::RouteCredentials)?;
+        let mut accounts = RouteCredentialRepository::list_summaries(pool).await?;
+        for account in &mut accounts {
+            account.active_request_count = activity.snapshot(&account.id);
+        }
+        Ok(accounts)
+    }
+
     pub async fn list(
         pool: &SqlitePool,
         platform: String,

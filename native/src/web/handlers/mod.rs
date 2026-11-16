@@ -611,6 +611,11 @@ pub async fn dispatch_command(
                     .map_err(|message| command_error("web.session_read", message))?,
             )
         }
+        "list_route_proxy_account_summaries" => {
+            let platform = required_string_arg(&args, "platform")?;
+            to_value(RouteCredentialService::list_summaries(&state.pool, &state.route_proxy.activity(), &platform)
+                .await.map_err(to_error)?)
+        }
         "list_route_credentials" => {
             let platform = required_string_arg(&args, "platform")?;
             let activity = state.route_proxy.activity();
@@ -940,6 +945,11 @@ pub async fn dispatch_command(
                     .map_err(to_error)?,
             )
         }
+        "get_route_proxy_pool_member_ids" => to_value(
+            crate::database::repositories::route_pool_repository::RoutePoolRepository::list_member_ids(&state.pool, "codex")
+                .await.map_err(to_error)?,
+        ),
+        "get_route_proxy_active_attempts" => to_value(state.route_proxy.active_attempts().snapshot()),
         "subscribe_route_proxy_live_log" => {
             let platform = required_string_arg(&args, "platform")?;
             to_value(state.route_proxy.live_log().subscribe(&platform))
@@ -973,11 +983,12 @@ pub async fn dispatch_command(
                     None
                 };
                 to_value(
-                    RouteModelTestService::test_model_through_proxy_with_root_certificate(
+                    RouteModelTestService::test_model_through_proxy_with_activity(
                         &state.pool,
                         request,
                         &base_url,
                         root_certificate_pem.as_deref(),
+                        Some(&state.route_proxy.active_attempts()),
                     )
                     .await
                     .map_err(to_error)?,
@@ -1736,6 +1747,62 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, "codex_oauth.session_not_found");
         }
+    }
+
+    #[tokio::test]
+    async fn traffic_pool_member_ids_do_not_include_history_or_credential_payloads() {
+        let fixture = test_state().await;
+        let credential = dispatch_command(fixture.state.clone(), "create_api_route_credential", json!({"input":{
+            "platform":"codex", "display_name":"Pool fixture", "api_key":"sk-hidden-fixture",
+            "base_url":"https://example.invalid/v1", "interface_format":"openai", "model_mappings_json":"[]"
+        }})).await.unwrap();
+        dispatch_command(fixture.state.clone(), "set_route_pool_members", json!({"input":{
+            "platform":"codex", "account_ids":[credential["id"]]
+        }})).await.unwrap();
+        let result = dispatch_command(fixture.state, "get_route_proxy_pool_member_ids", json!({})).await.unwrap();
+        assert_eq!(result, json!([credential["id"]]));
+    }
+
+    #[tokio::test]
+    async fn traffic_account_summaries_exclude_credentials_and_include_current_concurrency() {
+        let fixture = test_state().await;
+        let credential = dispatch_command(fixture.state.clone(), "create_api_route_credential", json!({"input":{
+            "platform":"codex", "display_name":"Summary Account", "api_key":"sk-DO-NOT-EXPOSE",
+            "base_url":"https://example.invalid/v1", "interface_format":"openai", "model_mappings_json":"[]"
+        }})).await.unwrap();
+        let id = credential["id"].as_str().unwrap();
+        let lease = fixture.state.route_proxy.activity().try_acquire("codex", id, 3).await.unwrap();
+        let result = dispatch_command(fixture.state.clone(), "list_route_proxy_account_summaries", json!({"platform":"codex"})).await.unwrap();
+        let row = &result.as_array().unwrap()[0];
+        assert_eq!(row["active_request_count"], 1);
+        assert_eq!(row["display_name"], "Summary Account");
+        assert_eq!(row.as_object().unwrap().len(), 8);
+        for field in ["secret_payload_json", "config_json", "preview_json", "model_states", "email", "quota_remaining"] {
+            assert!(row.get(field).is_none(), "unexpected {field}");
+        }
+        assert!(!result.to_string().contains("sk-DO-NOT-EXPOSE"));
+        drop(lease);
+        let result = dispatch_command(fixture.state.clone(), "list_route_proxy_account_summaries", json!({"platform":"claude"})).await.unwrap();
+        assert_eq!(result[0]["active_request_count"], 0);
+        assert!(dispatch_command(fixture.state.clone(), "list_route_proxy_account_summaries", json!({"platform":"not-real"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_active_attempt_snapshot_is_read_only_and_survives_without_a_viewer() {
+        let fixture = test_state().await;
+        let registry = fixture.state.route_proxy.active_attempts();
+        let guard = registry.begin("request-fixture", "codex", Some("zcode"), "account-fixture", "Account");
+        let result = dispatch_command(fixture.state.clone(), "get_route_proxy_active_attempts", json!({}))
+            .await.expect("snapshot command");
+        assert_eq!(result["active"][0]["client_key"], "zcode");
+        assert_eq!(result["active"][0]["credential_id"], "account-fixture");
+        assert!(result["epoch"].is_string());
+        assert!(crate::database::repositories::route_proxy_key_repository::RouteProxyKeyRepository::list_all(&fixture.state.pool).await.unwrap().is_empty());
+        drop(guard);
+        let result = dispatch_command(fixture.state.clone(), "get_route_proxy_active_attempts", json!({}))
+            .await.expect("empty snapshot");
+        assert!(result["active"].as_array().unwrap().is_empty());
+        assert!(!RouteProxyService::status(&fixture.state.route_proxy).await.running);
     }
 
     #[tokio::test]

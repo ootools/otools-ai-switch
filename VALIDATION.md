@@ -2,6 +2,18 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
+## v0.1.6 release preparation
+
+Version `0.1.6` includes live client-to-gateway-to-account routing visualization, per-client gateway-key suffix attribution, page-local simulation, twelve-account idle fill, the pinned client-setup write footer, hidden-by-default account-provider badges and the 100 retries / 500 ms capacity preset. Detailed implementation evidence is in `docs/validation/2026-11-16-live-routing.md` and `docs/validation/2026-11-16-client-setup-footer.md`.
+
+- Release-version frontend regression: **78 files / 919 tests passed**; typecheck, production build and packaging regression tests **5/5** passed.
+- Release-version native serial library suite: **2009 passed / 0 failed / 6 preexisting ignored**, no filtered tests. Test-only listeners use ephemeral ports; the production default remains 29527. Plugin boundary tests **4/4** passed.
+- Windows release native library rebuilt/staged at **26.71 MiB**. Nano Banana native integration tests **2/2** passed against it with local mock upstreams and temporary storage.
+- Local release package `artifacts/release-0.1.6-local/otools-ai-switch-0.1.6.oplg`: **17 entries**, CRC/SHA256/relative assets/native-library boundary/panel manifest verified.
+- Local listener smoke and autostart tests were **not run**, because the existing OTools service is using 29527. It was not stopped; these checks are required on the clean three-platform CI runners before publication.
+- Existing OCRAD/browser externalization/eval/chunk-size and native unused-code/import warnings remain. No real credentials, paid upstream requests, installed plugin replacement or standalone data migration were used in local validation.
+- Session-only `.zcode/` files and ignored build/test artifacts are excluded from publication. New bundled official project artwork includes its third-party license notices.
+
 ## v0.1.5: account-list toolbar rework
 
 Frontend-only change (commit `a91d554`, release commit `2842545`): the account-source filter moved to the left of the filter row with the batch/account filter box on the right and a tighter gap to the compute-pool strip; the list/card switch moved from the toolbar into the refresh dropdown's 「展示模式」 group; and the account list gained a header whose single checkbox replaces the 全选 / 反选 buttons, with an `indeterminate` mid-state.

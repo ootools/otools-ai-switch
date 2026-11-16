@@ -40,6 +40,30 @@ describe("AppLayout", () => {
     (window as Window & { innerWidth: number }).innerWidth = 1024;
   });
 
+  it("lets client setup own scrolling without moving its write footer with the page", () => {
+    const props = { onNavigate: vi.fn(), onToggleSidebar: vi.fn(), sidebarCollapsed: false };
+    const { rerender } = render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="ClientSetup" {...props}>
+          <div>client settings</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+    const content = screen.getByText("client settings").parentElement;
+    expect(content).toHaveClass("h-full", "overflow-hidden", "p-0");
+    expect(content).not.toHaveClass("overflow-y-auto");
+    expect(screen.getByTestId("app-sidebar")).not.toContainElement(screen.getByText("client settings"));
+
+    rerender(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="About" {...props}>
+          <div>about content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+    expect(screen.getByText("about content").parentElement).toHaveClass("overflow-y-auto", "p-2", "sm:p-3");
+  });
+
   it("shows five independent account modalities instead of agent platforms", () => {
     window.localStorage.setItem("ai-switch.agent-visibility", JSON.stringify({ codex: false, claude: false }));
     render(
@@ -80,6 +104,18 @@ describe("AppLayout", () => {
   });
 
 
+
+  it("opens live routing independently of account modalities", async () => {
+    const navigate = vi.fn();
+    render(<I18nProvider initialLanguage="en"><AppLayout activeScreen="Traffic"
+      onNavigate={navigate} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+      <div>traffic view</div>
+    </AppLayout></I18nProvider>);
+    const button = screen.getByRole("button", { name: "Live routing" });
+    expect(button).toHaveAttribute("aria-current", "page");
+    await userEvent.click(button);
+    expect(navigate).toHaveBeenCalledWith("Traffic");
+  });
 
   it("renders system utility nav entries and navigates to their screens", async () => {
     const onNavigate = vi.fn();

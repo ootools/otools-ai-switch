@@ -1,5 +1,19 @@
 # Third-Party Notices
 
+## Agent identification artwork
+
+DeepSeek Harness website/favicon and desktop icons are bundled unmodified from
+[deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
+under the MIT license (Copyright (c) 2026 DeepSeek).
+The Hermes Agent website logo is bundled unmodified from
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
+under the MIT license (Copyright (c) 2025 Nous Research).
+
+See `LICENSES/deepseek-harness-MIT.txt` and `LICENSES/hermes-agent-MIT.txt` for
+exact upstream license notices. These logos identify clients in the interface;
+they do not imply sponsorship or endorsement. Source and vendor-mark fallback
+notes are recorded in `src/components/brand/agent-logo-sources.md`.
+
 ## codeg MCP and Skills implementation
 
 Parts of the MCP and Skills settings implementation are derived from and adapted from:

@@ -33,6 +33,7 @@ import { MotionPage, MotionProvider, type MotionDirection } from "./components/m
 import { ImageGenerationScreen } from "./imagegen/ImageGenerationScreen";
 import { ClientSetupScreen, type ClientSetupFocus } from "./screens/ClientSetupScreen";
 import { CodexChannelsScreen } from "./screens/CodexChannelsScreen";
+import { TrafficScreen } from "./screens/TrafficScreen";
 
 const queryClient = createQueryClient();
 
@@ -53,6 +54,7 @@ const implementedScreens = new Set([
   "MCP",
   "Skills",
   "Stats",
+  "Traffic",
   "About",
 ]);
 
@@ -175,6 +177,7 @@ export function App() {
                     onOpenImageStudio={() => navigate("ImageGen")}
                     onOpenSessions={openSessions}
                     onOpenClientSetup={(platform, clientKey) => openClientSetup({ platform, clientKey })}
+                    onOpenTraffic={() => navigate("Traffic")}
                     onPoolScopeFocusConsumed={handlePoolScopeFocusConsumed}
                     onProviderFilterFocusConsumed={handleProviderFilterFocusConsumed}
                     poolScopeFocus={poolScopeFocus}
@@ -214,6 +217,7 @@ export function App() {
                     <UsageOverviewPanel standalone />
                   </section>
                 )}
+                {screen === "Traffic" && <TrafficScreen onBack={() => navigate(modalityScreenById.general)} />}
                 {screen === "About" && <AboutScreen />}
                 {screen === "Log" && <OperationLogScreen />}
                 {!implementedScreens.has(screen) && (

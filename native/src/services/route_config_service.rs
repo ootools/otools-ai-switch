@@ -360,6 +360,8 @@ impl RouteConfigService {
                 adapter.requires_client_models(),
             )
             .await?;
+            let route_proxy_key = route_proxy_key_for_client(&route_proxy_key, adapter.client_key());
+            let aliases = RouteProxyKeyRepository::list_aliases_for_platform(pool, &platform).await?;
             requests.push(ConfigWriteRequest {
                 adapter,
                 home: home.to_path_buf(),
@@ -367,7 +369,7 @@ impl RouteConfigService {
                 input: RouteConfigInput {
                     base_url: base_url.to_string(),
                     route_proxy_key,
-                    route_proxy_key_aliases: Vec::new(),
+                    route_proxy_key_aliases: aliases,
                     claude_env,
                     client_models,
                     codex_keep_login_state: Self::resolve_codex_keep_login_state(paths, parsed)
@@ -1558,6 +1560,9 @@ mod tests {
         .await
         .expect("first write");
 
+        let written_key = tokio::fs::read_to_string(fixture.home.join(".hermes/config.yaml")).await.unwrap();
+        let base_key = RouteProxyKeyRepository::get_existing_platform_key(&fixture.pool, "hermes").await.unwrap().unwrap();
+        assert!(written_key.contains(&format!("{base_key}.hermes")), "{written_key}");
         let outcomes = RouteConfigService::write_existing_configs_for_home(
             &fixture.paths,
             &fixture.pool,
@@ -1576,6 +1581,7 @@ mod tests {
             .expect("hermes config");
         assert!(written.contains("https://127.0.0.1:19528/v1"), "{written}");
         assert!(written.contains("glm-5.3"), "{written}");
+        assert!(written.contains(&format!("{base_key}.hermes")), "rewrite lost client suffix: {written}");
     }
 
     #[tokio::test]

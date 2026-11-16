@@ -1,0 +1,112 @@
+.traffic-screen {
+  --traffic-surface: #ffffff;
+  --traffic-ink: #1e293b;
+  --traffic-muted: #64748b;
+  --traffic-border: #e2e8f0;
+  --traffic-line: #cbd5e1;
+  color: var(--traffic-ink);
+  width: 100%;
+  min-width: 0;
+  padding: 10px 6px 16px;
+}
+
+.traffic-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin: 0 0 20px; }
+.traffic-kicker { display: inline-flex; align-items: center; gap: 6px; color: #6366f1; font-size: 10px; font-weight: 700; letter-spacing: .16em; }
+.traffic-heading h1 { margin-top: 5px; font-size: 24px; font-weight: 750; letter-spacing: -.04em; }
+.traffic-heading p { margin-top: 6px; color: var(--traffic-muted); font-size: 12px; line-height: 1.6; }
+.traffic-toolbar { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.traffic-toolbar .traffic-simulation-active { border-color: #fbbf24; background: #fffbeb; color: #b45309; }
+.traffic-simulation-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 10px 14px; margin-bottom: 12px; border: 1px solid #fde68a; border-radius: 10px; background: #fffbeb; color: #92400e; font-size: 12px; line-height: 1.6; }
+.traffic-simulation-notice svg { flex-shrink: 0; }
+.traffic-simulation-notice strong { font-weight: 700; }
+.traffic-toolbar button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--traffic-border); background: var(--traffic-surface); border-radius: 10px; padding: 8px 11px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.traffic-toolbar button:hover { border-color: #a5b4fc; color: #6366f1; }
+.traffic-toolbar button:focus-visible { outline: 2px solid #818cf8; outline-offset: 3px; }
+.traffic-refreshing { animation: traffic-refresh 1s linear infinite; }
+
+.traffic-online { color: #059669; }
+.traffic-offline { color: #94a3b8; }
+.traffic-online > i, .traffic-offline > i { display: inline-block; flex: 0 0 6px; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.traffic-error { margin-bottom: 12px; padding: 10px 14px; border: 1px solid #fecaca; border-radius: 10px; background: #fef2f2; color: #b91c1c; font-size: 12px; overflow-wrap: anywhere; }
+
+.traffic-network-panel { overflow: hidden; border: 1px solid var(--traffic-border); background: var(--traffic-surface); border-radius: 18px; }
+.traffic-network-labels { display: grid; grid-template-columns: 29% 42% 29%; padding: 16px 21px; border-bottom: 1px solid var(--traffic-border); font-size: 11px; font-weight: 700; letter-spacing: .02em; }
+.traffic-network-labels > span:nth-child(2) { text-align: center; }
+.traffic-network-labels > span:nth-child(3) { text-align: right; }
+.traffic-network-labels small { color: var(--traffic-muted); font-size: 10px; font-weight: 400; }
+.traffic-network-scroll { overflow-x: auto; }
+.traffic-network { position: relative; min-width: 860px; width: 100%; isolation: isolate; background-image: radial-gradient(circle, #cbd5e14a .8px, transparent .8px), radial-gradient(ellipse at center, #eef2ff70 0%, transparent 58%); background-size: 19px 19px, 100% 100%; }
+.traffic-links { position: absolute; z-index: 0; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.traffic-idle-path { fill: none; stroke: var(--traffic-line); stroke-width: 1.35; stroke-dasharray: 4 7; opacity: .8; vector-effect: non-scaling-stroke; }
+.traffic-active-path > path { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-dasharray: 4 7; opacity: .75; vector-effect: non-scaling-stroke; }
+.traffic-dot { fill: currentColor; offset-distance: 0%; offset-rotate: 0deg; animation: traffic-flow 2.8s linear infinite; filter: drop-shadow(0 0 4px currentColor); }
+.traffic-dot-secondary { opacity: .7; }
+
+.traffic-node { position: absolute; z-index: 2; display: flex; align-items: center; gap: 10px; min-width: 0; border: 1px solid var(--traffic-border); border-radius: 11px; background: var(--traffic-surface); box-shadow: 0 2px 8px #0f172a05; }
+.traffic-client { left: 2%; width: 21%; height: 40px; padding: 6px 10px; }
+.traffic-client-logo { width: 26px; height: 26px; flex-shrink: 0; }
+.traffic-node-copy { flex: 1; min-width: 0; }
+.traffic-node-copy strong { display: block; overflow: hidden; font-size: 11px; font-weight: 650; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.traffic-node-copy > span { display: block; overflow: hidden; margin-top: 2px; font-size: 9px; color: var(--traffic-muted); text-overflow: ellipsis; white-space: nowrap; }
+.traffic-node-copy small { font-size: inherit; color: #94a3b8; }
+.traffic-count { display: grid; place-items: center; min-width: 21px; height: 21px; border-radius: 6px; background: #f1f5f9; color: #94a3b8; font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.traffic-count-active { background: color-mix(in srgb, var(--client-color) 10%, var(--traffic-surface)); color: var(--client-color); }
+.traffic-node-active { border-color: color-mix(in srgb, var(--client-color) 50%, var(--traffic-border)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--client-color) 5%, transparent), 0 3px 15px color-mix(in srgb, var(--client-color) 7%, transparent); }
+.traffic-port { position: absolute; right: -4px; width: 7px; height: 7px; border: 1.5px solid var(--traffic-surface); border-radius: 50%; background: var(--traffic-line); }
+.traffic-node-active .traffic-port { background: var(--client-color); }
+
+.traffic-account { left: 77%; width: 21%; height: 48px; padding: 7px 11px; }
+.traffic-account > .traffic-port { left: -4px; right: auto; }
+.traffic-account-icon { display: grid; place-items: center; flex-shrink: 0; width: 29px; height: 29px; border-radius: 8px; background: #f1f5f9; color: #94a3b8; }
+.traffic-node-active .traffic-account-icon { color: var(--client-color); background: color-mix(in srgb, var(--client-color) 8%, var(--traffic-surface)); }
+.traffic-account-count { text-align: right; font-variant-numeric: tabular-nums; }
+.traffic-account-count strong { font-size: 15px; font-weight: 700; color: #94a3b8; }
+.traffic-node-active .traffic-account-count strong { color: var(--client-color); }
+.traffic-account-count small { margin-left: 3px; font-size: 9px; color: var(--traffic-muted); }
+.traffic-account-clients { position: absolute; display: flex; gap: 3px; right: 10px; bottom: -4px; }
+.traffic-account-clients span { width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--traffic-surface); }
+
+.traffic-hub { position: absolute; z-index: 3; left: 41.5%; width: 17%; height: 194px; display: flex; align-items: center; flex-direction: column; justify-content: center; background: var(--traffic-surface); border: 1px solid #c7d2fe; border-radius: 24px; box-shadow: 0 0 0 9px #6366f105, 0 12px 35px #6366f110; }
+.traffic-hub-orbit { position: absolute; inset: -20px; z-index: -1; border: 1px dashed #c7d2fe80; border-radius: 36px; }
+.traffic-hub-active { border-color: #818cf8; box-shadow: 0 0 0 9px #6366f109, 0 12px 35px #6366f11a; }
+.traffic-hub-logo { height: 45px; width: 45px; margin-bottom: 9px; }
+.traffic-hub h2 { font-size: 18px; font-weight: 750; letter-spacing: -.04em; }
+.traffic-hub p { font-size: 10px; color: var(--traffic-muted); margin-top: 2px; }
+.traffic-hub-count { display: flex; align-items: center; gap: 5px; color: #6366f1; margin-top: 11px; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.traffic-hub-count small { font-size: 9px; color: var(--traffic-muted); font-weight: 400; }
+.traffic-hub-status { display: flex; align-items: center; gap: 5px; margin-top: 9px; font-size: 9px; font-weight: 600; }
+.traffic-placeholder { position: absolute; top: 35px; left: 2%; color: var(--traffic-muted); font-size: 12px; }
+.traffic-empty-pool { position: absolute; top: 45%; left: 76%; max-width: 22%; font-size: 11px; line-height: 1.6; color: var(--traffic-muted); }
+
+.traffic-network-footer { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 13px 20px; border-top: 1px solid var(--traffic-border); font-size: 10px; color: var(--traffic-muted); }
+.traffic-legend { display: flex; gap: 18px; flex-wrap: wrap; }
+.traffic-legend > span { display: inline-flex; align-items: center; gap: 7px; }
+.traffic-legend-static { display: inline-block; width: 21px; border-top: 1.5px dashed #94a3b8; }
+.traffic-legend-active { display: inline-block; height: 5px; width: 5px; border-radius: 50%; background: #6366f1; box-shadow: 0 0 5px #6366f180; }
+.traffic-security-note { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.traffic-footnote { margin: 12px 4px 0; color: var(--traffic-muted); font-size: 11px; line-height: 1.65; }
+
+@keyframes traffic-flow { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+@keyframes traffic-refresh { to { transform: rotate(360deg); } }
+
+html.dark .traffic-screen { --traffic-surface: #1a2433; --traffic-ink: #e2e8f0; --traffic-muted: #94a3b8; --traffic-border: #334155; --traffic-line: #4b5a72; }
+html.dark .traffic-network { background-image: radial-gradient(circle, #4755695c .8px, transparent .8px), radial-gradient(ellipse at center, #3730a31c 0%, transparent 58%); }
+html.dark .traffic-count, html.dark .traffic-account-icon { background: #273449; }
+html.dark .traffic-hub { border-color: #4f46a5; }
+html.dark .traffic-hub-orbit { border-color: #4f46a570; }
+html.dark .traffic-error { background: #3e2027; border-color: #7f1d1d; color: #fca5a5; }
+html.dark .traffic-simulation-notice, html.dark .traffic-toolbar .traffic-simulation-active { background: #332718; border-color: #785a25; color: #fcd34d; }
+
+@media (max-width: 700px) {
+  .traffic-heading { align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .traffic-heading h1 { font-size: 21px; }
+  .traffic-heading p { max-width: 330px; }
+  .traffic-toolbar button { font-size: 11px; padding: 7px 9px; }
+  .traffic-network-labels { font-size: 10px; padding: 14px 13px; }
+  .traffic-network-labels small { display: none; }
+  .traffic-network-footer { padding: 11px 13px; flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .traffic-dot { animation: none; display: none; }
+  .traffic-refreshing { animation: none; }
+}

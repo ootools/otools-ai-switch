@@ -61,6 +61,7 @@ impl PluginRuntime {
             });
             let emitter = EventEmitter::Web(state.event_broadcaster.clone());
             state.route_proxy.activity().set_emitter(emitter.clone());
+            state.route_proxy.active_attempts().set_emitter(emitter.clone());
             state.route_proxy.live_log().set_emitter(emitter);
             let log_writer = state.route_proxy.live_log().persist_to(state.paths.logs_dir.clone()).map(|writer| tokio::spawn(writer.run()));
             let mut tasks = Vec::new();

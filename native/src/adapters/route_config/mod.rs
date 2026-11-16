@@ -64,10 +64,10 @@ pub(super) fn route_proxy_key_matches(
     if configured.is_empty() {
         return false;
     }
-    let suffixed = route_proxy_key_for_client(current_key, client_key);
     let base = current_key
         .strip_suffix(&format!(".{client_key}"))
         .unwrap_or(current_key);
+    let suffixed = route_proxy_key_for_client(base, client_key);
     if configured == current_key || configured == suffixed || configured == base {
         return true;
     }
@@ -288,6 +288,20 @@ impl TargetAdapterRegistry {
     pub fn adapters(&self) -> &[Arc<dyn TargetAdapter>] {
         &self.adapters
     }
+
+    /// Every distinct `client_key` a written config can carry, deduplicated and
+    /// sorted. The gateway checks a key suffix against this before trusting it,
+    /// so the list has to come from the registry rather than be retyped.
+    pub fn client_keys(&self) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = self
+            .adapters
+            .iter()
+            .map(|adapter| adapter.client_key())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
 }
 
 impl Default for TargetAdapterRegistry {
@@ -364,6 +378,17 @@ mod tests {
             route_proxy_key_for_client("sk-ai-switch-0123456789abcdef", "codex"),
             "sk-ai-switch-0123456789abcdef.codex"
         );
+    }
+
+    #[test]
+    fn key_adoption_does_not_accept_a_second_client_suffix() {
+        let aliases = vec!["sk-old".to_string()];
+        for configured in ["sk-current", "sk-current.zcode", "sk-old", "sk-old.zcode"] {
+            assert!(route_proxy_key_matches(configured, "zcode", "sk-current.zcode", &aliases));
+        }
+        for configured in ["sk-current.zcode.zcode", "sk-current.workbuddy", "sk-old.workbuddy", ""] {
+            assert!(!route_proxy_key_matches(configured, "zcode", "sk-current.zcode", &aliases), "{configured}");
+        }
     }
 
     fn input() -> RouteConfigInput {

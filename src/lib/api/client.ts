@@ -1,5 +1,7 @@
 import { getTransport } from "../transport";
 import type {
+  ActiveProxyAttemptSnapshot,
+  RouteProxyAccountSummary,
   AccountStatus,
   AppSettings,
   AppSettingsView,
@@ -438,6 +440,18 @@ export function getClaudeSlotPlan(): Promise<ClaudeSlotPlan> {
 /// state. Drives the write dialog's checkbox list.
 export function listConfigWriteClients(platform: string): Promise<ConfigWriteClientStatus[]> {
   return invoke("list_config_write_clients", { platform });
+}
+
+export function getRouteProxyPoolMemberIds(): Promise<string[]> {
+  return invoke("get_route_proxy_pool_member_ids");
+}
+
+export function getRouteProxyActiveAttempts(): Promise<ActiveProxyAttemptSnapshot> {
+  return invoke("get_route_proxy_active_attempts");
+}
+
+export function listRouteProxyAccountSummaries(platform: string): Promise<RouteProxyAccountSummary[]> {
+  return invoke("list_route_proxy_account_summaries", { platform });
 }
 
 export function listRouteCredentials(platform: string): Promise<RouteCredential[]> {

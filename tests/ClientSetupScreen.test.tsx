@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ClientSetupScreen } from "../src/screens/ClientSetupScreen";
@@ -202,6 +202,28 @@ describe("ClientSetupScreen", () => {
       capabilityOf("gemini", "Gemini"),
       capabilityOf("grok", "Grok"),
     ]);
+  });
+
+  it("keeps write actions outside the scrolling client list", async () => {
+    const user = userEvent.setup();
+    setup();
+    const client = await screen.findByRole("checkbox", { name: "写入 ZCode" });
+    const scrollRegion = screen.getByTestId("client-setup-scroll-region");
+    const actions = screen.getByRole("group", { name: "配置写入操作" });
+    const write = within(actions).getByRole("button", { name: "写入" });
+    expect(scrollRegion).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
+    expect(scrollRegion).toContainElement(client);
+    expect(scrollRegion).not.toContainElement(actions);
+    expect(actions).toHaveTextContent("只写入勾选的客户端");
+    expect(actions).toHaveClass("shrink-0");
+    expect(write.closest("form")).toBe(client.closest("form"));
+
+    fireEvent.scroll(scrollRegion, { target: { scrollTop: 1000 } });
+    await user.click(client);
+    await user.click(write);
+    await waitFor(() => expect(writeRouteProxyConfigs).toHaveBeenCalledWith(
+      "http://127.0.0.1:43111", "codex", ["codex", "zcode"],
+    ));
   });
 
   it("lists every client as a card with its file status and path", async () => {
