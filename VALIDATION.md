@@ -2,6 +2,17 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
+## v0.1.8 release preparation
+
+Version `0.1.8` replaces the account-list header select-all checkbox with the ordered **全选 / 反选 / 取消选择** buttons in the existing operation strip. The strip's original visibility mechanism is retained: select at least one account to open it; cancel/last-uncheck/empty inversion closes it. Current-page all/invert and cross-page clear behavior are covered in both list/card tests and an isolated rendered preview; see `docs/validation/2026-11-16-account-selection-actions.md`.
+
+- Release-version frontend suite: **81 files / 951 tests passed**. Typecheck, production build and package regression tests **5/5** passed.
+- Release-version native serial library suite: **2009 passed / 0 failed / 6 preexisting ignored**, no filtered tests. Plugin boundary tests **4/4** passed. Native business logic is unchanged; its manifest/lock version is aligned at `0.1.8`.
+- Windows release library compiled successfully at **26.71 MiB**. The standard staging step returned **EBUSY** because the earlier isolated GUI preview had loaded `lib/Windows.dll`; the preview and installed AI service were not stopped. The new compiled DLL was instead copied into fresh isolated release staging, where Nano Banana native integration tests **2/2** passed.
+- Local v0.1.8 package: **23 entries**, CRC/SHA256/relative assets/Windows-native boundary/panel manifest verified from that fresh staging. It is not a stale-library package.
+- Local listener smoke/autostart tests were not run because the existing OTools service still occupies 29527. All three clean release CI runners must perform those checks before publication.
+- Existing native unused-code/import and OCRAD/eval/chunk-size warnings remain. Local validation used temporary data only; no real-account requests, paid generation, installed-plugin replacement, standalone sync or data migration. Session/preview/build artifacts remain excluded from public source archives.
+
 ## v0.1.7 release verification
 
 Released 2026-11-16 from commit `de57b36`, annotated tag `v0.1.7`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.7> is public, non-draft, non-prerelease and the latest stable release, with all **8 assets uploaded**. Release notes match `docs/releases/0.1.7.md`; downloaded `plugin.json` and `SHA256SUMS` match verified local files byte-for-byte. All eight GitHub asset digests and sizes match the publication files.

@@ -3553,8 +3553,6 @@ export function AccountsScreen({
   const accountEdgeTimerRef = useRef<number | null>(null);
   const accountScrollRef = useRef<HTMLDivElement | null>(null);
   const [accountFilterMenuOpen, setAccountFilterMenuOpen] = useState(false);
-  // 表头复选框需要直接落到 DOM 上设 indeterminate（半选），React 没有受控属性。
-  const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
   const [refreshMenuOpen, setRefreshMenuOpen] = useState(false);
   const [modelTestMenuOpen, setModelTestMenuOpen] = useState(false);
   const [modelTestMenuCopied, setModelTestMenuCopied] = useState<
@@ -5955,37 +5953,26 @@ export function AccountsScreen({
     setSelectedAccountIds(new Set());
   };
 
-  // 本页账号是否已全部选中。表头复选框据此决定自身状态与动作：部分选中时
-  // 显示半选（indeterminate），点击要么补齐成全选、要么清空当前页。判断只能
-  // 落在账号数组本身，不能读同一渲染周期里还没更新的派生值。
   const visibleAccountIds = credentials.map((credential) => credential.id);
-  const selectedVisibleCount = visibleAccountIds.filter((id) => selectedAccountIds.has(id)).length;
-  const allVisibleAccountsSelected =
-    visibleAccountIds.length > 0 && selectedVisibleCount === visibleAccountIds.length;
-  const someVisibleAccountsSelected = selectedVisibleCount > 0 && !allVisibleAccountsSelected;
+  const visibleSelectionDisabled = credentialsQuery.isLoading || credentialsQuery.isPlaceholderData
+    || Boolean(credentialsQuery.error) || visibleAccountIds.length === 0;
 
-  const toggleAllVisibleAccounts = () => {
+  const selectAllVisibleAccounts = () => {
+    if (visibleSelectionDisabled) return;
+    setSelectedAccountIds((current) => new Set([...current, ...visibleAccountIds]));
+  };
+
+  const invertVisibleAccountSelection = () => {
+    if (visibleSelectionDisabled) return;
     setSelectedAccountIds((current) => {
       const next = new Set(current);
-      if (visibleAccountIds.every((id) => next.has(id))) {
-        for (const id of visibleAccountIds) {
-          next.delete(id);
-        }
-      } else {
-        for (const id of visibleAccountIds) {
-          next.add(id);
-        }
+      for (const id of visibleAccountIds) {
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
       }
       return next;
     });
   };
-
-  // 半选态不是 React 的受控属性，得直接落到 DOM 节点上，否则复选框只会显示
-  // 「全选/未选」两态，看不出「选中了一部分」。
-  useEffect(() => {
-    const node = selectAllCheckboxRef.current;
-    if (node) node.indeterminate = someVisibleAccountsSelected;
-  }, [someVisibleAccountsSelected]);
 
   const setSelectedAccountsStatus = () => {
     if (selectedAccountIds.size === 0 || !batchStatus || batchStatusMutation.isPending) {
@@ -7402,17 +7389,41 @@ export function AccountsScreen({
           {selectedAccountIds.size > 0 && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2">
               <div className="flex min-w-0 flex-wrap items-center gap-2 text-[12px] font-semibold text-amber-900">
-                <span>已选 {selectedAccountIds.size} 个账号</span>
-                <button
-                  aria-label="取消账号选择"
-                  className="rounded-lg border border-amber-200 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50"
-                  onClick={clearAccountSelection}
-                  type="button"
-                >
-                  取消选择
-                </button>
+                {selectedAccountIds.size > 0 && <span>已选 {selectedAccountIds.size} 个账号</span>}
+                <div aria-label="账号选择操作" className="flex shrink-0 items-center gap-2" role="group">
+                  <button
+                    aria-label="全选当前页账号"
+                    className="rounded-lg border border-amber-200 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-50"
+                    disabled={visibleSelectionDisabled}
+                    onClick={selectAllVisibleAccounts}
+                    title="全选当前页筛选结果"
+                    type="button"
+                  >
+                    全选
+                  </button>
+                  <button
+                    aria-label="反选当前页账号"
+                    className="rounded-lg border border-amber-200 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-50"
+                    disabled={visibleSelectionDisabled}
+                    onClick={invertVisibleAccountSelection}
+                    title="反选当前页筛选结果"
+                    type="button"
+                  >
+                    反选
+                  </button>
+                  <button
+                    aria-label="取消账号选择"
+                    className="rounded-lg border border-amber-200 bg-white px-2 py-1 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-50"
+                    disabled={selectedAccountIds.size === 0}
+                    onClick={clearAccountSelection}
+                    title="取消所有已选账号"
+                    type="button"
+                  >
+                    取消选择
+                  </button>
+                </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
+              {selectedAccountIds.size > 0 && <div className="flex flex-wrap items-center gap-2">
                   <>
                     <select
                       aria-label="批量设置状态"
@@ -7469,7 +7480,7 @@ export function AccountsScreen({
                   <Trash2 className="h-3.5 w-3.5" />
                   批量删除
                 </button>
-              </div>
+              </div>}
             </div>
           )}
           {quotaRefreshMessage && (
@@ -7506,30 +7517,6 @@ export function AccountsScreen({
               <DismissButton
                 ariaLabel="关闭批量设置状态错误"
                 onClick={() => batchStatusMutation.reset()}
-              />
-            </div>
-          )}
-          {!credentialsQuery.isLoading && credentials.length > 0 && (
-            // 表头：一个复选框同时承担全选/清空，半选表示只选中了部分账号。
-            // 只保留复选框，不再单摆「全选」「反选」两个按钮。列表布局下用跟行
-            // 一样的四列网格，第一列留出拖拽手柄的宽度，复选框才能落在各行的勾
-            // 选列正上方；卡片布局只留复选框贴左。
-            <div
-              className={
-                cardLayout
-                  ? "flex items-center px-1"
-                  : "mx-1 grid grid-cols-[auto_auto_minmax(0,1fr)_auto] items-center gap-2 px-3"
-              }
-              data-testid="account-list-header"
-            >
-              {!cardLayout && <span aria-hidden="true" className="w-7" />}
-              <input
-                aria-label="全选当前页账号"
-                checked={allVisibleAccountsSelected}
-                className="h-4 w-4 shrink-0 rounded border-stone-300 text-amber-500 focus:ring-blue-400"
-                onChange={toggleAllVisibleAccounts}
-                ref={selectAllCheckboxRef}
-                type="checkbox"
               />
             </div>
           )}
