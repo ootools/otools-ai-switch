@@ -2,7 +2,19 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
-## v0.1.6 release preparation
+## v0.1.6 release verification
+
+Released 2026-11-16 from commit `dda8943`, annotated tag `v0.1.6`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.6> is public, non-draft, non-prerelease and the latest release, with all **8 assets uploaded**. Release body matches `docs/releases/0.1.6.md`; downloaded `plugin.json` and `SHA256SUMS` match the publication files byte-for-byte. GitHub's asset digests match the published checksum list.
+
+- All three CI jobs in run **43800774260** succeeded on `dda8943`: Windows x64, Linux x64 and macOS ARM64. Each ran the **919-test frontend suite**, typecheck/build/package regressions, native plugin boundary checks, **7 FFI/listener smoke checks**, **3 autostart tests** and **2 Nano Banana tests** on clean runners.
+- Published platform packages came from that run, each re-verified locally for CRC/SHA256, the 17-file content set and its single expected native library. Windows PE, Linux ELF and macOS ARM64 Mach-O headers were checked. Non-native package entries were byte-identical across platforms.
+- The unsuffixed fallback package is Windows x64, repacked from the CI Windows package; platform-aware installation uses the separate Windows/Linux/macOS packages (`packageMode=1`).
+- Published SHA256 prefixes: fallback/Windows `a34d5648…400f`, Linux `0ef1e8f5…e8f1`, macOS `a0749ce5…a475`, source `6297f730…6469`, manifest `a0a7625a…384d`, logo `cea34d58…f424`.
+- Source ZIP was generated with `git archive` from the release commit and is byte-identical to a fresh archive of public tag `v0.1.6` (**863 entries**). Session state, local artifacts, node_modules and native build outputs are excluded.
+- Market publication returned **code=200 / 插件更新成功 / action=updated**. Public catalog read-back confirms `version=0.1.6`, `packageMode=1`, all four package URLs and both icon/logo URLs on v0.1.6, and all three platform flags enabled. Curated `minOToolsVersion=0.5.0`, `categories=["latest"]`, `screenshots=[]` and `official=0` were preserved.
+- The installed OTools service remained running on 29527. No local installation, real-account requests, paid generation, independent-version sync or user data migration was performed.
+
+### Local pre-release verification
 
 Version `0.1.6` includes live client-to-gateway-to-account routing visualization, per-client gateway-key suffix attribution, page-local simulation, twelve-account idle fill, the pinned client-setup write footer, hidden-by-default account-provider badges and the 100 retries / 500 ms capacity preset. Detailed implementation evidence is in `docs/validation/2026-11-16-live-routing.md` and `docs/validation/2026-11-16-client-setup-footer.md`.
 
