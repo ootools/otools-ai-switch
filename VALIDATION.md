@@ -2,7 +2,19 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
-## v0.1.8 release preparation
+## v0.1.8 release verification
+
+Released 2026-11-16 from commit `9cf5749`, annotated tag `v0.1.8`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.8> is public, non-draft, non-prerelease and the latest stable release, with all **8 assets uploaded**. Release notes match `docs/releases/0.1.8.md`; downloaded `plugin.json` and `SHA256SUMS` match verified local files byte-for-byte. All eight published asset digests and sizes match the publication files.
+
+- Three-platform CI run **43882159743** succeeded on `9cf5749`: Windows x64, Linux x64 and macOS ARM64. Each job passed the **951-test frontend suite**, typecheck/build/package checks, native plugin boundaries, **7 FFI/listener smoke checks**, **3 autostart tests** and **2 Nano Banana tests**.
+- Published platform packages were taken from that CI run and re-verified locally: **23 entries** each, CRC/SHA256, exactly one expected native library and Windows PE/Linux ELF/macOS ARM64 Mach-O headers. Non-native content is byte-identical across platforms.
+- The unsuffixed fallback is Windows x64, repacked from the CI Windows package; platform-aware installation uses the separate platform packages (`packageMode=1`). All four packages retain verified official artwork hashes and the original upstream notices.
+- Published SHA256 prefixes: fallback/Windows `5f2460dd…24b2`, Linux `746762b7…1f9b`, macOS `13e60678…896c`, source `b569bf99…1606`, manifest `65b60b8a…45f9`, logo `cea34d58…f424`.
+- Source ZIP is byte-identical to a fresh `git archive` of public tag `v0.1.8` (**883 entries**). Local previews, build outputs, session state and node_modules are excluded.
+- Market publication returned **code=200 / 插件更新成功 / action=updated**. Public read-back confirms `version=0.1.8`, `packageMode=1`, all four package URLs and both icon/logo URLs on v0.1.8, and all three platform support flags enabled. Curated `minOToolsVersion=0.5.0`, `categories=["latest"]`, `screenshots=[]` and `official=0` were preserved.
+- The existing OTools AI service and earlier isolated preview remained running. The local staging-lock workaround below did not affect the published CI packages. No installed-plugin replacement, real-account or paid upstream request, standalone sync or user data migration was performed.
+
+### Local pre-release verification
 
 Version `0.1.8` replaces the account-list header select-all checkbox with the ordered **全选 / 反选 / 取消选择** buttons in the existing operation strip. The strip's original visibility mechanism is retained: select at least one account to open it; cancel/last-uncheck/empty inversion closes it. Current-page all/invert and cross-page clear behavior are covered in both list/card tests and an isolated rendered preview; see `docs/validation/2026-11-16-account-selection-actions.md`.
 
