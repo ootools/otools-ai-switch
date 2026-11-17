@@ -7,8 +7,7 @@ import {
   Network,
 } from "lucide-react";
 import type { ComponentType } from "react";
-import { getCodexLoginState, getSettings, saveSettings } from "../lib/api/client";
-import { isDesktop } from "../lib/transport";
+import { getSettings, saveSettings } from "../lib/api/client";
 import { normalizeLanguage, supportedLanguages, useI18n, type Language } from "../lib/i18n";
 import { normalizeThemePreference, type ThemePreference } from "../lib/theme";
 import { RouteProxyHttpsSettings } from "../components/settings/route-proxy-https-settings";
@@ -100,17 +99,6 @@ export function SettingsScreen({
   const [requestBodyLimitDraft, setRequestBodyLimitDraft] = useState<string | null>(null);
   const [requestBodyLimitError, setRequestBodyLimitError] = useState(false);
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
-  // Only loaded for the Codex-login card: enabling that switch without a ChatGPT
-  // login leaves Codex unable to authenticate, so the card warns first instead of
-  // letting the user find out when a config write is refused. A failure here
-  // must not prevent editing other settings.
-  const codexLoginQuery = useQuery({
-    queryKey: ["codex-login-state"],
-    queryFn: getCodexLoginState,
-    // OTools resolves file operations on the host for desktop and remote views.
-    enabled: isDesktop(),
-    retry: false,
-  });
   const saveMutation = useMutation({
     mutationFn: saveSettings,
     onSuccess: (settings) => {
@@ -161,20 +149,6 @@ export function SettingsScreen({
   };
 
   const requestBodyLimit = settings.route_proxy_request_body_limit_mib ?? 128;
-  const codexKeepLoginState = settings.codex_keep_login_state ?? false;
-  // Keyed lookup rather than a template string: the translation keys are a
-  // closed union, and an unknown state must fall back to silence, not a crash.
-  const codexLoginWarning = (() => {
-    const state = codexLoginQuery.data;
-    if (!state || state.usable) return null;
-    const keys = {
-      missing: "settings.codexLogin.state.missing",
-      not_chatgpt: "settings.codexLogin.state.not_chatgpt",
-      unreadable: "settings.codexLogin.state.unreadable",
-    } as const;
-    const key = keys[state.state as keyof typeof keys];
-    return key ? t(key) : null;
-  })();
   const saveRequestBodyLimit = () => {
     const draft = requestBodyLimitDraft ?? String(requestBodyLimit);
     const value = Number(draft);
@@ -347,37 +321,6 @@ export function SettingsScreen({
             <span className="text-[11px] font-medium text-stone-500">{t("settings.proxy.hint")}</span>
           )}
         </label>
-      </div>
-
-      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
-        <h2 className="text-[15px] font-semibold text-stone-950">
-          {t("settings.codexLogin.title")}
-        </h2>
-        <p className="text-[12px] text-stone-500">{t("settings.codexLogin.subtitle")}</p>
-        <label className="flex max-w-xl items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-[12px] font-semibold text-stone-700">
-          <input
-            aria-label={t("settings.codexLogin.enable")}
-            checked={codexKeepLoginState}
-            className="mt-0.5"
-            disabled={saveMutation.isPending}
-            onChange={(event) =>
-              saveMutation.mutate({ ...settings, codex_keep_login_state: event.target.checked })
-            }
-            type="checkbox"
-          />
-          <span>{t("settings.codexLogin.enable")}</span>
-        </label>
-        {codexLoginWarning && (
-          <p
-            className="max-w-xl rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-[11px] font-medium text-amber-900"
-            role="status"
-          >
-            {codexLoginWarning}
-          </p>
-        )}
-        <p className="text-[11px] font-medium text-stone-500">
-          {t("settings.codexLogin.hint")}
-        </p>
       </div>
 
       <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
