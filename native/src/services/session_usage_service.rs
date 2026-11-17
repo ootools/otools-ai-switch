@@ -660,7 +660,8 @@ fn parse_codex_file(path: &Path) -> ParsedFile {
             // Some writers flush the aggregate heartbeat before its individual
             // records. Do not rewind a checkpoint already seen in this turn;
             // otherwise the next legacy delta charges these records again.
-            let older_checkpoint = previous.is_some_and(|previous| {
+            let baseline = previous;
+            let older_checkpoint = baseline.is_some_and(|previous| {
                 record.total.delta_from(previous).is_none()
                     && (legacy_checkpoints.contains_key(&previous)
                         || record_checkpoints.contains(&previous))
@@ -675,6 +676,26 @@ fn parse_codex_file(path: &Path) -> ParsedFile {
                 // request must not include this record's usage again.
                 previous = Some(record.total);
             }
+            // A writer may copy the cumulative checkpoint into `usage`. When
+            // it equals `thread_token_usage` and advances a known baseline,
+            // count only that delta instead of charging the whole thread again.
+            // The first response and late records for an unchanged checkpoint
+            // retain their recorded usage, as do genuine per-response records.
+            let usage = if record.cumulative_as_usage && !older_checkpoint {
+                match baseline.and_then(|prev| record.total.delta_from(prev)) {
+                    Some(delta)
+                        if delta.input_tokens > 0
+                            || delta.output_tokens > 0
+                            || delta.cache_read_tokens > 0
+                            || delta.cache_write_tokens > 0 =>
+                    {
+                        delta
+                    }
+                    _ => record.usage,
+                }
+            } else {
+                record.usage
+            };
             record_checkpoints.insert(record.total);
             pending_response_id = None;
             let entry_model = model.clone().unwrap_or_else(|| "unknown".to_string());
@@ -684,13 +705,13 @@ fn parse_codex_file(path: &Path) -> ParsedFile {
                 dedup_key: codex_dedup_key(
                     Some(&record.id),
                     &entry_model,
-                    &record.usage,
+                    &usage,
                     timestamp_ms,
                 ),
                 response_id: Some(record.id),
                 model: entry_model,
                 timestamp_ms,
-                usage: record.usage,
+                usage,
             }));
             continue;
         }
@@ -751,8 +772,12 @@ fn parse_codex_file(path: &Path) -> ParsedFile {
 /// record into a zero-cost success that suppresses the valid legacy fallback.
 struct CodexUsageRecord {
     id: String,
+    /// Per-response usage unless the writer copied the cumulative checkpoint.
     usage: TokenUsage,
+    /// Cumulative checkpoint after this response.
     total: CodexCumulative,
+    /// Both fields contain the same token counters, a possible cumulative copy.
+    cumulative_as_usage: bool,
 }
 
 impl CodexUsageRecord {
@@ -767,6 +792,7 @@ impl CodexUsageRecord {
         Some(Self {
             id: id.to_string(),
             usage: usage.usage(),
+            cumulative_as_usage: usage == total,
             total,
         })
     }

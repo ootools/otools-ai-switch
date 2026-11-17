@@ -409,6 +409,80 @@ async fn verify_live_codex_response_id_matching() {
 }
 
 #[test]
+fn gateway_cumulative_snapshots_in_usage_are_differenced_not_summed() {
+    // Reproduce a writer copying cumulative `thread_token_usage` into the
+    // per-response `usage` field as well. Consecutive checkpoints must be
+    // differenced so their sum equals the final cumulative total.
+    let parsed = parse(&[
+        context("turn-a"),
+        // First response: usage == total, no baseline yet, so the whole value is
+        // this response's own usage.
+        record(
+            "resp-1",
+            counts(10_000, 8_000, 500, 100),
+            counts(10_000, 8_000, 500, 100),
+        ),
+        // Only the delta (10k input, 7k cached) belongs to this request.
+        record(
+            "resp-2",
+            counts(20_000, 15_000, 900, 200),
+            counts(20_000, 15_000, 900, 200),
+        ),
+        record(
+            "resp-3",
+            counts(35_000, 27_000, 1_200, 350),
+            counts(35_000, 27_000, 1_200, 350),
+        ),
+    ]);
+
+    assert_eq!(parsed.entries.len(), 3);
+    // input_tokens excludes the cached portion: (10000-8000) + (10000-7000)
+    // + (15000-12000) = 8000.
+    assert_eq!(
+        parsed
+            .entries
+            .iter()
+            .map(|e| e.usage.input_tokens)
+            .sum::<i64>(),
+        8_000
+    );
+    // cache read = 8000 + 7000 + 12000 = 27000, not 8000+15000+27000.
+    assert_eq!(
+        parsed
+            .entries
+            .iter()
+            .map(|e| e.usage.cache_read_tokens)
+            .sum::<i64>(),
+        27_000
+    );
+    assert_eq!(
+        parsed
+            .entries
+            .iter()
+            .map(|e| e.usage.output_tokens)
+            .sum::<i64>(),
+        350
+    );
+}
+
+#[test]
+fn native_per_response_usage_is_kept_when_it_differs_from_the_checkpoint() {
+    // A genuine per-response `usage` must stay authoritative even when the
+    // cumulative checkpoint also includes earlier requests.
+    let parsed = parse(&[
+        context("turn-a"),
+        record(
+            "resp-1",
+            counts(4_000, 3_000, 200, 50),
+            counts(10_000, 8_000, 500, 100),
+        ),
+    ]);
+    assert_eq!(parsed.entries.len(), 1);
+    assert_eq!(parsed.entries[0].usage.input_tokens, 1_000);
+    assert_eq!(parsed.entries[0].usage.cache_read_tokens, 3_000);
+}
+
+#[test]
 fn late_records_after_aggregate_heartbeat_do_not_regress_cumulative_baseline() {
     let parsed = parse(&[
         context("turn-a"),
