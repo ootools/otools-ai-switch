@@ -50,6 +50,9 @@ pub struct ExtractedApiCredential {
     pub api_key_field: Option<&'static str>,
     pub model_mappings: Vec<ModelMapping>,
     pub user_agent: Option<String>,
+    /// Ordered custom upstream headers a reader preserves verbatim. cc-switch
+    /// never sets any; Codex++ relays and Magpie providers carry their own.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Claude Code env keys that carry a per-role upstream model, paired with the
@@ -451,6 +454,7 @@ pub fn extract_api_credential(
         api_key_field,
         model_mappings,
         user_agent,
+        extra_headers: Vec::new(),
     })
 }
 

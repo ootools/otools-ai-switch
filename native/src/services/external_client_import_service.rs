@@ -368,8 +368,20 @@ fn build_payload(extracted: &ExtractedApiCredential) -> CredentialPayload {
     if let Some(api_key_field) = extracted.api_key_field {
         config["api_key_field"] = json!(api_key_field);
     }
-    if let Some(user_agent) = extracted.user_agent.as_deref() {
-        config["headers"] = json!({ "User-Agent": user_agent });
+    if !extracted.extra_headers.is_empty() || extracted.user_agent.is_some() {
+        // serde_json's map sorts keys, but headers are a name→value table:
+        // insertion order carries no meaning, so extra headers and the
+        // User-Agent merge without an order contract.
+        let mut headers = serde_json::Map::new();
+        for (name, value) in &extracted.extra_headers {
+            headers.insert(name.trim().to_string(), json!(value.trim()));
+        }
+        if let Some(user_agent) = extracted.user_agent.as_deref().map(str::trim) {
+            headers
+                .entry("User-Agent".to_string())
+                .or_insert_with(|| json!(user_agent));
+        }
+        config["headers"] = Value::Object(headers);
     }
     let config_json = config.to_string();
     let preview_json = RoutePreviewService::generate(
@@ -389,6 +401,7 @@ fn build_payload(extracted: &ExtractedApiCredential) -> CredentialPayload {
 mod tests {
     use super::*;
     use crate::database::{create_memory_pool, run_migrations};
+    use crate::models::platform::ApiDialect;
     use serde_json::json;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::path::Path;
@@ -875,5 +888,40 @@ mod tests {
         assert_eq!(mask_api_key("sk-1234567890"), "sk-1***7890");
         assert_eq!(mask_api_key("short"), "sh***");
         assert_eq!(mask_api_key("   "), "(empty)");
+    }
+
+    #[test]
+    fn build_payload_merges_custom_headers_with_the_user_agent() {
+        let extracted = ExtractedApiCredential {
+            platform: PlatformId::Claude,
+            display_name: "Custom".to_string(),
+            api_key: "sk-x".to_string(),
+            base_url: "https://custom.example".to_string(),
+            interface_format: ApiDialect::Anthropic,
+            api_key_field: None,
+            model_mappings: Vec::new(),
+            user_agent: Some("ua/1".to_string()),
+            extra_headers: vec![
+                ("X-Debug".to_string(), "1".to_string()),
+                ("X-Trace".to_string(), "2".to_string()),
+            ],
+        };
+
+        let payload = build_payload(&extracted);
+        let config: Value =
+            serde_json::from_str(&payload.config_json).expect("config json");
+        let headers = config["headers"].as_object().expect("headers object");
+        assert_eq!(headers.get("User-Agent"), Some(&json!("ua/1")));
+        assert_eq!(headers.get("X-Debug"), Some(&json!("1")));
+        assert_eq!(headers.get("X-Trace"), Some(&json!("2")));
+
+        let mut without_agent = extracted.clone();
+        without_agent.user_agent = None;
+        let payload = build_payload(&without_agent);
+        let config: Value =
+            serde_json::from_str(&payload.config_json).expect("config json");
+        let headers = config["headers"].as_object().expect("headers object");
+        assert_eq!(headers.get("X-Debug"), Some(&json!("1")));
+        assert!(headers.get("User-Agent").is_none());
     }
 }
