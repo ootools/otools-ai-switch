@@ -1,8 +1,10 @@
 //! Preview and commit for "import from another client".
 //!
-//! Only cc-switch is supported today; the client id is a parameter rather than
-//! baked in so a second reader can be added without reshaping the command
-//! surface.
+//! Three readers are supported today — cc-switch, Codex++ and Magpie. Each
+//! reader module owns "find the config" and "produce entries"; this service
+//! owns classification, dedupe and the commit. The client id is a parameter
+//! rather than baked in so a further reader can be added without reshaping the
+//! command surface.
 //!
 //! Dedupe rule: `(external_source_client, external_source_id)` is unique, so an
 //! account already imported from a given source record is *overwritten* rather
@@ -17,15 +19,19 @@ use crate::error::AppError;
 use crate::models::external_client_import::{
     ExternalClientAccountPreviewItem, ExternalClientImportOutcome, ExternalClientImportPreview,
     ExternalClientImportPreviewCounts, ImportExternalClientAccountsInput,
-    PreviewExternalClientImportInput, EXTERNAL_CLIENT_CC_SWITCH,
+    PreviewExternalClientImportInput, EXTERNAL_CLIENT_CC_SWITCH, EXTERNAL_CLIENT_CODEX_PLUS,
+    EXTERNAL_CLIENT_MAGPIE,
 };
 use crate::models::platform::{PlatformId, PlatformOperation};
 use crate::services::cc_switch_import_service::{
-    self as cc_switch, ExternalClientProvider, ExtractIssue, ExtractedApiCredential,
+    self as cc_switch, ExtractedApiCredential,
 };
+use crate::services::codex_plus_import_service as codex_plus;
+use crate::services::cpa_import_service::ParsedOfficialCredential;
 // Reuse the deep-link masker rather than growing a second one: the preview must
 // mask exactly like every other credential surface.
 use crate::services::deeplink_service::mask_api_key;
+use crate::services::magpie_import_service as magpie;
 use crate::services::platform_capability_service::PlatformCapabilityService;
 use crate::services::route_preview_service::RoutePreviewService;
 use serde_json::{json, Value};
@@ -35,7 +41,82 @@ use std::collections::{HashMap, HashSet};
 /// Clients this build can read. Kept as a list so the frontend can be told what
 /// is available rather than hard-coding the same knowledge twice.
 pub fn supported_clients() -> Vec<&'static str> {
-    vec![EXTERNAL_CLIENT_CC_SWITCH]
+    vec![
+        EXTERNAL_CLIENT_CC_SWITCH,
+        EXTERNAL_CLIENT_CODEX_PLUS,
+        EXTERNAL_CLIENT_MAGPIE,
+    ]
+}
+
+/// One record a reader found, already translated into AI Switch terms.
+///
+/// Readers do the per-client extraction; everything after this point in the
+/// service is client-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedExternalEntry {
+    pub source_id: String,
+    pub body: PreparedBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedBody {
+    /// A ready-to-store API account.
+    Api(ExtractedApiCredential),
+    /// A ready-to-store official subscription account (OAuth snapshot).
+    Official(ParsedOfficialCredential),
+    /// Listable but not importable: the row shows with the issue so the user
+    /// can see why and fix the source.
+    Broken {
+        display_name: String,
+        issue_code: &'static str,
+        platform_hint: Option<PlatformId>,
+    },
+    /// Not listable at all, only counted.
+    Skipped(SkipBucket),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipBucket {
+    /// Belongs to another AI Switch platform; labelled for the "switch to the
+    /// other platform" hint.
+    OtherPlatform(Option<PlatformId>, String),
+    /// Nothing AI Switch can map (another vendor's subscription, an internal
+    /// aggregate definition); labelled for the unsupported summary.
+    Unsupported(String),
+}
+
+/// Locates the source config and reads every entry out of it.
+///
+/// Returns the display path alongside the entries: the preview shows where the
+/// accounts came from.
+async fn resolve_entries(
+    client: &str,
+    source_path: Option<&str>,
+) -> Result<(Vec<PreparedExternalEntry>, String), AppError> {
+    match client {
+        EXTERNAL_CLIENT_CC_SWITCH => {
+            let path = cc_switch::resolve_source_path(source_path)?;
+            let entries = cc_switch::prepare_entries(&path).await?;
+            Ok((entries, path.display().to_string()))
+        }
+        EXTERNAL_CLIENT_CODEX_PLUS => {
+            let dir = codex_plus::resolve_source_dir(source_path)?;
+            let entries = codex_plus::prepare_entries(&dir).await?;
+            Ok((entries, dir.display().to_string()))
+        }
+        EXTERNAL_CLIENT_MAGPIE => {
+            let dir = magpie::resolve_source_dir(source_path)?;
+            let entries = magpie::prepare_entries(&dir).await?;
+            Ok((entries, dir.display().to_string()))
+        }
+        // validate_client only lets the three constants through.
+        _ => Err(AppError::Validation {
+            code: "external_import.client_unsupported",
+            message: "This client cannot be imported yet".to_string(),
+            details: Some(client.to_string()),
+            recoverable: true,
+        }),
+    }
 }
 
 fn validate_client(client: &str) -> Result<&'static str, AppError> {
@@ -58,20 +139,24 @@ pub async fn preview_external_client_import(
     let platform = PlatformId::parse(&input.platform)?;
     PlatformCapabilityService::require(platform, PlatformOperation::RouteCredentials)?;
 
-    let source_path = cc_switch::resolve_source_path(input.source_path.as_deref())?;
-    let providers = cc_switch::read_providers(&source_path).await?;
+    let (entries, source_path) = resolve_entries(client, input.source_path.as_deref()).await?;
     let existing = existing_matches(pool, client).await?;
 
     let mut counts = ExternalClientImportPreviewCounts::default();
     let mut items = Vec::new();
-    for provider in &providers {
-        match classify(provider, platform, &existing) {
-            Classification::OtherPlatform(other) => {
+    for entry in &entries {
+        match classify(entry, platform, &existing) {
+            Classification::OtherPlatform { label, .. } => {
                 counts.other_platform += 1;
-                let label = other
-                    .map(|platform| platform.as_str().to_string())
-                    .unwrap_or_else(|| provider.app_type.trim().to_string());
                 *counts.other_platform_counts.entry(label).or_default() += 1;
+            }
+            // 占位：Task 6 换成真正的 unsupported 计数字段。
+            Classification::Unsupported(label) => {
+                counts.other_platform += 1;
+                *counts
+                    .other_platform_counts
+                    .entry(format!("unsupported:{label}"))
+                    .or_default() += 1;
             }
             Classification::Item(item) => {
                 counts.total += 1;
@@ -86,6 +171,9 @@ pub async fn preview_external_client_import(
                     }
                     _ => counts.errors += 1,
                 }
+                if item.kind == "official" {
+                    counts.official += 1;
+                }
                 items.push(item);
             }
         }
@@ -93,7 +181,7 @@ pub async fn preview_external_client_import(
 
     Ok(ExternalClientImportPreview {
         client: client.to_string(),
-        source_path: source_path.display().to_string(),
+        source_path,
         counts,
         items,
     })
@@ -125,8 +213,7 @@ pub async fn import_external_client_accounts(
     // Re-read the config instead of trusting a payload from the frontend: the
     // secrets never leave this process, and a stale selection surfaces as a
     // skipped id rather than an account built from client-supplied fields.
-    let source_path = cc_switch::resolve_source_path(input.source_path.as_deref())?;
-    let providers = cc_switch::read_providers(&source_path).await?;
+    let (entries, _source_path) = resolve_entries(client, input.source_path.as_deref()).await?;
     let existing = existing_matches(pool, client).await?;
 
     let mut outcome = ExternalClientImportOutcome::default();
@@ -138,18 +225,27 @@ pub async fn import_external_client_accounts(
         recoverable: true,
     })?;
 
-    for provider in &providers {
-        if !selected.contains(&provider.source_id) {
+    for entry in &entries {
+        if !selected.contains(&entry.source_id) {
             continue;
         }
-        matched.insert(provider.source_id.clone());
+        matched.insert(entry.source_id.clone());
 
-        let extracted = match cc_switch::extract_api_credential(provider) {
-            Ok(extracted) if extracted.platform == platform => extracted,
-            // Both arms mean the same thing to the user: the entry they picked
-            // is no longer importable, so it is reported as failed rather than
-            // silently dropped.
-            Ok(_) | Err(_) => {
+        // Both arms mean the same thing to the user: the entry they picked is
+        // no longer importable, so it is reported as failed rather than
+        // silently dropped.
+        let extracted = match &entry.body {
+            PreparedBody::Api(extracted) if extracted.platform == platform => extracted.clone(),
+            PreparedBody::Api(_) | PreparedBody::Broken { .. } => {
+                outcome.failed += 1;
+                continue;
+            }
+            // 占位：official 条目的真实落库在 Task 6 落地前不可导入。
+            PreparedBody::Official(_) => {
+                outcome.failed += 1;
+                continue;
+            }
+            PreparedBody::Skipped(_) => {
                 outcome.failed += 1;
                 continue;
             }
@@ -158,7 +254,7 @@ pub async fn import_external_client_accounts(
         let payload = build_payload(&extracted);
         // Same guard as the preview: only overwrite a row this platform's API
         // tab could have produced.
-        let matched = match overwrite_target(existing.get(&provider.source_id), platform) {
+        let matched = match overwrite_target(existing.get(&entry.source_id), platform) {
             Ok(matched) => matched,
             Err(_) => {
                 outcome.failed += 1;
@@ -195,7 +291,7 @@ pub async fn import_external_client_accounts(
                     &payload.preview_json,
                     Some(ExternalSourceRef {
                         client,
-                        source_id: &provider.source_id,
+                        source_id: &entry.source_id,
                     }),
                 )
                 .await?;
@@ -233,7 +329,13 @@ enum Classification {
     /// Belongs to another AI Switch platform, so it is counted but not listed:
     /// the accounts page is per-platform and an entry the user cannot act on
     /// here is noise.
-    OtherPlatform(Option<PlatformId>),
+    OtherPlatform {
+        platform: Option<PlatformId>,
+        label: String,
+    },
+    /// Nothing AI Switch can map at all (another vendor's subscription, an
+    /// aggregate definition); counted under its label only.
+    Unsupported(String),
     Item(ExternalClientAccountPreviewItem),
 }
 
@@ -266,23 +368,29 @@ fn overwrite_target<'a>(
 
 const CONFLICTING_LOCAL_ACCOUNT: &str = "external_import.conflicting_local_account";
 
+/// Until Task 6 lands, official entries cannot preview importably; they show
+/// with the long-standing official-login issue rather than a wrong one.
+const OFFICIAL_PREVIEW_PLACEHOLDER_ISSUE: &str = "external_import.official_login_unsupported";
+
 fn classify(
-    provider: &ExternalClientProvider,
+    entry: &PreparedExternalEntry,
     platform: PlatformId,
     existing: &HashMap<String, ExternalSourceMatch>,
 ) -> Classification {
-    let entry_platform = cc_switch::platform_for_app_type(&provider.app_type);
-    match cc_switch::extract_api_credential(provider) {
-        Ok(extracted) => {
+    match &entry.body {
+        PreparedBody::Api(extracted) => {
             if extracted.platform != platform {
-                return Classification::OtherPlatform(Some(extracted.platform));
+                return Classification::OtherPlatform {
+                    platform: Some(extracted.platform),
+                    label: extracted.platform.as_str().to_string(),
+                };
             }
-            let matched = match overwrite_target(existing.get(&provider.source_id), platform) {
+            let matched = match overwrite_target(existing.get(&entry.source_id), platform) {
                 Ok(matched) => matched,
                 Err(conflict) => {
                     return Classification::Item(ExternalClientAccountPreviewItem {
                         kind: "api".to_string(),
-                        source_id: provider.source_id.clone(),
+                        source_id: entry.source_id.clone(),
                         display_name: extracted.display_name.clone(),
                         platform: extracted.platform.as_str().to_string(),
                         interface_format: Some(extracted.interface_format.as_str().to_string()),
@@ -298,7 +406,7 @@ fn classify(
             };
             Classification::Item(ExternalClientAccountPreviewItem {
                 kind: "api".to_string(),
-                source_id: provider.source_id.clone(),
+                source_id: entry.source_id.clone(),
                 display_name: extracted.display_name.clone(),
                 platform: extracted.platform.as_str().to_string(),
                 interface_format: Some(extracted.interface_format.as_str().to_string()),
@@ -316,22 +424,21 @@ fn classify(
                 issue_codes: Vec::new(),
             })
         }
-        Err(issue) => {
-            // A platform we do not map at all is not this platform's problem;
-            // anything else is a real error the user should see and fix.
-            if issue == ExtractIssue::PlatformUnsupported {
-                return Classification::OtherPlatform(entry_platform);
-            }
-            if entry_platform.is_some_and(|entry_platform| entry_platform != platform) {
-                return Classification::OtherPlatform(entry_platform);
+        // 占位：Task 6 把这里换成真正的 official 预览行（kind 徽标、打码
+        // token、同 kind 覆盖判断）。
+        PreparedBody::Official(credential) => {
+            let credential_platform = PlatformId::parse(&credential.platform).ok();
+            if credential_platform.is_some_and(|parsed| parsed != platform) {
+                return Classification::OtherPlatform {
+                    platform: credential_platform,
+                    label: credential.platform.clone(),
+                };
             }
             Classification::Item(ExternalClientAccountPreviewItem {
-                kind: "api".to_string(),
-                source_id: provider.source_id.clone(),
-                display_name: provider.display_name.trim().to_string(),
-                platform: entry_platform
-                    .map(|platform| platform.as_str().to_string())
-                    .unwrap_or_else(|| provider.app_type.trim().to_string()),
+                kind: "official".to_string(),
+                source_id: entry.source_id.clone(),
+                display_name: credential.display_name.clone(),
+                platform: credential.platform.clone(),
                 interface_format: None,
                 base_url: None,
                 api_key_masked: None,
@@ -339,9 +446,48 @@ fn classify(
                 disposition: "error".to_string(),
                 existing_credential_id: None,
                 existing_display_name: None,
-                issue_codes: vec![issue.code().to_string()],
+                issue_codes: vec![OFFICIAL_PREVIEW_PLACEHOLDER_ISSUE.to_string()],
             })
         }
+        PreparedBody::Broken {
+            display_name,
+            issue_code,
+            platform_hint,
+        } => {
+            // A platform we do not map at all is not this platform's problem;
+            // anything else is a real error the user should see and fix.
+            if platform_hint.is_some_and(|hint| hint != platform) {
+                return Classification::OtherPlatform {
+                    platform: *platform_hint,
+                    label: platform_hint
+                        .map(|hint| hint.as_str().to_string())
+                        .unwrap_or_else(|| display_name.clone()),
+                };
+            }
+            Classification::Item(ExternalClientAccountPreviewItem {
+                kind: "api".to_string(),
+                source_id: entry.source_id.clone(),
+                display_name: display_name.clone(),
+                platform: platform_hint
+                    .map(|hint| hint.as_str().to_string())
+                    .unwrap_or_default(),
+                interface_format: None,
+                base_url: None,
+                api_key_masked: None,
+                model_mapping_count: 0,
+                disposition: "error".to_string(),
+                existing_credential_id: None,
+                existing_display_name: None,
+                issue_codes: vec![(*issue_code).to_string()],
+            })
+        }
+        PreparedBody::Skipped(bucket) => match bucket {
+            SkipBucket::OtherPlatform(platform, label) => Classification::OtherPlatform {
+                platform: *platform,
+                label: label.clone(),
+            },
+            SkipBucket::Unsupported(label) => Classification::Unsupported(label.clone()),
+        },
     }
 }
 
