@@ -540,7 +540,6 @@ export function cancelCodexOAuth(sessionId: string): Promise<CodexOAuthStatus> {
 }
 
 export function importOfficialRouteCredentialsFromText(input: {
-  platform: string;
   text: string;
   batch_name?: string | null;
 }): Promise<RouteCredentialImportResult> {
@@ -548,7 +547,6 @@ export function importOfficialRouteCredentialsFromText(input: {
 }
 
 export function importOfficialRouteCredentialsFromFiles(input: {
-  platform: string;
   file_paths: string[];
   batch_name?: string | null;
 }): Promise<RouteCredentialImportResult> {
