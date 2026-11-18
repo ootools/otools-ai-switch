@@ -281,6 +281,7 @@ fn classify(
                 Ok(matched) => matched,
                 Err(conflict) => {
                     return Classification::Item(ExternalClientAccountPreviewItem {
+                        kind: "api".to_string(),
                         source_id: provider.source_id.clone(),
                         display_name: extracted.display_name.clone(),
                         platform: extracted.platform.as_str().to_string(),
@@ -296,6 +297,7 @@ fn classify(
                 }
             };
             Classification::Item(ExternalClientAccountPreviewItem {
+                kind: "api".to_string(),
                 source_id: provider.source_id.clone(),
                 display_name: extracted.display_name.clone(),
                 platform: extracted.platform.as_str().to_string(),
@@ -324,6 +326,7 @@ fn classify(
                 return Classification::OtherPlatform(entry_platform);
             }
             Classification::Item(ExternalClientAccountPreviewItem {
+                kind: "api".to_string(),
                 source_id: provider.source_id.clone(),
                 display_name: provider.display_name.trim().to_string(),
                 platform: entry_platform
