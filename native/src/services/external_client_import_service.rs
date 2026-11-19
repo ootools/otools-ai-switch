@@ -15,6 +15,7 @@
 use crate::database::repositories::route_credential_repository::{
     ExternalSourceMatch, ExternalSourceRef, RouteCredentialRepository,
 };
+use crate::database::repositories::route_pool_repository::UNIFIED_POOL_PLATFORM;
 use crate::error::AppError;
 use crate::models::external_client_import::{
     ExternalClientAccountPreviewItem, ExternalClientImportOutcome, ExternalClientImportPreview,
@@ -100,11 +101,7 @@ async fn resolve_entries(
             let entries = cc_switch::prepare_entries(&path).await?;
             Ok((entries, path.display().to_string()))
         }
-        EXTERNAL_CLIENT_CODEX_PLUS => {
-            let dir = codex_plus::resolve_source_dir(source_path)?;
-            let entries = codex_plus::prepare_entries(&dir).await?;
-            Ok((entries, dir.display().to_string()))
-        }
+        EXTERNAL_CLIENT_CODEX_PLUS => codex_plus::read_entries(source_path).await,
         EXTERNAL_CLIENT_MAGPIE => {
             let dir = magpie::resolve_source_dir(source_path)?;
             let entries = magpie::prepare_entries(&dir).await?;
@@ -207,163 +204,57 @@ pub async fn import_external_client_accounts(
         });
     }
 
-    // Re-read the config instead of trusting a payload from the frontend: the
-    // secrets never leave this process, and a stale selection surfaces as a
-    // skipped id rather than an account built from client-supplied fields.
-    let (entries, _source_path) = resolve_entries(client, input.source_path.as_deref()).await?;
-    let existing = existing_matches(pool, client).await?;
-
-    let mut outcome = ExternalClientImportOutcome::default();
-    let mut matched = HashSet::new();
-    let mut tx = pool.begin().await.map_err(|error| AppError::Database {
+    // The preview supplies IDs only. Load the current bindings under the same
+    // write transaction to keep concurrent imports from creating duplicates.
+    let (entries, _) = resolve_entries(client, input.source_path.as_deref()).await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|error| AppError::Database {
         code: "database.external_client_import_tx",
         message: "Could not start the external account import".to_string(),
         details: Some(error.to_string()),
         recoverable: true,
     })?;
-
+    let existing = existing_matches(&mut *tx, client).await?;
+    let mut outcome = ExternalClientImportOutcome::default();
+    let mut matched = HashSet::new();
     for entry in &entries {
-        if !selected.contains(&entry.source_id) {
+        if !selected.contains(&entry.source_id) || !matched.insert(&entry.source_id) {
             continue;
         }
-        matched.insert(entry.source_id.clone());
-
-        // Both arms mean the same thing to the user: the entry they picked is
-        // no longer importable, so it is reported as failed rather than
-        // silently dropped.
-        let extracted = match &entry.body {
-            PreparedBody::Api(extracted) if extracted.platform == platform => extracted.clone(),
-            PreparedBody::Api(_) | PreparedBody::Broken { .. } => {
-                outcome.failed += 1;
-                continue;
-            }
-            PreparedBody::Skipped(_) => {
-                outcome.failed += 1;
-                continue;
-            }
-            // official 条目由下面的专用循环落库。
-            PreparedBody::Official(_) => {
-                continue;
-            }
-        };
-
-        let payload = build_payload(&extracted);
-        // Same guard as the preview: only overwrite a row this platform's API
-        // tab could have produced.
-        let matched = match overwrite_target(existing.get(&entry.source_id), platform, "api") {
-            Ok(matched) => matched,
-            Err(_) => {
+        let (vendor, kind, display_name, email, payload) = match &entry.body {
+            PreparedBody::Api(api) if platform_in_scope(platform, api.platform) => (
+                api.platform.as_str(), "api", api.display_name.as_str(), None, build_payload(api),
+            ),
+            PreparedBody::Official(credential)
+                if PlatformId::parse(&credential.platform).is_ok_and(|vendor| platform_in_scope(platform, vendor)) => (
+                    credential.platform.as_str(), "official", credential.display_name.as_str(),
+                    credential.email.as_deref(), official_payload(credential),
+                ),
+            _ => {
                 outcome.failed += 1;
                 continue;
             }
         };
-        match matched {
-            Some(existing) => {
+        match overwrite_target(existing.get(&entry.source_id), kind) {
+            Ok(Some(existing)) => {
                 RouteCredentialRepository::overwrite_from_external_source(
-                    &mut tx,
-                    &existing.id,
-                    &extracted.display_name,
-                    &payload.secret_payload_json,
-                    &payload.config_json,
-                    &payload.preview_json,
-                )
-                .await?;
+                    &mut tx, &existing.id, display_name, &payload.secret_payload_json,
+                    &payload.config_json, &payload.preview_json,
+                    (kind == "official").then_some((vendor, email)),
+                ).await?;
                 outcome.overwritten += 1;
-                outcome
-                    .imported
-                    .push(RouteCredentialRepository::get_tx(&mut tx, &existing.id).await?);
+                outcome.imported.push(RouteCredentialRepository::get_tx(&mut tx, &existing.id).await?);
             }
-            None => {
+            Ok(None) => {
                 let created = RouteCredentialRepository::create_tx_with_external_source(
-                    &mut tx,
-                    extracted.platform.as_str(),
-                    "api",
-                    &extracted.display_name,
-                    None,
-                    "ok",
-                    None,
-                    &payload.secret_payload_json,
-                    &payload.config_json,
-                    &payload.preview_json,
-                    Some(ExternalSourceRef {
-                        client,
-                        source_id: &entry.source_id,
-                    }),
-                )
-                .await?;
+                    &mut tx, vendor, kind, display_name, email.map(str::to_owned), "ok", None,
+                    &payload.secret_payload_json, &payload.config_json, &payload.preview_json,
+                    Some(ExternalSourceRef { client, source_id: &entry.source_id }),
+                ).await?;
                 outcome.created += 1;
                 outcome.created_ids.push(created.id.clone());
                 outcome.imported.push(created);
             }
-        }
-    }
-
-    // Official entries run through the same transaction: same dedupe key, same
-    // overwrite guard, but their kind and payload come from the parsed
-    // credential instead of `build_payload`.
-    for entry in &entries {
-        let PreparedBody::Official(credential) = &entry.body else {
-            continue;
-        };
-        if !selected.contains(&entry.source_id) {
-            continue;
-        }
-        matched.insert(entry.source_id.clone());
-
-        let Some(credential_platform) = PlatformId::parse(&credential.platform).ok() else {
-            outcome.failed += 1;
-            continue;
-        };
-        if credential_platform != platform {
-            outcome.failed += 1;
-            continue;
-        }
-        let payload = official_payload(credential);
-        let matched = match overwrite_target(existing.get(&entry.source_id), platform, "official") {
-            Ok(matched) => matched,
-            Err(_) => {
-                outcome.failed += 1;
-                continue;
-            }
-        };
-        match matched {
-            Some(existing) => {
-                RouteCredentialRepository::overwrite_from_external_source(
-                    &mut tx,
-                    &existing.id,
-                    &credential.display_name,
-                    &payload.secret_payload_json,
-                    &payload.config_json,
-                    &payload.preview_json,
-                )
-                .await?;
-                outcome.overwritten += 1;
-                outcome
-                    .imported
-                    .push(RouteCredentialRepository::get_tx(&mut tx, &existing.id).await?);
-            }
-            None => {
-                let created = RouteCredentialRepository::create_tx_with_external_source(
-                    &mut tx,
-                    credential.platform.as_str(),
-                    "official",
-                    &credential.display_name,
-                    credential.email.clone(),
-                    "ok",
-                    None,
-                    &payload.secret_payload_json,
-                    &payload.config_json,
-                    &payload.preview_json,
-                    Some(ExternalSourceRef {
-                        client,
-                        source_id: &entry.source_id,
-                    }),
-                )
-                .await?;
-                outcome.created += 1;
-                outcome.created_ids.push(created.id.clone());
-                outcome.imported.push(created);
-            }
+            Err(_) => outcome.failed += 1,
         }
     }
 
@@ -378,12 +269,12 @@ pub async fn import_external_client_accounts(
     Ok(outcome)
 }
 
-async fn existing_matches(
-    pool: &SqlitePool,
+async fn existing_matches<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
     client: &str,
 ) -> Result<HashMap<String, ExternalSourceMatch>, AppError> {
     Ok(
-        RouteCredentialRepository::external_source_matches(pool, client)
+        RouteCredentialRepository::external_source_matches(executor, client)
             .await?
             .into_iter()
             .collect(),
@@ -412,7 +303,6 @@ enum Classification {
 /// see from here, so those cases become a visible error instead.
 fn overwrite_target<'a>(
     matched: Option<&'a ExternalSourceMatch>,
-    platform: PlatformId,
     entry_kind: &str,
 ) -> Result<Option<&'a ExternalSourceMatch>, ExternalSourceMatch> {
     match matched {
@@ -432,6 +322,29 @@ fn overwrite_target<'a>(
     }
 }
 
+/// Codex identifies the unified pool rather than a vendor filter in that view.
+fn platform_in_scope(requested: PlatformId, vendor: PlatformId) -> bool {
+    requested.as_str() == UNIFIED_POOL_PLATFORM || requested == vendor
+}
+
+/// A preview needs the endpoint, not URL credentials, query values or fragments.
+fn sanitize_external_url(input: &str) -> Option<String> {
+    let mut url = url::Url::parse(input).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return None;
+    }
+    // Preserve the spelling of ordinary URLs (e.g. a bare hostname without a
+    // trailing slash) after validation. Only rewrite when there's data to hide.
+    if url.username().is_empty() && url.password().is_none() && url.query().is_none() && url.fragment().is_none() {
+        return Some(input.to_string());
+    }
+    url.set_password(None).ok()?;
+    url.set_username("").ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.into())
+}
+
 const CONFLICTING_LOCAL_ACCOUNT: &str = "external_import.conflicting_local_account";
 
 fn classify(
@@ -441,13 +354,13 @@ fn classify(
 ) -> Classification {
     match &entry.body {
         PreparedBody::Api(extracted) => {
-            if extracted.platform != platform {
+            if !platform_in_scope(platform, extracted.platform) {
                 return Classification::OtherPlatform {
                     platform: Some(extracted.platform),
                     label: extracted.platform.as_str().to_string(),
                 };
             }
-            let matched = match overwrite_target(existing.get(&entry.source_id), platform, "api") {
+            let matched = match overwrite_target(existing.get(&entry.source_id), "api") {
                 Ok(matched) => matched,
                 Err(conflict) => {
                     return Classification::Item(ExternalClientAccountPreviewItem {
@@ -456,7 +369,7 @@ fn classify(
                         display_name: extracted.display_name.clone(),
                         platform: extracted.platform.as_str().to_string(),
                         interface_format: Some(extracted.interface_format.as_str().to_string()),
-                        base_url: Some(extracted.base_url.clone()),
+                        base_url: sanitize_external_url(&extracted.base_url),
                         api_key_masked: Some(mask_api_key(&extracted.api_key)),
                         model_mapping_count: extracted.model_mappings.len(),
                         disposition: "error".to_string(),
@@ -472,7 +385,7 @@ fn classify(
                 display_name: extracted.display_name.clone(),
                 platform: extracted.platform.as_str().to_string(),
                 interface_format: Some(extracted.interface_format.as_str().to_string()),
-                base_url: Some(extracted.base_url.clone()),
+                base_url: sanitize_external_url(&extracted.base_url),
                 api_key_masked: Some(mask_api_key(&extracted.api_key)),
                 model_mapping_count: extracted.model_mappings.len(),
                 disposition: if matched.is_some() {
@@ -488,13 +401,13 @@ fn classify(
         }
         PreparedBody::Official(credential) => {
             let credential_platform = PlatformId::parse(&credential.platform).ok();
-            if credential_platform.is_some_and(|parsed| parsed != platform) {
+            if credential_platform.is_some_and(|parsed| !platform_in_scope(platform, parsed)) {
                 return Classification::OtherPlatform {
                     platform: credential_platform,
                     label: credential.platform.clone(),
                 };
             }
-            let matched = match overwrite_target(existing.get(&entry.source_id), platform, "official")
+            let matched = match overwrite_target(existing.get(&entry.source_id), "official")
             {
                 Ok(matched) => matched,
                 Err(conflict) => {
@@ -542,7 +455,7 @@ fn classify(
         } => {
             // A platform we do not map at all is not this platform's problem;
             // anything else is a real error the user should see and fix.
-            if platform_hint.is_some_and(|hint| hint != platform) {
+            if platform_hint.is_some_and(|hint| !platform_in_scope(platform, hint)) {
                 return Classification::OtherPlatform {
                     platform: *platform_hint,
                     label: platform_hint
@@ -568,6 +481,9 @@ fn classify(
             })
         }
         PreparedBody::Skipped(bucket) => match bucket {
+            SkipBucket::OtherPlatform(_, label) if platform.as_str() == UNIFIED_POOL_PLATFORM => {
+                Classification::Unsupported(label.clone())
+            }
             SkipBucket::OtherPlatform(platform, label) => Classification::OtherPlatform {
                 platform: *platform,
                 label: label.clone(),
@@ -1147,6 +1063,32 @@ mod tests {
         assert!(overwritten.secret_payload_json.contains("sk-one"));
     }
 
+    #[tokio::test]
+    async fn api_preview_masks_urls_with_credentials_and_query_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let url = "https://fixture-user:fixture-password@relay.example/v1?api_key=fixture-query-secret#fixture-fragment";
+        tokio::fs::write(dir.path().join("providers.json"), json!({"providers": [{
+            "id": "relay", "name": "Relay", "key": "sk-fixture-key", "responses": url,
+        }]}).to_string()).await.unwrap();
+        let path = Some(dir.path().display().to_string());
+        let preview = preview_external_client_import(&pool, PreviewExternalClientImportInput {
+            client: EXTERNAL_CLIENT_MAGPIE.into(), platform: "codex".into(), source_path: path.clone(),
+        }).await.unwrap();
+        assert_eq!(preview.items[0].base_url.as_deref(), Some("https://relay.example/v1"));
+        let serialized = serde_json::to_string(&preview).unwrap();
+        for secret in ["fixture-user", "fixture-password", "fixture-query-secret", "fixture-fragment", "sk-fixture-key"] {
+            assert!(!serialized.contains(secret));
+        }
+        let result = import_external_client_accounts(&pool, ImportExternalClientAccountsInput {
+            client: EXTERNAL_CLIENT_MAGPIE.into(), platform: "codex".into(), source_path: path,
+            source_ids: vec!["provider:relay:responses".into()],
+        }).await.unwrap();
+        let config: Value = serde_json::from_str(&result.imported[0].config_json).unwrap();
+        assert_eq!(config["base_url"], url);
+    }
+
     #[test]
     fn masking_never_reveals_a_usable_key() {
         assert_eq!(mask_api_key("sk-1234567890"), "sk-1***7890");
@@ -1156,6 +1098,7 @@ mod tests {
 
     // ---- codex-plus / magpie：official 条目与真计数（Task 6）----
 
+
     async fn write_codex_plus_official_fixture(dir: &Path, display: &str) {
         let content = json!({
             "relayProfiles": [{
@@ -1163,7 +1106,7 @@ mod tests {
                 "name": display,
                 "relayMode": "official",
                 // settings.json 里的 authContents 是 JSON 字符串（auth.json 原文）。
-                "authContents": r#"{"tokens":{"id_token":"id-tok","access_token":"at-tok","refresh_token":"rt-tok","account_id":"acc-1"}}"#,
+                "authContents": crate::services::codex_plus_import_service::test_support::valid_auth(),
             }]
         })
         .to_string();
@@ -1229,12 +1172,14 @@ mod tests {
         assert!(item.api_key_masked.as_deref().is_some_and(|m| m.contains("***")));
         // 预览是展示载荷：快照明文不出现在序列化结果里。
         let serialized = serde_json::to_string(&preview).expect("serialize preview");
-        assert!(!serialized.contains("at-tok"));
-        assert!(!serialized.contains("rt-tok"));
+        let fixture: Value = serde_json::from_str(&codex_plus::test_support::valid_auth()).unwrap();
+        for key in ["access_token", "id_token", "refresh_token"] {
+            assert!(!serialized.contains(fixture["tokens"][key].as_str().unwrap()));
+        }
     }
 
     #[tokio::test]
-    async fn magpie_logins_list_on_their_own_platform_and_count_otherwise() {
+    async fn explicit_vendor_preview_keeps_legacy_filtering() {
         let dir = tempfile::tempdir().expect("temp dir");
         tokio::fs::write(
             dir.path().join("logins.json"),
@@ -1242,7 +1187,7 @@ mod tests {
                 {"id":"cl1","agent":"claude","user":"claude@example.com",
                  "auth":{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"sk-ant-ort01-abc"}}},
                 {"id":"cx1","agent":"codex","user":"codex@example.com",
-                 "auth":{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"id","account_id":"acc"}}}
+                 "auth":{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"id","account_id":"acc","client_id":"fixture-client"}}}
             ]"#,
         )
         .await
@@ -1273,10 +1218,84 @@ mod tests {
         assert_eq!(claude_preview.counts.other_platform, 1);
         assert_eq!(claude_preview.counts.other_platform_counts["codex"], 1);
 
-        let codex_preview = preview("codex".to_string()).await;
-        assert_eq!(codex_preview.counts.total, 1);
-        assert_eq!(codex_preview.items[0].display_name, "codex@example.com");
-        assert_eq!(codex_preview.counts.other_platform_counts["claude"], 1);
+    }
+
+    #[tokio::test]
+    async fn unified_pool_preview_and_import_accept_magpie_claude_accounts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            dir.path().join("logins.json"),
+            r#"[
+                {"id":"cl1","agent":"claude","user":"claude@example.com","auth":{"claudeAiOauth":{"accessToken":"sk-ant-oat01-claude","refreshToken":"sk-ant-ort01-claude","expiresAt":4070908800000,"scopes":["user:inference"]}}},
+                {"id":"cx1","agent":"codex","user":"codex@example.com","auth":{"auth_mode":"chatgpt","tokens":{"access_token":"at","refresh_token":"rt","id_token":"id","account_id":"acc","client_id":"client"}}}
+            ]"#,
+        )
+        .await
+        .expect("write logins");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+
+        let preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("unified-pool preview");
+        assert_eq!(preview.counts.other_platform, 0);
+        assert_eq!(preview.items.len(), 2);
+        assert!(preview.items.iter().any(|item| item.source_id == "login:cl1"));
+        assert!(preview.items.iter().any(|item| item.source_id == "login:cx1"));
+
+        let result = import_external_client_accounts(
+            &pool,
+            ImportExternalClientAccountsInput {
+                client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+                source_ids: vec!["login:cl1".to_string()],
+            },
+        )
+        .await
+        .expect("unified-pool import");
+        assert_eq!(result.created, 1);
+        assert_eq!(result.imported[0].platform, "codex");
+        assert_eq!(result.imported[0].kind, "official");
+        assert_eq!(result.imported[0].provider, "claude");
+        assert_eq!(result.imported[0].email.as_deref(), Some("claude@example.com"));
+    }
+
+    #[tokio::test]
+    async fn unified_pool_import_accepts_magpie_anthropic_api_providers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            dir.path().join("providers.json"),
+            r#"{"providers":[{"id":"claude-relay","name":"Claude relay","key":"sk-api","anthropic":"https://relay.example"}]}"#,
+        )
+        .await
+        .expect("write providers");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+
+        let result = import_external_client_accounts(
+            &pool,
+            ImportExternalClientAccountsInput {
+                client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+                source_ids: vec!["provider:claude-relay:anthropic".to_string()],
+            },
+        )
+        .await
+        .expect("unified-pool API import");
+        assert_eq!(result.created, 1);
+        assert_eq!(result.imported[0].kind, "api");
+        assert_eq!(result.imported[0].provider, "custom");
+        let config: Value = serde_json::from_str(&result.imported[0].config_json).unwrap();
+        assert_eq!(config["interface_format"], "anthropic");
     }
 
     #[tokio::test]
@@ -1325,12 +1344,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overwriting_an_official_source_updates_the_login_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = create_memory_pool().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let auth: Value = serde_json::from_str(&codex_plus::test_support::valid_auth()).unwrap();
+        let input = || ImportExternalClientAccountsInput {
+            client: EXTERNAL_CLIENT_MAGPIE.into(), platform: "codex".into(),
+            source_path: Some(dir.path().display().to_string()), source_ids: vec!["login:one".into()],
+        };
+        let mut ids = Vec::new();
+        for user in ["alice@example.test", "bob@example.test"] {
+            let content = json!([{"id":"one", "agent":"codex", "user":user, "auth":auth}]);
+            tokio::fs::write(dir.path().join("logins.json"), content.to_string()).await.unwrap();
+            let result = import_external_client_accounts(&pool, input()).await.unwrap();
+            assert_eq!(result.imported.len(), 1);
+            assert_eq!(result.imported[0].email.as_deref(), Some(user));
+            ids.push(result.imported[0].id.clone());
+        }
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
     async fn api_rows_and_official_rows_never_overwrite_each_other() {
         let dir = tempfile::tempdir().expect("temp dir");
         // officialMixApiKey 的同 relay 同时给出 :api 与 :official 两条。
         tokio::fs::write(
             dir.path().join("settings.json"),
-            r#"{"relayProfiles":[{"id":"mix1","name":"混合","relayMode":"mixedApi","officialMixApiKey":true,"upstreamBaseUrl":"https://relay.example/v1","apiKey":"sk-mix","authContents":"{\"tokens\":{\"access_token\":\"at\",\"refresh_token\":\"rt\"}}"}]}"#,
+            &json!({"relayProfiles":[{
+                "id":"mix1", "name":"混合", "relayMode":"mixedApi",
+                "officialMixApiKey":true, "upstreamBaseUrl":"https://relay.example/v1",
+                "apiKey":"sk-mix", "authContents":crate::services::codex_plus_import_service::test_support::valid_auth()
+            }]}).to_string(),
         )
         .await
         .expect("write fixture");
@@ -1375,7 +1420,7 @@ mod tests {
         tokio::fs::write(
             dir.path().join("logins.json"),
             r#"[{"id":"cx9","agent":"codex","user":"snap@example.com",
-                 "auth":{"tokens":{"id_token":"id-tok","access_token":"at-tok","refresh_token":"rt-tok","account_id":"acc-9"}}}]"#,
+                 "auth":{"tokens":{"id_token":"id-tok","access_token":"at-tok","refresh_token":"rt-tok","account_id":"acc-9","client_id":"fixture-client"}}}]"#,
         )
         .await
         .expect("write logins");

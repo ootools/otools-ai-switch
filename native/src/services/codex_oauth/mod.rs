@@ -1,4 +1,4 @@
-mod credential;
+pub(crate) mod credential;
 mod process;
 
 use crate::error::{ApiError, AppError};

@@ -769,8 +769,8 @@ impl RouteCredentialRepository {
     ///
     /// The import preview needs every match up front — one query beats one
     /// round-trip per previewed item.
-    pub async fn external_source_matches(
-        pool: &SqlitePool,
+    pub async fn external_source_matches<'e>(
+        executor: impl sqlx::SqliteExecutor<'e>,
         client: &str,
     ) -> Result<Vec<(String, ExternalSourceMatch)>, AppError> {
         let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
@@ -779,7 +779,7 @@ impl RouteCredentialRepository {
              WHERE external_source_client = ? AND external_source_id IS NOT NULL",
         )
         .bind(client)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(|err| {
             database_error(
@@ -827,12 +827,15 @@ impl RouteCredentialRepository {
         secret_payload_json: &str,
         config_json: &str,
         preview_json: &str,
+        official_identity: Option<(&str, Option<&str>)>,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
+        let provider = official_identity.map(|(vendor, _)| if vendor == "codex" { "openai" } else { vendor });
         let quota = quota_columns_from_config_json(config_json);
         let result = sqlx::query(
             "UPDATE route_credentials
              SET display_name = ?, secret_payload_json = ?, config_json = ?, preview_json = ?,
+                 provider = COALESCE(?, provider), email = CASE WHEN ? THEN ? ELSE email END,
                  status = CASE WHEN status = 'revoked' THEN status ELSE 'ok' END,
                  transient_failure_count = 0, next_retry_at = NULL, cooldown_until = NULL,
                  semantic_failure_streak_count = 0, semantic_failure_streak_fingerprint = NULL,
@@ -849,6 +852,9 @@ impl RouteCredentialRepository {
         .bind(secret_payload_json)
         .bind(config_json)
         .bind(preview_json)
+        .bind(provider)
+        .bind(official_identity.is_some())
+        .bind(official_identity.and_then(|(_, email)| email))
         .bind(quota.subscription_type)
         .bind(quota.primary_remain)
         .bind(quota.weekly_remain)
@@ -3080,6 +3086,7 @@ mod tests {
             r#"{"api_key":"sk-new"}"#,
             r#"{"base_url":"https://new.example","interface_format":"anthropic"}"#,
             r#"{"settings_json":"{}"}"#,
+            None,
         )
         .await
         .unwrap();
@@ -3163,6 +3170,7 @@ mod tests {
             r#"{"api_key":"sk-new"}"#,
             "{}",
             "{}",
+            None,
         )
         .await
         .unwrap();
@@ -3217,6 +3225,7 @@ mod tests {
             r#"{"api_key":"sk-new"}"#,
             "{}",
             "{}",
+            None,
         )
         .await
         .unwrap();

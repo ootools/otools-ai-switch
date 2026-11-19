@@ -15,7 +15,7 @@
 //!   snapshot is stored verbatim, never refreshed.
 
 use crate::error::AppError;
-use crate::models::external_client_import::EXTERNAL_CLIENT_MAX_ITEMS;
+use crate::models::external_client_import::{EXTERNAL_CLIENT_MAX_ITEMS, EXTERNAL_CLIENT_MAX_SOURCE_BYTES};
 use crate::models::platform::{ApiDialect, PlatformId};
 use crate::models::route_credential::ModelMapping;
 use crate::services::cc_switch_import_service::ExtractedApiCredential;
@@ -23,7 +23,7 @@ use crate::services::cpa_import_service::{parse_cpa_text, ParsedOfficialCredenti
 use crate::services::external_client_import_service::{
     PreparedBody, PreparedExternalEntry, SkipBucket,
 };
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 fn home_dir() -> PathBuf {
@@ -65,8 +65,8 @@ pub fn resolve_source_dir(source_path: Option<&str>) -> Result<PathBuf, AppError
 }
 
 async fn read_json_file(path: &Path) -> Result<Option<Value>, AppError> {
-    let text = match tokio::fs::read_to_string(path).await {
-        Ok(text) => text,
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(AppError::Filesystem {
@@ -77,6 +77,15 @@ async fn read_json_file(path: &Path) -> Result<Option<Value>, AppError> {
             });
         }
     };
+    if bytes.len() > EXTERNAL_CLIENT_MAX_SOURCE_BYTES {
+        return Err(AppError::Validation {
+            code: "external_import.source_too_large",
+            message: "The Magpie configuration file is too large to import".to_string(),
+            details: Some(format!("{}: {} bytes", path.display(), bytes.len())),
+            recoverable: true,
+        });
+    }
+    let text = String::from_utf8_lossy(&bytes);
     serde_json::from_str::<Value>(&text)
         .map(Some)
         .map_err(|error| AppError::Validation {
@@ -181,6 +190,14 @@ fn prepare_provider(provider: &Value, entries: &mut Vec<PreparedExternalEntry>) 
     };
     let id = string_field(object, "id").unwrap_or_default();
     if id.is_empty() {
+        return;
+    }
+    let preset = string_field(object, "preset").unwrap_or_default();
+    if preset == "remote-magpie" {
+        entries.push(PreparedExternalEntry {
+            source_id: format!("provider:{id}:remote-magpie"),
+            body: PreparedBody::Skipped(SkipBucket::Unsupported("remote-magpie".to_string())),
+        });
         return;
     }
     let display_name = string_field(object, "name").unwrap_or_else(|| id.clone());
@@ -295,8 +312,15 @@ fn prepare_login(login: &Value, entries: &mut Vec<PreparedExternalEntry>) {
         false => user.clone(),
     } + if access_only { " (access-only)" } else { "" };
 
-    let Some(normalized) = normalize_login_auth(object, &agent, &user) else {
-        entries.push(PreparedExternalEntry {
+    match normalize_login_auth(object, &agent, &user, access_only) {
+        Ok(credential) => entries.push(PreparedExternalEntry {
+            source_id,
+            body: PreparedBody::Official(ParsedOfficialCredential {
+                display_name,
+                ..credential
+            }),
+        }),
+        Err(LoginAuthIssue::Invalid) => entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
                 kind: "official".to_string(),
@@ -304,33 +328,7 @@ fn prepare_login(login: &Value, entries: &mut Vec<PreparedExternalEntry>) {
                 issue_code: "external_import.official_snapshot_invalid",
                 platform_hint: Some(platform),
             },
-        });
-        return;
-    };
-
-    match parse_cpa_text(&normalized) {
-        Ok(credentials) => {
-            for credential in credentials {
-                entries.push(PreparedExternalEntry {
-                    source_id: source_id.clone(),
-                    body: PreparedBody::Official(ParsedOfficialCredential {
-                        display_name: display_name.clone(),
-                        ..credential
-                    }),
-                });
-            }
-        }
-        Err(_) => {
-            entries.push(PreparedExternalEntry {
-                source_id,
-                body: PreparedBody::Broken {
-                    kind: "official".to_string(),
-                    display_name,
-                    issue_code: "external_import.official_snapshot_invalid",
-                    platform_hint: Some(platform),
-                },
-            });
-        }
+        }),
     }
 }
 
@@ -342,73 +340,89 @@ fn platform_for_agent(agent: &str) -> Option<PlatformId> {
     }
 }
 
-/// Builds one flat CPA-shaped object from a saved login's `auth` blob:
-///
-/// - codex: `{auth_mode, tokens:{...}}` flattened, tagged `type: "codex"`.
-/// - claude: `{claudeAiOauth:{accessToken, ...}}` flattened to snake_case and
-///   tagged `type: "claude"`; a bare `{setupToken}` becomes an access token.
-///
-/// `email` is injected top-level so the CPA parser picks up the login's user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginAuthIssue {
+    Invalid,
+}
+
+/// Keep the native login JSON boundary explicit so readers preserve secrets
+/// and refresh metadata without re-parsing a made-up placeholder format.
 fn normalize_login_auth(
     login: &Map<String, Value>,
     agent: &str,
     user: &str,
-) -> Option<String> {
-    let auth = login.get("auth")?.as_object()?.clone();
-    let mut object = Map::new();
-    if !user.is_empty() {
-        object.insert("email".to_string(), Value::String(user.to_string()));
-    }
+    access_only: bool,
+) -> Result<ParsedOfficialCredential, LoginAuthIssue> {
+    let auth = login
+        .get("auth")
+        .and_then(Value::as_object)
+        .ok_or(LoginAuthIssue::Invalid)?;
     match agent {
         "codex" => {
-            if let Some(tokens) = auth.get("tokens").and_then(Value::as_object) {
-                for (key, token) in tokens {
-                    object.insert(key.clone(), token.clone());
-                }
+            let native = auth
+                .get("tokens")
+                .and_then(Value::as_object)
+                .map(|tokens| json!({
+                    "auth_mode": auth.get("auth_mode"),
+                    "client_id": auth.get("client_id"),
+                    "tokens": tokens,
+                    "last_refresh": auth.get("last_refresh"),
+                }).to_string())
+                .or_else(|| Some(Value::Object(auth.clone()).to_string()))
+                .ok_or(LoginAuthIssue::Invalid)?;
+            let credential = if access_only {
+                super::codex_oauth::credential::parse_auth_json_access_only(&native, None)
+            } else {
+                super::codex_oauth::credential::parse_auth_json(&native, None)
+            }.map_err(|_| LoginAuthIssue::Invalid)?;
+            let mut credential = credential;
+            if !user.is_empty() {
+                credential.email = Some(user.to_string());
+                credential.display_name = user.to_string();
             }
-            for key in ["auth_mode", "last_refresh"] {
-                if let Some(value) = auth.get(key) {
-                    object.insert(key.to_string(), value.clone());
-                }
-            }
-            object
-                .entry("type".to_string())
-                .or_insert_with(|| Value::String("codex".to_string()));
+            Ok(credential)
         }
         "claude" => {
-            if let Some(setup_token) = string_field(&auth, "setupToken") {
-                object.insert("access_token".to_string(), Value::String(setup_token));
-            } else {
-                let oauth = auth.get("claudeAiOauth").and_then(Value::as_object)?;
-                for (source, target) in [
-                    ("accessToken", "access_token"),
-                    ("refreshToken", "refresh_token"),
-                    ("idToken", "id_token"),
-                ] {
-                    if let Some(value) = oauth.get(source) {
-                        object.insert(target.to_string(), value.clone());
+            // Magpie 的 setupToken 是无刷新能力的 Claude 访问令牌：按 Task 6 的裁定，
+            // 仍作为官方凭据快照导入（订阅徽标，不承诺刷新；到期后需重新导入），
+            // 既不降级成 API 凭据，也不静默刷新。
+            let source = match auth
+                .get("setupToken")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                Some(token) => json!({"type": "claude", "access_token": token}),
+                None => {
+                    let mut auth_object = auth.clone();
+                    if let Some(user) = (!user.is_empty()).then(|| user.to_string()) {
+                        let profile = auth_object
+                            .entry("oauthAccount".to_string())
+                            .or_insert_with(|| Value::Object(Map::new()));
+                        if let Some(profile) = profile.as_object_mut() {
+                            profile.entry("emailAddress".to_string()).or_insert(Value::String(user));
+                        }
                     }
+                    Value::Object(auth_object)
                 }
-                if let Some(expires) = oauth.get("expiresAt") {
-                    object.insert("expired".to_string(), expires.clone());
+            };
+            let mut credential = parse_cpa_text(&source.to_string())
+                .map_err(|_| LoginAuthIssue::Invalid)?
+                .into_iter()
+                .next()
+                .ok_or(LoginAuthIssue::Invalid)?;
+            if !user.is_empty() {
+                credential.email = Some(user.to_string());
+                if credential.display_name == "Official account" {
+                    credential.display_name = user.to_string();
                 }
             }
-            object
-                .entry("type".to_string())
-                .or_insert_with(|| Value::String("claude".to_string()));
+            Ok(credential)
         }
-        _ => return None,
+        // platform_for_agent already filtered unknown agents; reaching here means
+        // a new agent string was added without a normalization arm.
+        _ => Err(LoginAuthIssue::Invalid),
     }
-
-    let has_token = ["access_token", "refresh_token", "id_token"]
-        .iter()
-        .any(|key| {
-            object
-                .get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-        });
-    has_token.then(|| Value::Object(object).to_string())
 }
 
 fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
@@ -422,7 +436,6 @@ fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::external_client_import::EXTERNAL_CLIENT_MAX_ITEMS;
     use crate::models::platform::{ApiDialect, PlatformId};
     use crate::services::external_client_import_service::{PreparedBody, SkipBucket};
     use serde_json::json;
@@ -439,6 +452,25 @@ mod tests {
 
     async fn prepare_with(dir: &Path) -> Vec<PreparedExternalEntry> {
         prepare_entries(dir).await.expect("prepare entries")
+    }
+
+    #[tokio::test]
+    async fn remote_magpie_provider_is_counted_as_unsupported_not_imported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "providers.json",
+            r#"{"providers":[{"id":"remote-1","name":"Remote gateway","preset":"remote-magpie","key":"remote-key","chat":"http://192.0.2.1:3425/v1"}]}"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "provider:remote-1:remote-magpie");
+        assert!(matches!(
+            &entries[0].body,
+            PreparedBody::Skipped(SkipBucket::Unsupported(label)) if label == "remote-magpie"
+        ));
     }
 
     #[tokio::test]
@@ -583,7 +615,8 @@ mod tests {
                     "id_token": "id-token",
                     "access_token": "at-token",
                     "refresh_token": "rt-token",
-                    "account_id": "acc-1"
+                    "account_id": "acc-1",
+                    "client_id": "fixture-codex-client"
                 }}
             }]"#,
         )
@@ -700,7 +733,7 @@ mod tests {
                 "agent": "codex",
                 "user": "ao@example.com",
                 "accessOnly": true,
-                "auth": {"tokens": {"access_token": "at", "id_token": "id"}}
+                "auth": {"client_id": "magpie-client", "tokens": {"access_token": "at", "id_token": "id", "account_id": "ao-account"}}
             }]"#,
         )
         .await;
@@ -746,6 +779,27 @@ mod tests {
             error,
             AppError::Validation {
                 code: "external_import.too_many_items",
+                ..
+            }
+        ));
+    }
+
+    /// 尺寸检查必须发生在 JSON 解析之前：超大文件以大小错误拒绝，
+    /// 而不是先整块读入再碰运气解析。
+    #[tokio::test]
+    async fn oversized_source_file_is_rejected_before_json_parsing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let oversized = format!(
+            r#"{{"providers":[{{"id":"big","chat":"https://big.example/v1","key":"sk-{}"}}]}}"#,
+            "x".repeat(EXTERNAL_CLIENT_MAX_SOURCE_BYTES + 1)
+        );
+        write_file(dir.path(), "providers.json", &oversized).await;
+
+        let error = prepare_entries(dir.path()).await.expect_err("too large");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "external_import.source_too_large",
                 ..
             }
         ));

@@ -17,16 +17,18 @@
 //!   extraction handles them unchanged.
 
 use crate::error::AppError;
-use crate::models::external_client_import::EXTERNAL_CLIENT_MAX_ITEMS;
+use crate::models::external_client_import::{EXTERNAL_CLIENT_MAX_ITEMS, EXTERNAL_CLIENT_MAX_SOURCE_BYTES};
 use crate::models::platform::{ApiDialect, PlatformId};
-use crate::models::route_credential::ModelMapping;
+use crate::models::route_credential::{ModelMapping, ANTHROPIC_AUTH_TOKEN_FIELD};
 use crate::services::cc_switch_import_service::{self as cc_switch};
-use crate::services::cpa_import_service::parse_cpa_text;
+use crate::services::codex_oauth::credential::parse_auth_json;
+use crate::services::cpa_import_service::ParsedOfficialCredential;
 use crate::services::external_client_import_service::{
     PreparedBody, PreparedExternalEntry, SkipBucket,
 };
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 fn home_dir() -> PathBuf {
@@ -49,18 +51,6 @@ pub fn default_state_dir() -> PathBuf {
 
 fn default_state_base_dir() -> PathBuf {
     home_dir().join(".codex-session-delete")
-}
-
-/// Whether the `settings.path` pointer may redirect settings.json for `dir`.
-///
-/// Mirrors Codex++: the pointer belongs to the default single-instance layout —
-/// an explicit directory choice (or a `CODEX_PLUS_STATE_DIR` override) is
-/// authoritative and never follows it.
-fn pointer_allowed_for(dir: &Path) -> bool {
-    let overridden = std::env::var("CODEX_PLUS_STATE_DIR")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    !overridden && dir == default_state_base_dir()
 }
 
 pub fn resolve_source_dir(source_path: Option<&str>) -> Result<PathBuf, AppError> {
@@ -89,9 +79,9 @@ struct CodexPlusSources {
 
 fn resolve_sources(dir: &Path, pointer_allowed: bool) -> CodexPlusSources {
     let mut settings = dir.join("settings.json");
-    if !settings.is_file() && pointer_allowed {
+    if pointer_allowed {
         // settings.path 是状态目录的兄弟文件，内容为 settings.json 的绝对路径。
-        if let Ok(content) = std::fs::read_to_string(dir.with_file_name("settings.path")) {
+        if let Some(content) = small_text(&dir.with_file_name("settings.path")) {
             let target = PathBuf::from(content.trim());
             if target.is_absolute() {
                 settings = target;
@@ -112,13 +102,23 @@ fn resolve_sources(dir: &Path, pointer_allowed: bool) -> CodexPlusSources {
 }
 
 async fn read_json_file(path: &Path) -> Result<Option<Value>, AppError> {
-    let text = match tokio::fs::read_to_string(path).await {
-        Ok(text) => text,
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(read_error(path, error));
         }
     };
+    // 尺寸检查发生在解析之前：超大文件以大小错误拒绝，而不是整块读入。
+    if bytes.len() > EXTERNAL_CLIENT_MAX_SOURCE_BYTES {
+        return Err(AppError::Validation {
+            code: "external_import.source_too_large",
+            message: "The Codex++ configuration file is too large to import".to_string(),
+            details: Some(format!("{}: {} bytes", path.display(), bytes.len())),
+            recoverable: true,
+        });
+    }
+    let text = String::from_utf8_lossy(&bytes);
     serde_json::from_str::<Value>(&text)
         .map(Some)
         .map_err(|error| AppError::Validation {
@@ -138,8 +138,17 @@ fn read_error(path: &Path, error: std::io::Error) -> AppError {
     }
 }
 
-pub async fn prepare_entries(dir: &Path) -> Result<Vec<PreparedExternalEntry>, AppError> {
-    let sources = resolve_sources(dir, pointer_allowed_for(dir));
+pub(super) async fn read_entries(source_path: Option<&str>) -> Result<(Vec<PreparedExternalEntry>, String), AppError> {
+    let source_path = source_path.map(str::trim).filter(|path| !path.is_empty());
+    let dir = resolve_source_dir(source_path)?;
+    let pointer_allowed = source_path.is_none()
+        && std::env::var("CODEX_PLUS_STATE_DIR").ok().is_none_or(|value| value.trim().is_empty());
+    let entries = prepare_entries(&dir, pointer_allowed).await?;
+    Ok((entries, dir.display().to_string()))
+}
+
+async fn prepare_entries(dir: &Path, pointer_allowed: bool) -> Result<Vec<PreparedExternalEntry>, AppError> {
+    let sources = resolve_sources(dir, pointer_allowed);
     if sources.settings.is_none()
         && sources.gateway.is_none()
         && sources.claude_providers.is_none()
@@ -164,54 +173,27 @@ pub async fn prepare_entries(dir: &Path) -> Result<Vec<PreparedExternalEntry>, A
         None => None,
     };
 
-    let settings_relays = settings
-        .as_ref()
-        .and_then(|value| value.get("relayProfiles"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // Gateway relays whose id a settings relay already claimed are skipped:
-    // the direct-connection copy is the authority.
-    let settings_relay_ids: HashSet<String> = settings_relays
-        .iter()
-        .filter_map(|relay| value_string_field(relay, "id"))
-        .collect();
+    let settings_relays = settings.as_ref().and_then(|value| value.get("relayProfiles"))
+        .and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let gateway_relays: Vec<_> = gateway.as_ref().and_then(|value| value.get("providers"))
+        .and_then(Value::as_array).into_iter().flatten()
+        .filter_map(|provider| provider.get("relay")).collect();
 
-    let gateway_relays: Vec<Value> = gateway
-        .as_ref()
-        .and_then(|value| value.get("providers"))
-        .and_then(Value::as_array)
-        .map(|providers| {
-            providers
-                .iter()
-                .filter_map(|provider| provider.get("relay").cloned())
-                .filter(|relay| {
-                    value_string_field(relay, "id")
-                        .map(|id| !settings_relay_ids.contains(&id))
-                        .unwrap_or(false)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // A settings relay may reference the gateway's auth snapshot via
-    // officialAccountRef; index gateway relays by id for that lookup.
-    let mut gateway_by_id: HashMap<String, Map<String, Value>> = HashMap::new();
-    for relay in settings_relays.iter().chain(gateway_relays.iter()) {
-        if let (Some(id), Some(object)) = (
-            value_string_field(relay, "id"),
-            relay.as_object().cloned(),
-        ) {
-            gateway_by_id.entry(id).or_insert(object);
+    // Resolve credentials before deduplicating the visible provider rows: a
+    // settings relay can explicitly reference its gateway counterpart.
+    let mut gateway_auth = HashMap::new();
+    for relay in &gateway_relays {
+        if let (Some(id), Some(auth)) = (value_string_field(relay, "id"), value_string_field(relay, "authContents")) {
+            gateway_auth.entry(id).or_insert(auth);
         }
     }
-
+    let mut emitted = HashSet::new();
     let mut entries = Vec::new();
-    for relay in &settings_relays {
-        prepare_relay(relay, &gateway_by_id, &mut entries);
-    }
-    for relay in &gateway_relays {
-        prepare_relay(relay, &gateway_by_id, &mut entries);
+    for relay in settings_relays.iter().chain(gateway_relays) {
+        let Some(id) = value_string_field(relay, "id") else { continue };
+        if emitted.insert(id) {
+            prepare_relay(relay, &gateway_auth, &mut entries);
+        }
     }
     if let Some(providers) = claude_providers
         .as_ref()
@@ -236,7 +218,7 @@ pub async fn prepare_entries(dir: &Path) -> Result<Vec<PreparedExternalEntry>, A
 
 fn prepare_relay(
     relay: &Value,
-    gateway_by_id: &HashMap<String, Map<String, Value>>,
+    gateway_auth: &HashMap<String, String>,
     entries: &mut Vec<PreparedExternalEntry>,
 ) {
     let object = match relay.as_object() {
@@ -258,85 +240,67 @@ fn prepare_relay(
         return;
     }
 
-    let api_key = extract_api_key(object);
-    let auth_snapshot = extract_auth_snapshot(object, gateway_by_id);
+    let config = string_field(object, "configContents").and_then(|text| text.parse::<toml::Value>().ok());
+    let provider = config.as_ref().and_then(active_provider);
+    let api_key = extract_api_key(object, provider);
+    let official_mode = relay_mode.eq_ignore_ascii_case("official");
     let official_mix = object.get("officialMixApiKey").and_then(Value::as_bool) == Some(true);
-
-    match relay_mode.as_str() {
-        "official" => {
-            push_official(
-                format!("relay:{id}:official"),
-                &display_name,
-                auth_snapshot.as_deref(),
-                entries,
-            );
-        }
-        _ => {
-            if api_key.is_some() {
-                push_api(format!("relay:{id}:api"), &display_name, object, entries);
-            } else {
-                // 无 key（noAuth 也在内）：官方快照是唯一可导入的凭据。
-                push_official(
-                    format!("relay:{id}:official"),
-                    &display_name,
-                    auth_snapshot.as_deref(),
-                    entries,
-                );
-            }
-            if official_mix && api_key.is_some() {
-                push_official(
-                    format!("relay:{id}:official"),
-                    &display_name,
-                    auth_snapshot.as_deref(),
-                    entries,
-                );
-            }
-        }
+    let auth_snapshot = match string_field(object, "officialAccountRef") {
+        Some(reference) => gateway_auth.get(&reference).cloned(),
+        None => string_field(object, "authContents"),
+    };
+    let has_key = api_key.is_some();
+    if !official_mode || official_mix {
+        push_api(format!("relay:{id}:api"), &display_name, object, config.as_ref(), provider, api_key, entries);
+    }
+    if (official_mode || official_mix) && (auth_snapshot.is_some() || !official_mix || !has_key) {
+        push_official(format!("relay:{id}:official"), &display_name, auth_snapshot.as_deref(), entries);
     }
 }
 
-/// `apiKey` → `apiKeys[activeApiKeyId]` → first key carrying a value.
-fn extract_api_key(relay: &Map<String, Value>) -> Option<String> {
-    if let Some(key) = string_field(relay, "apiKey") {
-        return Some(key);
+fn active_provider(config: &toml::Value) -> Option<&toml::Value> {
+    let providers = config.get("model_providers")?.as_table()?;
+    if let Some(selected) = toml_text(config, "model_provider") {
+        return providers.get(selected);
     }
-    let keys = relay.get("apiKeys").and_then(Value::as_array)?;
+    (providers.len() == 1).then(|| providers.values().next()).flatten()
+}
+
+fn toml_text<'a>(value: &'a toml::Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str().map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn extract_api_key(relay: &Map<String, Value>, provider: Option<&toml::Value>) -> Option<String> {
+    if relay.get("noAuth").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let active_id = string_field(relay, "activeApiKeyId");
-    let carrying = |key: &Value| value_string_field(key, "apiKey").is_some();
-    let selected = active_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .and_then(|id| {
-            keys.iter()
-                .find(|key| value_string_field(key, "id").as_deref() == Some(id) && carrying(key))
-        })
-        .or_else(|| keys.iter().find(|key| carrying(key)));
-    selected.and_then(|key| value_string_field(key, "apiKey"))
-}
-
-/// The relay's own `authContents`, or the gateway relay's when
-/// `officialAccountRef` points at one.
-fn extract_auth_snapshot(
-    relay: &Map<String, Value>,
-    gateway_by_id: &HashMap<String, Map<String, Value>>,
-) -> Option<String> {
-    if let Some(own) = string_field(relay, "authContents") {
-        return Some(own);
-    }
-    let reference = string_field(relay, "officialAccountRef").filter(|value| !value.is_empty())?;
-    gateway_by_id
-        .get(&reference)
-        .and_then(|gateway_relay| string_field(gateway_relay, "authContents"))
+    let saved = relay.get("apiKeys").and_then(Value::as_array);
+    let selected = saved.and_then(|keys| {
+        active_id.as_ref().and_then(|id| keys.iter().find(|key| {
+            value_string_field(key, "id").as_ref() == Some(id)
+        })).and_then(|key| value_string_field(key, "apiKey"))
+            .or_else(|| keys.iter().find_map(|key| value_string_field(key, "apiKey")))
+    });
+    selected.or_else(|| {
+        let auth: Value = serde_json::from_str(&string_field(relay, "authContents")?).ok()?;
+        value_string_field(&auth, "OPENAI_API_KEY")
+    }).or_else(|| toml_text(provider?, "experimental_bearer_token").map(str::to_owned))
+        .or_else(|| string_field(relay, "apiKey"))
+        .filter(|key| !matches!(key.as_str(), "codex-plus-no-auth" | "codex-plus-aggregate"))
 }
 
 fn push_api(
     source_id: String,
     display_name: &str,
     relay: &Map<String, Value>,
+    config: Option<&toml::Value>,
+    provider: Option<&toml::Value>,
+    api_key: Option<String>,
     entries: &mut Vec<PreparedExternalEntry>,
 ) {
     let no_auth = relay.get("noAuth").and_then(Value::as_bool) == Some(true);
-    let Some(api_key) = extract_api_key(relay).filter(|_| !no_auth) else {
+    let Some(api_key) = api_key.filter(|_| !no_auth) else {
         entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
@@ -349,10 +313,28 @@ fn push_api(
         return;
     };
 
-    let base_url = string_field(relay, "upstreamBaseUrl")
-        .or_else(|| string_field(relay, "baseUrl"))
-        .unwrap_or_default();
-    if !is_importable_base_url(&base_url) {
+    // Resolution order: the relay's explicit upstream override, then the active
+    // TOML provider, then the relay's own `baseUrl` — that last one is what
+    // Codex++ writes into its codex config, usually its own local proxy shell,
+    // so a loopback found there is not a real upstream and imports as broken.
+    // `upstreamBaseUrl` and the TOML provider are deliberate user choices; even
+    // a loopback there is a real local server and imports as-is.
+    let provider_base = provider.and_then(|provider| toml_text(provider, "base_url")).map(str::to_owned);
+    let provider_dialect = provider
+        .and_then(|provider| toml_text(provider, "wire_api"))
+        .and_then(|wire| match wire {
+            "chat" => Some(ApiDialect::OpenAi),
+            "responses" => Some(ApiDialect::OpenAiResponses),
+            _ => None,
+        });
+    let (base_url, shell_fallback) = match string_field(relay, "upstreamBaseUrl") {
+        Some(url) => (url, false),
+        None => match provider_base {
+            Some(url) => (url, false),
+            None => (string_field(relay, "baseUrl").unwrap_or_default(), true),
+        },
+    };
+    if base_url.is_empty() || !is_importable_base_url(&base_url, !shell_fallback) {
         entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
@@ -388,7 +370,25 @@ fn push_api(
                 })
                 .collect::<Vec<_>>()
         })
+        // Codex++ keeps the default model at the config top level; a provider
+        // table override wins when present.
+        .or_else(|| {
+            toml_text(provider?, "model")
+                .or_else(|| toml_text(config?, "model"))
+                .map(|model| {
+                    vec![ModelMapping { from: model.to_string(), to: model.to_string(), ..Default::default() }]
+                })
+        })
         .unwrap_or_default();
+
+    let dialect = provider_dialect.unwrap_or(protocol_dialect(relay));
+    // Codex++ lets Anthropic relays choose between x-api-key and Bearer.
+    let api_key_field = (dialect == ApiDialect::Anthropic
+        && matches!(
+            string_field(relay, "anthropicAuthHeader").as_deref(),
+            Some("authorization") | Some("bearer") | Some("auth_token") | Some("anthropic_auth_token")
+        ))
+    .then_some(ANTHROPIC_AUTH_TOKEN_FIELD);
 
     entries.push(PreparedExternalEntry {
         source_id,
@@ -397,8 +397,8 @@ fn push_api(
             display_name: display_name.to_string(),
             api_key,
             base_url,
-            interface_format: protocol_dialect(relay),
-            api_key_field: None,
+            interface_format: dialect,
+            api_key_field,
             model_mappings,
             user_agent: string_field(relay, "userAgent"),
             extra_headers,
@@ -428,48 +428,34 @@ fn push_official(
         broken("external_import.official_snapshot_missing");
         return;
     };
-    let Some(normalized) = normalize_codex_auth(&snapshot) else {
-        broken("external_import.official_snapshot_missing");
-        return;
-    };
-    match parse_cpa_text(&normalized) {
-        Ok(credentials) => {
-            for credential in credentials {
-                entries.push(PreparedExternalEntry {
-                    source_id: source_id.clone(),
-                    body: PreparedBody::Official(ParsedOfficialCredential {
-                        display_name: display_name.to_string(),
-                        ..credential
-                    }),
-                });
-            }
+    let credential = match parse_auth_json(snapshot, None) {
+        Ok(credential) => credential,
+        Err(_) => {
+            broken("external_import.official_snapshot_invalid");
+            return;
         }
-        Err(_) => broken("external_import.official_snapshot_invalid"),
-    }
+    };
+    entries.push(PreparedExternalEntry {
+        source_id,
+        body: PreparedBody::Official(ParsedOfficialCredential {
+            display_name: display_name.to_string(),
+            ..credential
+        }),
+    });
 }
 
-/// Flattens Codex's native `auth.json` (`{auth_mode, tokens:{...}}`) into the
-/// flat CPA shape `parse_cpa_text` reads, tagging it as Codex.
-fn normalize_codex_auth(snapshot: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(snapshot).ok()?;
-    let mut object = value.as_object()?.clone();
-    if let Some(tokens) = object.remove("tokens") {
-        if let Some(token_map) = tokens.as_object() {
-            for (key, token) in token_map {
-                object.entry(key.clone()).or_insert_with(|| token.clone());
-            }
-        }
-    }
-    if !object.contains_key("type") {
-        object.insert("type".to_string(), Value::String("codex".to_string()));
-    }
-    let has_token = ["access_token", "refresh_token", "id_token"].iter().any(|key| {
-        object
-            .get(*key)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    has_token.then(|| Value::Object(object).to_string())
+fn small_text(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(1024 * 1024).read_to_string(&mut text).ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+fn pointer_allowed_for(dir: &Path) -> bool {
+    let overridden = std::env::var("CODEX_PLUS_STATE_DIR")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    !overridden && dir == default_state_base_dir()
 }
 
 fn prepare_claude_provider(provider: &Value, entries: &mut Vec<PreparedExternalEntry>) {
@@ -529,7 +515,10 @@ fn protocol_dialect_platform(relay: &Map<String, Value>) -> (ApiDialect, Platfor
 /// Empty, non-HTTP or loopback-only URLs point at Codex++'s own protocol proxy
 /// rather than a real upstream: without `upstreamBaseUrl` there is nothing to
 /// import.
-fn is_importable_base_url(base_url: &str) -> bool {
+/// `allow_loopback` is false only for the relay's own `baseUrl` fallback: that
+/// value is Codex++'s proxy shell by construction, so a loopback there means
+/// "no real upstream configured", not "user runs a local server".
+fn is_importable_base_url(base_url: &str, allow_loopback: bool) -> bool {
     let Ok(parsed) = url::Url::parse(base_url) else {
         return false;
     };
@@ -551,7 +540,7 @@ fn is_importable_base_url(base_url: &str) -> bool {
             .parse::<std::net::Ipv6Addr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(false);
-    !loopback
+    allow_loopback || !loopback
 }
 
 fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
@@ -566,13 +555,42 @@ fn value_string_field(value: &Value, key: &str) -> Option<String> {
     value.as_object().and_then(|map| string_field(map, key))
 }
 
-use crate::services::cpa_import_service::ParsedOfficialCredential;
+
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use serde_json::{json, Value};
+
+    pub(crate) fn valid_auth() -> String {
+        fn jwt(payload: Value) -> String {
+            format!("e30.{}.fixture", URL_SAFE_NO_PAD.encode(payload.to_string()))
+        }
+
+        json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": jwt(json!({
+                    "email": "codex@example.com",
+                    "aud": "codex-cli-client",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "codex-account",
+                        "chatgpt_plan_type": "plus"
+                    }
+                })),
+                "access_token": jwt(json!({"exp": 2_000_000_000})),
+                "refresh_token": "codex-refresh-token",
+                "account_id": "codex-account"
+            }
+        }).to_string()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::external_client_import::{
-        EXTERNAL_CLIENT_CODEX_PLUS, EXTERNAL_CLIENT_MAX_ITEMS,
+        EXTERNAL_CLIENT_CODEX_PLUS, EXTERNAL_CLIENT_MAX_ITEMS, EXTERNAL_CLIENT_MAX_SOURCE_BYTES,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -588,8 +606,11 @@ mod tests {
     }
 
     async fn prepare_with(dir: &Path) -> Vec<PreparedExternalEntry> {
-        prepare_entries(dir).await.expect("prepare entries")
+        prepare_entries(dir, pointer_allowed_for(dir)).await.expect("prepare entries")
     }
+
+
+
 
     #[tokio::test]
     async fn extracts_relay_chain_url_headers_and_model_list() {
@@ -669,18 +690,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn official_relay_uses_validated_codex_auth_parser_and_is_refreshable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let auth = test_support::valid_auth();
+        write_file(
+            dir.path(),
+            "settings.json",
+            &json!({"relayProfiles":[{
+                "id":"official-chatgpt", "name":"Codex official relay",
+                "relayMode":"official", "authContents":auth
+            }]}).to_string(),
+        ).await;
+
+        let entries = prepare_with(dir.path()).await;
+        let PreparedBody::Official(credential) = &entries[0].body else {
+            panic!("valid auth.json becomes a refreshable official credential");
+        };
+        let config: Value = serde_json::from_str(&credential.config_json).expect("config");
+        assert_eq!(credential.email.as_deref(), Some("codex@example.com"));
+        assert_eq!(config["client_id"], "codex-cli-client");
+        assert_eq!(config["token_endpoint"], "https://auth.openai.com/oauth/token");
+        assert_eq!(config["account_id"], "codex-account");
+        assert_eq!(config["subscription_type"], "plus");
+        assert_eq!(config["expired"], 2_000_000_000i64);
+    }
+
+    #[tokio::test]
     async fn official_relay_becomes_a_codex_official_entry() {
         let dir = tempfile::tempdir().expect("temp dir");
         write_file(
             dir.path(),
             "settings.json",
-            r#"{
-                "relayProfiles": [{
-                    "id": "of1", "name": "ChatGPT 订阅",
-                    "relayMode": "official",
-                    "authContents": "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":\"id-token\",\"access_token\":\"at-token\",\"refresh_token\":\"rt-token\",\"account_id\":\"acc-1\"}}"
-                }]
-            }"#,
+            &json!({"relayProfiles":[{
+                "id":"of1",
+                "name":"ChatGPT 订阅",
+                "relayMode":"official",
+                "authContents": test_support::valid_auth()
+            }]}).to_string(),
         )
         .await;
 
@@ -694,11 +740,11 @@ mod tests {
         assert_eq!(credential.display_name, "ChatGPT 订阅");
         let secret: serde_json::Value =
             serde_json::from_str(&credential.secret_payload_json).expect("secret payload");
-        // 快照原样落库：不刷新、不改写。
-        assert_eq!(secret["access_token"], "at-token");
-        assert_eq!(secret["refresh_token"], "rt-token");
-        assert_eq!(secret["account_id"], "acc-1");
-        assert_eq!(secret["id_token"], "id-token");
+        // 无刷新请求或重写；secret 直接来自原 auth snapshot。
+        assert_eq!(secret["refresh_token"], "codex-refresh-token");
+        assert_eq!(secret["account_id"], "codex-account");
+        assert_eq!(secret["client_id"], "codex-cli-client");
+
     }
 
     #[tokio::test]
@@ -707,18 +753,12 @@ mod tests {
         write_file(
             dir.path(),
             "settings.json",
-            r#"{
-                "relayProfiles": [{
-                    "id": "mix1", "name": "混合订阅",
-                    "relayMode": "mixedApi",
-                    "officialMixApiKey": true,
-                    "upstreamBaseUrl": "https://relay.example/v1",
-                    "apiKey": "sk-mix",
-                    "authContents": "{\"tokens\":{\"access_token\":\"at\",\"refresh_token\":\"rt\"}}"
-                }]
-            }"#,
-        )
-        .await;
+            &json!({"relayProfiles":[{
+                "id":"mix1", "name":"混合订阅", "relayMode":"mixedApi",
+                "officialMixApiKey":true, "upstreamBaseUrl":"https://relay.example/v1",
+                "apiKey":"sk-mix", "authContents":test_support::valid_auth()
+            }]}).to_string(),
+        ).await;
 
         let entries = prepare_with(dir.path()).await;
         assert_eq!(entries.len(), 2);
@@ -726,6 +766,75 @@ mod tests {
         assert!(matches!(&entries[0].body, PreparedBody::Api(_)));
         assert_eq!(entries[1].source_id, "relay:mix1:official");
         assert!(matches!(&entries[1].body, PreparedBody::Official(_)));
+    }
+
+    #[tokio::test]
+    async fn reads_active_toml_provider_and_snapshot_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = r#"
+model_provider = "current"
+model = "fixture-model"
+[model_providers.old]
+base_url = "https://old.example/v1"
+experimental_bearer_token = "old-key"
+[model_providers.current]
+base_url = "https://current.example/v1"
+wire_api = "chat"
+experimental_bearer_token = "toml-key"
+"#;
+        write_file(dir.path(), "settings.json", &json!({"relayProfiles": [
+            {"id":"legacy", "relayMode":"pureApi", "baseUrl":"https://stale.example/v1",
+             "configContents":config, "authContents":r#"{"OPENAI_API_KEY":"auth-key"}"#},
+            {"id":"active", "relayMode":"pureApi", "configContents":config, "apiKey":"stale-key",
+             "apiKeys":[{"id":"first","apiKey":"first-key"},{"id":"next","apiKey":"active-key"}],
+             "activeApiKeyId":"next"},
+            {"id":"toml", "relayMode":"pureApi", "configContents":config}
+        ]}).to_string()).await;
+        let entries = prepare_with(dir.path()).await;
+        for (entry, key) in entries.iter().zip(["auth-key", "active-key", "toml-key"]) {
+            let PreparedBody::Api(api) = &entry.body else { panic!("expected API entry") };
+            assert_eq!(api.base_url, "https://current.example/v1");
+            assert_eq!(api.interface_format, ApiDialect::OpenAi);
+            assert_eq!(api.api_key, key);
+            assert_eq!(api.model_mappings[0].to, "fixture-model");
+        }
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn official_mode_mix_preserves_the_api_half_and_uses_gateway_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "settings.json", &json!({"relayProfiles": [
+            {"id":"mirror", "relayMode":"official", "officialMixApiKey":true,
+             "officialAccountRef":"mirror", "apiKey":"mixed-key", "baseUrl":"https://relay.example/v1"},
+            {"id":"api-only", "relayMode":"official", "officialMixApiKey":true,
+             "apiKey":"mixed-key", "baseUrl":"https://relay.example/v1"}
+        ]}).to_string()).await;
+        write_file(dir.path(), "gateway.json", &json!({"providers":[{"relay":{
+            "id":"mirror", "relayMode":"official", "authContents":test_support::valid_auth()
+        }}]}).to_string()).await;
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 3);
+        for (id, kind) in [("relay:mirror:api", "api"), ("relay:mirror:official", "official"), ("relay:api-only:api", "api")] {
+            let entry = entries.iter().find(|entry| entry.source_id == id).unwrap();
+            assert!(matches!((&entry.body, kind), (PreparedBody::Api(_), "api") | (PreparedBody::Official(_), "official")));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_native_oauth_is_not_promoted_and_local_anthropic_api_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = r#"{"access_token":"access","id_token":"id","refresh_token":"refresh","client_id":"client","account_id":"account"}"#;
+        write_file(dir.path(), "settings.json", &json!({"relayProfiles":[
+            {"id":"flat", "relayMode":"official", "authContents":flat},
+            {"id":"local", "relayMode":"pureApi", "protocol":"anthropicMessages",
+             "upstreamBaseUrl":"http://127.0.0.1:1234/v1", "apiKey":"local-key", "anthropicAuthHeader":"authorization"}
+        ]}).to_string()).await;
+        let entries = prepare_with(dir.path()).await;
+        assert!(matches!(entries[0].body, PreparedBody::Broken { issue_code: "external_import.official_snapshot_invalid", .. }));
+        let PreparedBody::Api(api) = &entries[1].body else { panic!("real local upstream must import") };
+        assert_eq!(api.base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(api.api_key_field, Some("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[tokio::test]
@@ -885,7 +994,7 @@ mod tests {
         std::env::set_var("CODEX_PLUS_STATE_DIR", &state);
         let resolved = resolve_source_dir(None).expect("default dir");
         assert_eq!(resolved, state);
-        let entries = prepare_entries(&resolved).await.expect("default dir");
+        let entries = prepare_entries(&resolved, pointer_allowed_for(&resolved)).await.expect("default dir");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source_id, "relay:p1:api");
         std::env::remove_var("CODEX_PLUS_STATE_DIR");
@@ -909,21 +1018,16 @@ mod tests {
         )
         .expect("write pointer");
 
-        // 指针被允许时：settings.json 缺失则读指针目标。
-        let sources = resolve_sources(&state, true);
-        let pointed = sources.settings.expect("pointer honoured");
-        assert_eq!(pointed, real_settings);
-        // 指针被禁止时（显式目录 / 多开覆盖）：三文件全缺就是全缺。
-        let sources = resolve_sources(&state, false);
-        assert!(sources.settings.is_none());
-        assert!(sources.gateway.is_none());
-        assert!(sources.claude_providers.is_none());
+        let stale_settings = state.join("settings.json");
+        std::fs::write(&stale_settings, "{}").unwrap();
+        assert_eq!(resolve_sources(&state, true).settings, Some(real_settings));
+        assert_eq!(resolve_sources(&state, false).settings, Some(stale_settings));
     }
 
     #[tokio::test]
     async fn missing_files_report_not_found_and_invalid_json_is_named() {
         let empty = tempfile::tempdir().expect("temp dir");
-        let error = prepare_entries(empty.path()).await.expect_err("no files");
+        let error = prepare_entries(empty.path(), false).await.expect_err("no files");
         assert!(matches!(
             error,
             AppError::Validation {
@@ -934,7 +1038,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         write_file(dir.path(), "settings.json", "{ not json").await;
-        let error = prepare_entries(dir.path()).await.expect_err("invalid json");
+        let error = prepare_entries(dir.path(), false).await.expect_err("invalid json");
         assert!(matches!(
             error,
             AppError::Validation {
@@ -968,11 +1072,31 @@ mod tests {
         )
         .await;
 
-        let error = prepare_entries(dir.path()).await.expect_err("too many");
+        let error = prepare_entries(dir.path(), false).await.expect_err("too many");
         assert!(matches!(
             error,
             AppError::Validation {
                 code: "external_import.too_many_items",
+                ..
+            }
+        ));
+    }
+
+    /// 与 Magpie 一致：尺寸检查在 JSON 解析之前，超大文件以大小错误拒绝。
+    #[tokio::test]
+    async fn oversized_source_file_is_rejected_before_json_parsing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let oversized = format!(
+            r#"{{"relayProfiles":[{{"id":"big","relayMode":"pureApi","upstreamBaseUrl":"https://big.example/v1","apiKey":"sk-{}"}}]}}"#,
+            "x".repeat(EXTERNAL_CLIENT_MAX_SOURCE_BYTES + 1)
+        );
+        write_file(dir.path(), "settings.json", &oversized).await;
+
+        let error = prepare_entries(dir.path(), false).await.expect_err("too large");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "external_import.source_too_large",
                 ..
             }
         ));

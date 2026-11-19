@@ -101,19 +101,26 @@
 - `base_url`：`upstreamBaseUrl` 非空用之，否则 `baseUrl`；两者皆空，或解析出
   指向本机回环（Codex++ 自身协议代理默认地址）且无 upstream 的，报 issue
   `external_import.upstream_missing`（无法导入：它只是个指向 Codex++ 代理的壳）。
-- `api_key`：`apiKey`，为空时取 `apiKeys[]` 里 `activeApiKeyId` 对应项，再为空取
-  第一项；`noAuth=true` 报 `external_import.api_key_missing`。
+- `api_key`：活动 API key（优先 `apiKeys[]` 的 active 项），再用兼容旧 schema 的
+  `authContents.OPENAI_API_KEY` 或活动 `[model_providers.*].experimental_bearer_token`
+  fallback，最后回退 `apiKey`。绝不把用于访问本机代理的 no-auth key 当成上游 key；
+  无上游 key 报 `external_import.api_key_missing`。
 - 模型映射：`modelList`（换行分隔的模型 id 列表）逐行 `from == to` 透传，
   与 cc-switch Codex 提取同法。
 - `userAgent` 与 `customHeaders[]`（`{key,value}`）→ config `headers`。
-- `configContents` 不读（Codex CLI config.toml 快照，AI Switch 不需要）。
+- `configContents` 只按 TOML 提取活动 provider 的 `base_url`、`model_provider`、
+  `model` 和 `wire_api`/bearer-token fallback；若 `base_url` 指向 Codex++ 管理的
+  本地协议代理，再用其专用 `upstreamBaseUrl` / `baseUrl` 字段寻找真实上游；否则
+  不从任意 loopback 地址臆测上游。其它 Codex CLI 配置键不导入。
 
 **RelayProfile（`relayMode` = `official`）→ 官方条目（platform codex）**：
 
-- `authContents` 非空：视为 Codex `auth.json` 原文（`{auth_mode, tokens:{id_token,
-  access_token, refresh_token, account_id}}`），归一为 CPA 形状
-  `{type:"codex", tokens 原文}` 交给官方解析（`parse_cpa_object` 路径；token_field
-  已支持 `tokens` 嵌套）。显示名 = relay `name`。
+- `authContents` 非空：按 Codex CLI `auth.json` 形状输入既有严格
+  `parse_auth_json` validator（必须是 `auth_mode=chatgpt`，且包含完整 token、账号与
+  client identity）；从成功解析结果保存 email、access/id/refresh tokens、account ID、
+  client ID、subscription tier、expiry 与 refresh endpoint。只保留解析器构造的
+  payload/config，不留原始 auth JSON。无效、API-key 模式或仅 token 列表的快照显示
+  为 `official_snapshot_invalid`。
 - `authContents` 为空但 `officialMixApiKey=true` 且有 key：按 API 条目处理（上面
   规则）。否则尝试跨文件解析：`officialAccountRef` 指向的 relay 若在 `gateway.json`
   里且其 `authContents` 非空，以该快照为准（来源 id 仍用 settings relay 的
@@ -137,12 +144,10 @@
 
 **`providers.json`（`{providers:[Provider...]}`）→ API 条目**：
 
+- `providers.json` 顶层为 `{providers:[...]}`。一个 Provider 的真实形状包括 `id` / `name`、顶层 `key` 与 `keyProtocol`、`keys[]`（各项用 `key` / `protocol` / `off`）、`chat` / `responses` / `anthropic` / `gemini` URL 字段、`models[]`、`headers{}` 和可选 `preset`。
 - 一个 Provider 可同时配置多个协议 URL。每个**设置了 URL 的协议**产出一条：
   source_id `provider:<id>:<protocol>`（恒带协议后缀，增删协议 URL 不换 id）。
-- 跳过规则：没有任何协议 URL 的条目、Magpie 标记为插件提供或来自其他设备的
-  条目（实现时在 `provider.go` 核对对应标记字段），计入 unsupported 汇总，
-  不进列表。有 URL 但无 key 的条目照常列出并报
-  `external_import.api_key_missing`（本地无鉴权端点也归此列）。
+- 跳过规则：没有任何协议 URL、`preset="remote-magpie"`（当前配置指向另一台机器的 Magpie 网关）的条目计入 unsupported 汇总；无协议 URL 统一标签 `无协议地址`，远端供应商标签 `remote-magpie`。
 - 协议 → interface_format / 平台：`anthropic` → Anthropic / claude；
   `responses` → OpenAI Responses / codex；`chat` → OpenAI Chat / codex；
   `gemini` → Gemini / gemini。
@@ -160,13 +165,15 @@
   `{type:"codex", ...auth}` 交官方解析；显示名 = `user`（邮箱），
   email = `user`。
 - `agent` = `claude`：`auth` 字段为 `{claudeAiOauth:{...}}` 原生形状，CPA 解析器
-  已原生支持；`profile`（oauthAccount）仅用于补充显示名。
-- `agent` = `claude` 且 `auth` 为 `{setupToken:...}`：归一为
-  `{type:"claude", access_token:<setupToken>}`（长令牌，仅推理 scope）。
+  已原生支持并保存 scopes、过期时间、plan、rate limit tier 与 client metadata；
+  `profile`（oauthAccount）仅用于补充显示名。Magpie 交由 Claude Code 更新此凭据，
+  AI Switch 不猜测另一个 Claude OAuth endpoint/client。
+- `agent` = `claude` 且 `auth` 为 `{setupToken:...}`：忽略而不列为可导入官方 OAuth
+  account（仅限 Claude inference，不能代表可刷新的 Claude Code sign-in）。
 - 其余 agent（copilot / gemini / antigravity / factory / 插件等）：计入
   unsupported，与 Codex++ 的 aggregate 同法展示汇总数量。
-- `accessOnly=true`：照常导入（access + id token 可用；refresh token 可能缺失，
-  到期后失效），显示名追加「(access-only)」。
+- `accessOnly=true` 的 Codex 条目允许以 access/id token 输入官方 parser；如缺少
+  refresh token，过期后将不能续期，显示名追加「(access-only)」。
 - `lapsed` / `refused`：照常导入，预览不额外拦截——AI Switch 使用时自会暴露，
   不替用户做二次判断。
 - source_id 用 savedLogin 的 `id` 字段，缺失时回退 `<agent>:<user>`。

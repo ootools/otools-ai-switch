@@ -56,6 +56,7 @@ function renderPanel(client: "cc-switch" | "codex-plus" | "magpie" = "magpie") {
   render(
     <ExternalClientImportPanel
       client={client}
+      pathMode={client === "cc-switch" ? "file" : "directory"}
       desktop
       error={null}
       labelClass="label"

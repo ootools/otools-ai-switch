@@ -22,6 +22,11 @@ pub const EXTERNAL_CLIENT_MAGPIE: &str = "magpie";
 /// not streamed into the account list.
 pub const EXTERNAL_CLIENT_MAX_ITEMS: usize = 2_000;
 
+/// Upper bound on one external source file, checked **before** JSON parsing so
+/// a giant file dies with a size error instead of being slurped into memory.
+/// Same ceiling as the credential-transfer payloads.
+pub const EXTERNAL_CLIENT_MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreviewExternalClientImportInput {
     pub client: String,

@@ -125,10 +125,16 @@ fn parse_cpa_object(object: &Map<String, Value>) -> Result<ParsedOfficialCredent
     let refresh_token = token_field(object, "refresh_token", "refreshToken");
     let account_id = token_field(object, "account_id", "accountId");
 
-    if access_token.is_none() && refresh_token.is_none() {
+    if !access_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+        && !refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+    {
         return Err(validation_error(
             "validation.cpa_secret_required",
-            "CPA credential requires access_token or refresh_token",
+            "CPA credential requires a non-empty access_token or refresh_token",
             None,
         ));
     }
@@ -183,6 +189,24 @@ fn parse_cpa_object(object: &Map<String, Value>) -> Result<ParsedOfficialCredent
     config.insert("expires_in".to_string(), expires_in);
     config.insert("disabled".to_string(), disabled);
     config.insert("raw".to_string(), raw);
+
+    if platform == "claude" {
+        for (field, aliases) in [
+            ("scopes", &["scopes"][..]),
+            ("subscription_type", &["subscription_type", "subscriptionType"][..]),
+            ("rate_limit_tier", &["rate_limit_tier", "rateLimitTier"][..]),
+            ("client_id", &["client_id", "clientId"][..]),
+        ] {
+            if let Some(value) = value_field_option(object, aliases).or_else(|| {
+                object
+                    .get("raw")
+                    .and_then(Value::as_object)
+                    .and_then(|raw| value_field_option(raw, aliases))
+            }) {
+                config.insert(field.to_string(), value);
+            }
+        }
+    }
 
     if let Some(base_url) = base_url {
         config.insert("base_url".to_string(), json!(base_url));
@@ -373,16 +397,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_access_token_only_claude_setup_token_for_proxy_routing() {
-        let error = parse_cpa_text(r#"{"type":"claude","access_token":"sk-ant-oat01-setup"}"#)
-            .expect_err("setup token cannot enter the official proxy path");
-        assert!(matches!(
-            error,
-            AppError::Validation {
-                code: "validation.cpa_secret_required",
-                ..
-            }
-        ));
+    fn accepts_claude_setup_token_as_an_official_credential_snapshot() {
+        let rows = parse_cpa_text(r#"{"type":"claude","access_token":"sk-ant-oat01-setup"}"#)
+            .expect("setup token is an official credential snapshot");
+        assert_eq!(rows.len(), 1);
+        let secret: Value = serde_json::from_str(&rows[0].secret_payload_json).expect("secret");
+        assert_eq!(secret["access_token"], "sk-ant-oat01-setup");
+        assert_eq!(rows[0].platform, "claude");
+    }
+
+    #[test]
+    fn preserves_native_claude_oauth_metadata_for_refresh_and_direct_mode() {
+        let parsed = parse_cpa_text(
+            r#"{"claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":4070908800000,"refreshTokenExpiresAt":4071908800000,"scopes":["user:inference","user:profile"],"subscriptionType":"max","rateLimitTier":"default_claude_max_5x","clientId":"claude-client"}}"#,
+        )
+        .expect("native Claude OAuth");
+        let config: Value = serde_json::from_str(&parsed[0].config_json).expect("config");
+        assert_eq!(config["expired"], 4070908800000i64);
+        assert_eq!(config["subscription_type"], "max");
+        assert_eq!(config["rate_limit_tier"], "default_claude_max_5x");
+        assert_eq!(config["client_id"], "claude-client");
+        assert_eq!(config["scopes"], json!(["user:inference", "user:profile"]));
     }
 
     #[test]
