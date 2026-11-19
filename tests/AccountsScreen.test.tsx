@@ -3807,6 +3807,32 @@ describe("AccountsScreen", () => {
     expect(screen.getByRole("button", { name: "导入所选账号" })).toBeDisabled();
   });
 
+  it("selects Magpie as a directory-based source and previews that directory", async () => {
+    renderScreen();
+
+    await userEvent.click(await screen.findByRole("button", { name: "新增账号" }));
+    await userEvent.click(screen.getByRole("button", { name: "导入其他客户端" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Magpie" }));
+
+    vi.mocked(open).mockResolvedValue("D:\\backup\\magpie");
+    await userEvent.click(screen.getByRole("button", { name: "选择客户端配置目录" }));
+
+    await waitFor(() =>
+      expect(open).toHaveBeenLastCalledWith({
+        directory: true,
+        multiple: false,
+        title: "选择 Magpie 配置目录",
+      }),
+    );
+    await waitFor(() =>
+      expect(previewExternalClientImport).toHaveBeenLastCalledWith({
+        client: "magpie",
+        platform: "codex",
+        source_path: "D:\\backup\\magpie",
+      }),
+    );
+  });
+
   it("re-reads the preview from a hand-picked config file", async () => {
     renderScreen();
 
