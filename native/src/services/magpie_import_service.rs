@@ -1,12 +1,29 @@
-//! Reads provider and login entries out of Magpie's own configuration.
+//! Reads provider and login entries out of Magpie's own configuration
+//! (`~/.config/magpie/`).
 //!
-//! Placeholder dispatch target: `resolve_source_dir` returns the default config
-//! directory and `prepare_entries` contributes nothing yet. Task 5 fills in the
-//! real reading and extraction (`providers.json` API providers + `logins.json`
-//! subscription accounts).
+//! Clean-room: this reads Magpie's public on-disk formats only and shares no
+//! code with it. Two files contribute entries, either alone is enough, both
+//! missing means there is nothing to import:
+//!
+//! - `providers.json` — `{providers:[...]}`, API-key providers. A provider can
+//!   serve several wire protocols at once (`chat` / `responses` / `anthropic` /
+//!   `gemini` URL fields); AI Switch accounts are single-dialect, so each set
+//!   URL becomes its own entry `provider:<id>:<protocol>`.
+//! - `logins.json` — an array of saved subscription accounts whose `auth` blob
+//!   is the agent's own native credential file (Codex `auth.json` / Claude's
+//!   `claudeAiOauth` credentials). These import as official accounts; the
+//!   snapshot is stored verbatim, never refreshed.
 
 use crate::error::AppError;
-use crate::services::external_client_import_service::PreparedExternalEntry;
+use crate::models::external_client_import::EXTERNAL_CLIENT_MAX_ITEMS;
+use crate::models::platform::{ApiDialect, PlatformId};
+use crate::models::route_credential::ModelMapping;
+use crate::services::cc_switch_import_service::ExtractedApiCredential;
+use crate::services::cpa_import_service::{parse_cpa_text, ParsedOfficialCredential};
+use crate::services::external_client_import_service::{
+    PreparedBody, PreparedExternalEntry, SkipBucket,
+};
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 fn home_dir() -> PathBuf {
@@ -16,7 +33,8 @@ fn home_dir() -> PathBuf {
 }
 
 /// Magpie's config directory; the Go app uses `~/.config/magpie` on every
-/// platform, honouring `XDG_CONFIG_HOME`.
+/// platform, honouring `XDG_CONFIG_HOME`. Portable and beside-the-executable
+/// installs are left to the manual directory picker.
 pub fn default_config_dir() -> PathBuf {
     match std::env::var("XDG_CONFIG_HOME")
         .ok()
@@ -30,11 +48,728 @@ pub fn default_config_dir() -> PathBuf {
 
 pub fn resolve_source_dir(source_path: Option<&str>) -> Result<PathBuf, AppError> {
     match source_path.map(str::trim).filter(|path| !path.is_empty()) {
-        Some(path) => Ok(PathBuf::from(path)),
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if !path.is_dir() {
+                return Err(AppError::Validation {
+                    code: "external_import.source_missing",
+                    message: "The selected Magpie config directory does not exist".to_string(),
+                    details: Some(path.display().to_string()),
+                    recoverable: true,
+                });
+            }
+            Ok(path)
+        }
         None => Ok(default_config_dir()),
     }
 }
 
-pub async fn prepare_entries(_dir: &Path) -> Result<Vec<PreparedExternalEntry>, AppError> {
-    Ok(Vec::new())
+async fn read_json_file(path: &Path) -> Result<Option<Value>, AppError> {
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Filesystem {
+                code: "external_import.source_read_failed",
+                message: "Could not read the Magpie configuration file".to_string(),
+                details: Some(format!("{}: {error}", path.display())),
+                recoverable: true,
+            });
+        }
+    };
+    serde_json::from_str::<Value>(&text)
+        .map(Some)
+        .map_err(|error| AppError::Validation {
+            code: "external_import.source_invalid_json",
+            message: "The Magpie configuration file is not valid JSON".to_string(),
+            details: Some(format!("{}: {error}", path.display())),
+            recoverable: true,
+        })
+}
+
+pub async fn prepare_entries(dir: &Path) -> Result<Vec<PreparedExternalEntry>, AppError> {
+    let providers_path = dir.join("providers.json");
+    let logins_path = dir.join("logins.json");
+    let providers = read_json_file(&providers_path).await?;
+    let logins = read_json_file(&logins_path).await?;
+    if providers.is_none() && logins.is_none() {
+        return Err(AppError::Validation {
+            code: "external_import.source_not_found",
+            message: "Could not find a Magpie configuration on this machine".to_string(),
+            details: Some(dir.display().to_string()),
+            recoverable: true,
+        });
+    }
+
+    let mut entries = Vec::new();
+    if let Some(provider_list) = providers
+        .as_ref()
+        .and_then(|value| value.get("providers"))
+        .and_then(Value::as_array)
+    {
+        for provider in provider_list {
+            prepare_provider(provider, &mut entries);
+        }
+    }
+    if let Some(login_list) = logins.as_ref().and_then(Value::as_array) {
+        for login in login_list {
+            prepare_login(login, &mut entries);
+        }
+    }
+
+    if entries.len() > EXTERNAL_CLIENT_MAX_ITEMS {
+        return Err(AppError::Validation {
+            code: "external_import.too_many_items",
+            message: "The Magpie configuration contains too many entries".to_string(),
+            details: Some(entries.len().to_string()),
+            recoverable: true,
+        });
+    }
+    Ok(entries)
+}
+
+/// A key as providers.json stores it: the value plus the one protocol it may
+/// serve (no restriction = any protocol).
+struct MagpieKey {
+    value: String,
+    protocol: Option<String>,
+}
+
+/// `key`/`keyProtocol` name the first key; `keys[]` holds the saved ones.
+/// A `KeyAccount` spells its value `key` and can carry its own `protocol` and
+/// an `off` switch.
+fn provider_keys(provider: &Map<String, Value>) -> Vec<MagpieKey> {
+    let mut keys = Vec::new();
+    if let Some(first) = string_field(provider, "key") {
+        keys.push(MagpieKey {
+            value: first,
+            protocol: string_field(provider, "keyProtocol"),
+        });
+    }
+    if let Some(saved) = provider.get("keys").and_then(Value::as_array) {
+        for key in saved {
+            let Some(key_object) = key.as_object() else {
+                continue;
+            };
+            let off = key_object.get("off").and_then(Value::as_bool) == Some(true);
+            if off {
+                continue;
+            }
+            if let Some(value) = string_field(key_object, "key") {
+                keys.push(MagpieKey {
+                    value,
+                    protocol: string_field(key_object, "protocol"),
+                });
+            }
+        }
+    }
+    keys
+}
+
+/// (URL field, dialect, platform) in providers.json's own order.
+const MAGPIE_PROTOCOLS: &[(&str, ApiDialect, PlatformId)] = &[
+    ("anthropic", ApiDialect::Anthropic, PlatformId::Claude),
+    ("responses", ApiDialect::OpenAiResponses, PlatformId::Codex),
+    ("chat", ApiDialect::OpenAi, PlatformId::Codex),
+    ("gemini", ApiDialect::Gemini, PlatformId::Gemini),
+];
+
+fn prepare_provider(provider: &Value, entries: &mut Vec<PreparedExternalEntry>) {
+    let object = match provider.as_object() {
+        Some(object) => object,
+        None => return,
+    };
+    let id = string_field(object, "id").unwrap_or_default();
+    if id.is_empty() {
+        return;
+    }
+    let display_name = string_field(object, "name").unwrap_or_else(|| id.clone());
+
+    let set_urls: Vec<(&str, String, ApiDialect, PlatformId)> = MAGPIE_PROTOCOLS
+        .iter()
+        .filter_map(|(field, dialect, platform)| {
+            string_field(object, field).map(|url| (*field, url, *dialect, *platform))
+        })
+        .collect();
+    if set_urls.is_empty() {
+        entries.push(PreparedExternalEntry {
+            source_id: format!("provider:{id}"),
+            body: PreparedBody::Skipped(SkipBucket::Unsupported("无协议地址".to_string())),
+        });
+        return;
+    }
+
+    let keys = provider_keys(object);
+    let headers: Vec<(String, String)> = object
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.as_str().map(|value| (name.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_mappings: Vec<ModelMapping> = object
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| ModelMapping {
+                    from: model.to_string(),
+                    to: model.to_string(),
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (field, url, dialect, platform) in set_urls {
+        let source_id = format!("provider:{id}:{field}");
+        let key = keys
+            .iter()
+            .find(|key| key.protocol.as_deref().map(|p| p == field).unwrap_or(true))
+            .map(|key| key.value.clone());
+        let Some(api_key) = key else {
+            entries.push(PreparedExternalEntry {
+                source_id,
+                body: PreparedBody::Broken {
+                    display_name: display_name.clone(),
+                    issue_code: "external_import.api_key_missing",
+                    platform_hint: Some(platform),
+                },
+            });
+            continue;
+        };
+
+        entries.push(PreparedExternalEntry {
+            source_id,
+            body: PreparedBody::Api(ExtractedApiCredential {
+                platform,
+                display_name: display_name.clone(),
+                api_key,
+                base_url: url,
+                interface_format: dialect,
+                api_key_field: None,
+                model_mappings: model_mappings.clone(),
+                user_agent: None,
+                extra_headers: headers.clone(),
+            }),
+        });
+    }
+}
+
+fn prepare_login(login: &Value, entries: &mut Vec<PreparedExternalEntry>) {
+    let object = match login.as_object() {
+        Some(object) => object,
+        None => return,
+    };
+    let agent = string_field(object, "agent").unwrap_or_default();
+    if agent.is_empty() {
+        return;
+    }
+    let user = string_field(object, "user").unwrap_or_default();
+    let login_id = string_field(object, "id");
+    let source_id = match login_id {
+        Some(id) => format!("login:{id}"),
+        None => format!("login:{agent}:{user}"),
+    };
+    let Some(platform) = platform_for_agent(&agent) else {
+        entries.push(PreparedExternalEntry {
+            source_id,
+            body: PreparedBody::Skipped(SkipBucket::Unsupported(agent)),
+        });
+        return;
+    };
+
+    let access_only = object.get("accessOnly").and_then(Value::as_bool) == Some(true);
+    let display_name = match user.is_empty() {
+        true => agent.clone(),
+        false => user.clone(),
+    } + if access_only { " (access-only)" } else { "" };
+
+    let Some(normalized) = normalize_login_auth(object, &agent, &user) else {
+        entries.push(PreparedExternalEntry {
+            source_id,
+            body: PreparedBody::Broken {
+                display_name,
+                issue_code: "external_import.official_snapshot_invalid",
+                platform_hint: Some(platform),
+            },
+        });
+        return;
+    };
+
+    match parse_cpa_text(&normalized) {
+        Ok(credentials) => {
+            for credential in credentials {
+                entries.push(PreparedExternalEntry {
+                    source_id: source_id.clone(),
+                    body: PreparedBody::Official(ParsedOfficialCredential {
+                        display_name: display_name.clone(),
+                        ..credential
+                    }),
+                });
+            }
+        }
+        Err(_) => {
+            entries.push(PreparedExternalEntry {
+                source_id,
+                body: PreparedBody::Broken {
+                    display_name,
+                    issue_code: "external_import.official_snapshot_invalid",
+                    platform_hint: Some(platform),
+                },
+            });
+        }
+    }
+}
+
+fn platform_for_agent(agent: &str) -> Option<PlatformId> {
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "codex" => Some(PlatformId::Codex),
+        "claude" => Some(PlatformId::Claude),
+        _ => None,
+    }
+}
+
+/// Builds one flat CPA-shaped object from a saved login's `auth` blob:
+///
+/// - codex: `{auth_mode, tokens:{...}}` flattened, tagged `type: "codex"`.
+/// - claude: `{claudeAiOauth:{accessToken, ...}}` flattened to snake_case and
+///   tagged `type: "claude"`; a bare `{setupToken}` becomes an access token.
+///
+/// `email` is injected top-level so the CPA parser picks up the login's user.
+fn normalize_login_auth(
+    login: &Map<String, Value>,
+    agent: &str,
+    user: &str,
+) -> Option<String> {
+    let auth = login.get("auth")?.as_object()?.clone();
+    let mut object = Map::new();
+    if !user.is_empty() {
+        object.insert("email".to_string(), Value::String(user.to_string()));
+    }
+    match agent {
+        "codex" => {
+            if let Some(tokens) = auth.get("tokens").and_then(Value::as_object) {
+                for (key, token) in tokens {
+                    object.insert(key.clone(), token.clone());
+                }
+            }
+            for key in ["auth_mode", "last_refresh"] {
+                if let Some(value) = auth.get(key) {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+            object
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("codex".to_string()));
+        }
+        "claude" => {
+            if let Some(setup_token) = string_field(&auth, "setupToken") {
+                object.insert("access_token".to_string(), Value::String(setup_token));
+            } else {
+                let oauth = auth.get("claudeAiOauth").and_then(Value::as_object)?;
+                for (source, target) in [
+                    ("accessToken", "access_token"),
+                    ("refreshToken", "refresh_token"),
+                    ("idToken", "id_token"),
+                ] {
+                    if let Some(value) = oauth.get(source) {
+                        object.insert(target.to_string(), value.clone());
+                    }
+                }
+                if let Some(expires) = oauth.get("expiresAt") {
+                    object.insert("expired".to_string(), expires.clone());
+                }
+            }
+            object
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("claude".to_string()));
+        }
+        _ => return None,
+    }
+
+    let has_token = ["access_token", "refresh_token", "id_token"]
+        .iter()
+        .any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+    has_token.then(|| Value::Object(object).to_string())
+}
+
+fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::external_client_import::EXTERNAL_CLIENT_MAX_ITEMS;
+    use crate::models::platform::{ApiDialect, PlatformId};
+    use crate::services::external_client_import_service::{PreparedBody, SkipBucket};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// XDG_CONFIG_HOME is process-global; serialise the tests that touch it.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    async fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
+        let path = dir.join(name);
+        tokio::fs::write(&path, content).await.expect("write fixture");
+        path
+    }
+
+    async fn prepare_with(dir: &Path) -> Vec<PreparedExternalEntry> {
+        prepare_entries(dir).await.expect("prepare entries")
+    }
+
+    #[tokio::test]
+    async fn a_provider_with_several_protocol_urls_becomes_one_entry_each() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "providers.json",
+            r#"{
+                "providers": [{
+                    "id": "relay1", "name": "多协议中转",
+                    "key": "sk-multi",
+                    "anthropic": "https://relay.example",
+                    "chat": "https://relay.example/v1",
+                    "headers": {"X-Debug": "1"},
+                    "models": ["model-a", "model-b"]
+                }]
+            }"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source_id, "provider:relay1:anthropic");
+        let PreparedBody::Api(anthropic) = &entries[0].body else {
+            panic!("anthropic entry must be an API entry");
+        };
+        assert_eq!(anthropic.platform, PlatformId::Claude);
+        assert_eq!(anthropic.interface_format, ApiDialect::Anthropic);
+        assert_eq!(anthropic.base_url, "https://relay.example");
+        assert_eq!(anthropic.api_key, "sk-multi");
+        assert_eq!(
+            anthropic.extra_headers,
+            vec![("X-Debug".to_string(), "1".to_string())]
+        );
+        assert_eq!(anthropic.model_mappings.len(), 2);
+        assert_eq!(anthropic.model_mappings[0].from, "model-a");
+
+        assert_eq!(entries[1].source_id, "provider:relay1:chat");
+        let PreparedBody::Api(chat) = &entries[1].body else {
+            panic!("chat entry must be an API entry");
+        };
+        assert_eq!(chat.platform, PlatformId::Codex);
+        assert_eq!(chat.interface_format, ApiDialect::OpenAi);
+        assert_eq!(chat.base_url, "https://relay.example/v1");
+    }
+
+    #[tokio::test]
+    async fn single_protocol_source_ids_still_carry_the_protocol_suffix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "providers.json",
+            r#"{
+                "providers": [{
+                    "id": "resp1", "name": "Responses",
+                    "key": "sk-r",
+                    "responses": "https://resp.example/v1"
+                }]
+            }"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "provider:resp1:responses");
+        let PreparedBody::Api(extracted) = &entries[0].body else {
+            panic!("responses entry must be an API entry");
+        };
+        assert_eq!(extracted.interface_format, ApiDialect::OpenAiResponses);
+        assert_eq!(extracted.platform, PlatformId::Codex);
+    }
+
+    #[tokio::test]
+    async fn a_protocol_restricted_key_only_serves_its_own_protocol() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "providers.json",
+            r#"{
+                "providers": [{
+                    "id": "dual", "name": "分协议 key",
+                    "key": "sk-anthropic",
+                    "keyProtocol": "anthropic",
+                    "anthropic": "https://relay.example",
+                    "chat": "https://relay.example/v1"
+                }]
+            }"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 2);
+        let PreparedBody::Api(anthropic) = &entries[0].body else {
+            panic!("anthropic entry must use the restricted key");
+        };
+        assert_eq!(anthropic.api_key, "sk-anthropic");
+        match &entries[1].body {
+            PreparedBody::Broken { issue_code, .. } => {
+                assert_eq!(*issue_code, "external_import.api_key_missing");
+            }
+            other => panic!("chat must lack a key, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_any_key_lists_broken_rows() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "providers.json",
+            r#"{
+                "providers": [{
+                    "id": "nokey", "name": "无 key",
+                    "responses": "https://nokey.example/v1"
+                }]
+            }"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        match &entries[0].body {
+            PreparedBody::Broken { issue_code, .. } => {
+                assert_eq!(*issue_code, "external_import.api_key_missing");
+            }
+            other => panic!("keyless provider must be broken, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_logins_normalize_into_official_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "logins.json",
+            r#"[{
+                "id": "login-1",
+                "agent": "codex",
+                "user": "user@example.com",
+                "plan": "plus",
+                "auth": {"auth_mode": "chatgpt", "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "at-token",
+                    "refresh_token": "rt-token",
+                    "account_id": "acc-1"
+                }}
+            }]"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "login:login-1");
+        let PreparedBody::Official(credential) = &entries[0].body else {
+            panic!("codex login must be an Official entry");
+        };
+        assert_eq!(credential.platform, "codex");
+        assert_eq!(credential.email.as_deref(), Some("user@example.com"));
+        assert_eq!(credential.display_name, "user@example.com");
+        let secret: serde_json::Value =
+            serde_json::from_str(&credential.secret_payload_json).expect("secret");
+        assert_eq!(secret["access_token"], "at-token");
+        assert_eq!(secret["refresh_token"], "rt-token");
+        assert_eq!(secret["account_id"], "acc-1");
+    }
+
+    #[tokio::test]
+    async fn claude_logins_normalize_into_official_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "logins.json",
+            r#"[{
+                "id": "login-2",
+                "agent": "claude",
+                "user": "claude@example.com",
+                "auth": {"claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-abc",
+                    "refreshToken": "sk-ant-ort01-abc",
+                    "expiresAt": 1730000000000
+                }}
+            }]"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "login:login-2");
+        let PreparedBody::Official(credential) = &entries[0].body else {
+            panic!("claude login must be an Official entry");
+        };
+        assert_eq!(credential.platform, "claude");
+        assert_eq!(credential.email.as_deref(), Some("claude@example.com"));
+        let secret: serde_json::Value =
+            serde_json::from_str(&credential.secret_payload_json).expect("secret");
+        assert_eq!(secret["access_token"], "sk-ant-oat01-abc");
+        assert_eq!(secret["refresh_token"], "sk-ant-ort01-abc");
+    }
+
+    #[tokio::test]
+    async fn setup_token_logins_import_as_claude_accounts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "logins.json",
+            r#"[{
+                "id": "login-3",
+                "agent": "claude",
+                "user": "",
+                "auth": {"setupToken": "sk-ant-oat01-setup"}
+            }]"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        let PreparedBody::Official(credential) = &entries[0].body else {
+            panic!("setup token must be an Official entry");
+        };
+        assert_eq!(credential.platform, "claude");
+        let secret: serde_json::Value =
+            serde_json::from_str(&credential.secret_payload_json).expect("secret");
+        assert_eq!(secret["access_token"], "sk-ant-oat01-setup");
+        assert_eq!(entries[0].source_id, "login:login-3");
+    }
+
+    #[tokio::test]
+    async fn unrelated_agents_are_skipped_with_a_label() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "logins.json",
+            r#"[
+                {"id": "cop1", "agent": "copilot", "user": "dev@example.com", "auth": {}},
+                {"id": "gem1", "agent": "gemini", "user": "g@example.com", "auth": {}}
+            ]"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            match &entry.body {
+                PreparedBody::Skipped(SkipBucket::Unsupported(label)) => {
+                    assert!(label == "copilot" || label == "gemini");
+                }
+                other => panic!("unrelated agent must be skipped, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn access_only_logins_are_marked_in_their_display_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_file(
+            dir.path(),
+            "logins.json",
+            r#"[{
+                "id": "ao1",
+                "agent": "codex",
+                "user": "ao@example.com",
+                "accessOnly": true,
+                "auth": {"tokens": {"access_token": "at", "id_token": "id"}}
+            }]"#,
+        )
+        .await;
+
+        let entries = prepare_with(dir.path()).await;
+        let PreparedBody::Official(credential) = &entries[0].body else {
+            panic!("access-only login must be an Official entry");
+        };
+        assert!(credential.display_name.contains("(access-only)"));
+    }
+
+    #[test]
+    fn xdg_config_home_resolves_the_config_dir() {
+        let _guard = ENV_GUARD.lock().expect("guard");
+        let xdg = tempfile::tempdir().expect("temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+        let resolved = resolve_source_dir(None).expect("resolve");
+        assert_eq!(resolved, xdg.path().join("magpie"));
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[tokio::test]
+    async fn more_than_two_thousand_entries_are_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut providers = String::new();
+        for index in 0..EXTERNAL_CLIENT_MAX_ITEMS + 1 {
+            providers.push_str(&format!(
+                r#"{{"id":"p{index}","chat":"https://h{index}.example/v1","key":"sk-{index}"}}"#
+            ));
+            if index < EXTERNAL_CLIENT_MAX_ITEMS {
+                providers.push(',');
+            }
+        }
+        write_file(
+            dir.path(),
+            "providers.json",
+            &format!(r#"{{"providers":[{providers}]}}"#),
+        )
+        .await;
+
+        let error = prepare_entries(dir.path()).await.expect_err("too many");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "external_import.too_many_items",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn either_file_alone_is_enough_and_both_missing_reports_not_found() {
+        let only_logins = tempfile::tempdir().expect("temp dir");
+        // 无 id 的登录回退 agent:user 形态。
+        write_file(only_logins.path(), "logins.json", r#"[{"agent":"codex","user":"fallback@example.com","auth":{"tokens":{"access_token":"at","refresh_token":"rt"}}}]"#).await;
+        let entries = prepare_with(only_logins.path()).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "login:codex:fallback@example.com");
+
+        let only_providers = tempfile::tempdir().expect("temp dir");
+        write_file(only_providers.path(), "providers.json", r#"{"providers":[]}"#).await;
+        let entries = prepare_with(only_providers.path()).await;
+        assert!(entries.is_empty());
+
+        let empty = tempfile::tempdir().expect("temp dir");
+        let error = prepare_entries(empty.path()).await.expect_err("no files");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "external_import.source_not_found",
+                ..
+            }
+        ));
+    }
 }
