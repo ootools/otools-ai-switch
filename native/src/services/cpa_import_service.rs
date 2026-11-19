@@ -132,6 +132,19 @@ fn parse_cpa_object(object: &Map<String, Value>) -> Result<ParsedOfficialCredent
             None,
         ));
     }
+    if !access_token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+        && !refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+    {
+        return Err(validation_error(
+            "validation.cpa_secret_required",
+            "CPA credential requires a non-empty access_token or refresh_token",
+            None,
+        ));
+    }
 
     let last_refresh = value_field(object, &["last_refresh", "lastRefresh"]);
     let expired = value_field(object, &["expired"]);
@@ -343,6 +356,34 @@ fn with_file_context(err: AppError, path: &Path) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_empty_access_and_refresh_tokens() {
+        let parsed = parse_cpa_text(
+            r#"{"type":"codex","access_token":"","refresh_token":"","account_id":"account","client_id":"client"}"#,
+        )
+        .expect_err("empty token values must be rejected");
+        assert!(matches!(
+            parsed,
+            AppError::Validation {
+                code: "validation.cpa_secret_required",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_access_token_only_claude_setup_token_for_proxy_routing() {
+        let error = parse_cpa_text(r#"{"type":"claude","access_token":"sk-ant-oat01-setup"}"#)
+            .expect_err("setup token cannot enter the official proxy path");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "validation.cpa_secret_required",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn parses_cliproxyapi_codex_object() {

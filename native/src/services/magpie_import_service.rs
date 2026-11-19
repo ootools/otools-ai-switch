@@ -240,6 +240,7 @@ fn prepare_provider(provider: &Value, entries: &mut Vec<PreparedExternalEntry>) 
             entries.push(PreparedExternalEntry {
                 source_id,
                 body: PreparedBody::Broken {
+                    kind: "api".to_string(),
                     display_name: display_name.clone(),
                     issue_code: "external_import.api_key_missing",
                     platform_hint: Some(platform),
@@ -298,6 +299,7 @@ fn prepare_login(login: &Value, entries: &mut Vec<PreparedExternalEntry>) {
         entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
+                kind: "official".to_string(),
                 display_name,
                 issue_code: "external_import.official_snapshot_invalid",
                 platform_hint: Some(platform),
@@ -322,6 +324,7 @@ fn prepare_login(login: &Value, entries: &mut Vec<PreparedExternalEntry>) {
             entries.push(PreparedExternalEntry {
                 source_id,
                 body: PreparedBody::Broken {
+                    kind: "official".to_string(),
                     display_name,
                     issue_code: "external_import.official_snapshot_invalid",
                     platform_hint: Some(platform),

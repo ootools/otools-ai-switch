@@ -24,6 +24,7 @@ use crate::models::route_credential::{
 use crate::services::external_client_import_service::{
     PreparedBody, PreparedExternalEntry, SkipBucket,
 };
+
 use serde_json::{Map, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::path::{Path, PathBuf};
@@ -734,12 +735,6 @@ fn split_one_m_suffix(value: &str) -> (String, bool) {
     (trimmed.to_string(), false)
 }
 
-/// Wraps every provider into the unified entry shape the external import
-/// service consumes, so cc-switch and the newer readers share one classifier.
-///
-/// `OfficialLogin` / key / URL problems become listable `Broken` rows; an app
-/// type no platform maps to becomes an `OtherPlatform` skip labelled by the app
-/// type, exactly as the pre-refactor classifier treated them.
 pub async fn prepare_entries(path: &Path) -> Result<Vec<PreparedExternalEntry>, AppError> {
     Ok(read_providers(path)
         .await?
@@ -756,6 +751,7 @@ fn prepare_provider(provider: ExternalClientProvider) -> PreparedExternalEntry {
             SkipBucket::OtherPlatform(None, provider.app_type.trim().to_string()),
         ),
         Err(issue) => PreparedBody::Broken {
+            kind: "api".to_string(),
             display_name: provider.display_name.trim().to_string(),
             issue_code: issue.code(),
             platform_hint: entry_platform,

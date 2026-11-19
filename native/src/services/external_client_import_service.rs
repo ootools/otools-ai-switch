@@ -62,15 +62,16 @@ pub struct PreparedExternalEntry {
 pub enum PreparedBody {
     /// A ready-to-store API account.
     Api(ExtractedApiCredential),
-    /// A ready-to-store official subscription account (OAuth snapshot).
-    Official(ParsedOfficialCredential),
-    /// Listable but not importable: the row shows with the issue so the user
-    /// can see why and fix the source.
+    /// An entry we own but cannot import until its source account is repaired.
+    /// Keep the kind so UI doesn't mislabel a broken OAuth snapshot as API.
     Broken {
+        kind: String,
         display_name: String,
         issue_code: &'static str,
         platform_hint: Option<PlatformId>,
     },
+    /// A ready-to-store official subscription account (OAuth snapshot).
+    Official(ParsedOfficialCredential),
     /// Not listable at all, only counted.
     Skipped(SkipBucket),
 }
@@ -150,13 +151,9 @@ pub async fn preview_external_client_import(
                 counts.other_platform += 1;
                 *counts.other_platform_counts.entry(label).or_default() += 1;
             }
-            // 占位：Task 6 换成真正的 unsupported 计数字段。
             Classification::Unsupported(label) => {
-                counts.other_platform += 1;
-                *counts
-                    .other_platform_counts
-                    .entry(format!("unsupported:{label}"))
-                    .or_default() += 1;
+                counts.unsupported += 1;
+                *counts.unsupported_counts.entry(label).or_default() += 1;
             }
             Classification::Item(item) => {
                 counts.total += 1;
@@ -240,13 +237,12 @@ pub async fn import_external_client_accounts(
                 outcome.failed += 1;
                 continue;
             }
-            // 占位：official 条目的真实落库在 Task 6 落地前不可导入。
-            PreparedBody::Official(_) => {
+            PreparedBody::Skipped(_) => {
                 outcome.failed += 1;
                 continue;
             }
-            PreparedBody::Skipped(_) => {
-                outcome.failed += 1;
+            // official 条目由下面的专用循环落库。
+            PreparedBody::Official(_) => {
                 continue;
             }
         };
@@ -254,7 +250,7 @@ pub async fn import_external_client_accounts(
         let payload = build_payload(&extracted);
         // Same guard as the preview: only overwrite a row this platform's API
         // tab could have produced.
-        let matched = match overwrite_target(existing.get(&entry.source_id), platform) {
+        let matched = match overwrite_target(existing.get(&entry.source_id), platform, "api") {
             Ok(matched) => matched,
             Err(_) => {
                 outcome.failed += 1;
@@ -284,6 +280,75 @@ pub async fn import_external_client_accounts(
                     "api",
                     &extracted.display_name,
                     None,
+                    "ok",
+                    None,
+                    &payload.secret_payload_json,
+                    &payload.config_json,
+                    &payload.preview_json,
+                    Some(ExternalSourceRef {
+                        client,
+                        source_id: &entry.source_id,
+                    }),
+                )
+                .await?;
+                outcome.created += 1;
+                outcome.created_ids.push(created.id.clone());
+                outcome.imported.push(created);
+            }
+        }
+    }
+
+    // Official entries run through the same transaction: same dedupe key, same
+    // overwrite guard, but their kind and payload come from the parsed
+    // credential instead of `build_payload`.
+    for entry in &entries {
+        let PreparedBody::Official(credential) = &entry.body else {
+            continue;
+        };
+        if !selected.contains(&entry.source_id) {
+            continue;
+        }
+        matched.insert(entry.source_id.clone());
+
+        let Some(credential_platform) = PlatformId::parse(&credential.platform).ok() else {
+            outcome.failed += 1;
+            continue;
+        };
+        if credential_platform != platform {
+            outcome.failed += 1;
+            continue;
+        }
+        let payload = official_payload(credential);
+        let matched = match overwrite_target(existing.get(&entry.source_id), platform, "official") {
+            Ok(matched) => matched,
+            Err(_) => {
+                outcome.failed += 1;
+                continue;
+            }
+        };
+        match matched {
+            Some(existing) => {
+                RouteCredentialRepository::overwrite_from_external_source(
+                    &mut tx,
+                    &existing.id,
+                    &credential.display_name,
+                    &payload.secret_payload_json,
+                    &payload.config_json,
+                    &payload.preview_json,
+                )
+                .await?;
+                outcome.overwritten += 1;
+                outcome
+                    .imported
+                    .push(RouteCredentialRepository::get_tx(&mut tx, &existing.id).await?);
+            }
+            None => {
+                let created = RouteCredentialRepository::create_tx_with_external_source(
+                    &mut tx,
+                    credential.platform.as_str(),
+                    "official",
+                    &credential.display_name,
+                    credential.email.clone(),
                     "ok",
                     None,
                     &payload.secret_payload_json,
@@ -342,19 +407,20 @@ enum Classification {
 /// The local row a re-import may overwrite, if there is one it is allowed to touch.
 ///
 /// The unique index is global, not per platform, so the row bound to a source
-/// record could in principle sit on another platform or be an official-login
-/// account. Overwriting either would corrupt something the user cannot see from
-/// here, so those cases become a visible error instead.
+/// record could in principle sit on another platform or be of another kind
+/// (api ↔ official). Overwriting either would corrupt something the user cannot
+/// see from here, so those cases become a visible error instead.
 fn overwrite_target<'a>(
     matched: Option<&'a ExternalSourceMatch>,
     platform: PlatformId,
+    entry_kind: &str,
 ) -> Result<Option<&'a ExternalSourceMatch>, ExternalSourceMatch> {
     match matched {
         None => Ok(None),
         Some(matched)
-            if matched.kind.eq_ignore_ascii_case("api")
+            if matched.kind.eq_ignore_ascii_case(entry_kind)
                 // 统一账号池（G-P8 P4a）：已有账号的 platform 恒为 `codex`；
-                // 覆盖匹配只要求它是本功能写入的 API 账号。
+                // 覆盖匹配只要求它是本功能写入的同 kind 账号。
                 && PlatformId::parse(&matched.platform).is_ok_and(|local| {
                     local.as_str()
                         == crate::database::repositories::route_pool_repository::UNIFIED_POOL_PLATFORM
@@ -367,10 +433,6 @@ fn overwrite_target<'a>(
 }
 
 const CONFLICTING_LOCAL_ACCOUNT: &str = "external_import.conflicting_local_account";
-
-/// Until Task 6 lands, official entries cannot preview importably; they show
-/// with the long-standing official-login issue rather than a wrong one.
-const OFFICIAL_PREVIEW_PLACEHOLDER_ISSUE: &str = "external_import.official_login_unsupported";
 
 fn classify(
     entry: &PreparedExternalEntry,
@@ -385,7 +447,7 @@ fn classify(
                     label: extracted.platform.as_str().to_string(),
                 };
             }
-            let matched = match overwrite_target(existing.get(&entry.source_id), platform) {
+            let matched = match overwrite_target(existing.get(&entry.source_id), platform, "api") {
                 Ok(matched) => matched,
                 Err(conflict) => {
                     return Classification::Item(ExternalClientAccountPreviewItem {
@@ -424,8 +486,6 @@ fn classify(
                 issue_codes: Vec::new(),
             })
         }
-        // 占位：Task 6 把这里换成真正的 official 预览行（kind 徽标、打码
-        // token、同 kind 覆盖判断）。
         PreparedBody::Official(credential) => {
             let credential_platform = PlatformId::parse(&credential.platform).ok();
             if credential_platform.is_some_and(|parsed| parsed != platform) {
@@ -434,6 +494,26 @@ fn classify(
                     label: credential.platform.clone(),
                 };
             }
+            let matched = match overwrite_target(existing.get(&entry.source_id), platform, "official")
+            {
+                Ok(matched) => matched,
+                Err(conflict) => {
+                    return Classification::Item(ExternalClientAccountPreviewItem {
+                        kind: "official".to_string(),
+                        source_id: entry.source_id.clone(),
+                        display_name: credential.display_name.clone(),
+                        platform: credential.platform.clone(),
+                        interface_format: None,
+                        base_url: None,
+                        api_key_masked: official_masked_token(credential),
+                        model_mapping_count: 0,
+                        disposition: "error".to_string(),
+                        existing_credential_id: Some(conflict.id),
+                        existing_display_name: Some(conflict.display_name),
+                        issue_codes: vec![CONFLICTING_LOCAL_ACCOUNT.to_string()],
+                    })
+                }
+            };
             Classification::Item(ExternalClientAccountPreviewItem {
                 kind: "official".to_string(),
                 source_id: entry.source_id.clone(),
@@ -441,15 +521,21 @@ fn classify(
                 platform: credential.platform.clone(),
                 interface_format: None,
                 base_url: None,
-                api_key_masked: None,
+                api_key_masked: official_masked_token(credential),
                 model_mapping_count: 0,
-                disposition: "error".to_string(),
-                existing_credential_id: None,
-                existing_display_name: None,
-                issue_codes: vec![OFFICIAL_PREVIEW_PLACEHOLDER_ISSUE.to_string()],
+                disposition: if matched.is_some() {
+                    "overwrite"
+                } else {
+                    "create"
+                }
+                .to_string(),
+                existing_credential_id: matched.map(|matched| matched.id.clone()),
+                existing_display_name: matched.map(|matched| matched.display_name.clone()),
+                issue_codes: Vec::new(),
             })
         }
         PreparedBody::Broken {
+            kind,
             display_name,
             issue_code,
             platform_hint,
@@ -465,7 +551,7 @@ fn classify(
                 };
             }
             Classification::Item(ExternalClientAccountPreviewItem {
-                kind: "api".to_string(),
+                kind: kind.clone(),
                 source_id: entry.source_id.clone(),
                 display_name: display_name.clone(),
                 platform: platform_hint
@@ -495,6 +581,38 @@ struct CredentialPayload {
     secret_payload_json: String,
     config_json: String,
     preview_json: String,
+}
+
+/// Official entries carry their payload ready-made from the CPA parser; only
+/// the preview blob is generated here, for `kind: "official"`.
+fn official_payload(credential: &ParsedOfficialCredential) -> CredentialPayload {
+    let preview_json = RoutePreviewService::generate(
+        &credential.platform,
+        "official",
+        &credential.secret_payload_json,
+        &credential.config_json,
+    );
+    CredentialPayload {
+        secret_payload_json: credential.secret_payload_json.clone(),
+        config_json: credential.config_json.clone(),
+        preview_json,
+    }
+}
+
+/// The token the preview row shows masked: access_token first, id_token as the
+/// fallback (some access-only imports carry only that), else nothing.
+fn official_masked_token(credential: &ParsedOfficialCredential) -> Option<String> {
+    let secret: Value = serde_json::from_str(&credential.secret_payload_json).ok()?;
+    ["access_token", "id_token"]
+        .iter()
+        .find_map(|key| {
+            secret
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(mask_api_key)
+        })
 }
 
 /// Builds the same three JSON blobs `RouteCredentialService::create_api` writes.
@@ -1035,6 +1153,340 @@ mod tests {
         assert_eq!(mask_api_key("short"), "sh***");
         assert_eq!(mask_api_key("   "), "(empty)");
     }
+
+    // ---- codex-plus / magpie：official 条目与真计数（Task 6）----
+
+    async fn write_codex_plus_official_fixture(dir: &Path, display: &str) {
+        let content = json!({
+            "relayProfiles": [{
+                "id": "of1",
+                "name": display,
+                "relayMode": "official",
+                // settings.json 里的 authContents 是 JSON 字符串（auth.json 原文）。
+                "authContents": r#"{"tokens":{"id_token":"id-tok","access_token":"at-tok","refresh_token":"rt-tok","account_id":"acc-1"}}"#,
+            }]
+        })
+        .to_string();
+        tokio::fs::write(dir.join("settings.json"), content)
+            .await
+            .expect("write fixture");
+    }
+
+    #[tokio::test]
+    async fn broken_official_snapshots_keep_the_official_kind_badge() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"relayProfiles":[{"id":"missing","name":"No snapshot","relayMode":"official"}]}"#,
+        )
+        .await
+        .expect("write fixture");
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+
+        let preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("preview");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].kind, "official");
+        assert_eq!(preview.items[0].disposition, "error");
+        assert!(preview.items[0]
+            .issue_codes
+            .contains(&"external_import.official_snapshot_missing".to_string()));
+    }
+
+    #[tokio::test]
+    async fn official_preview_rows_mask_the_snapshot_tokens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_codex_plus_official_fixture(dir.path(), "ChatGPT 订阅").await;
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("preview");
+        assert_eq!(preview.counts.total, 1);
+        assert_eq!(preview.counts.official, 1);
+        let item = &preview.items[0];
+        assert_eq!(item.kind, "official");
+        assert_eq!(item.disposition, "create");
+        assert_eq!(item.interface_format, None);
+        assert_eq!(item.base_url, None);
+        assert!(item.api_key_masked.as_deref().is_some_and(|m| m.contains("***")));
+        // 预览是展示载荷：快照明文不出现在序列化结果里。
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+        assert!(!serialized.contains("at-tok"));
+        assert!(!serialized.contains("rt-tok"));
+    }
+
+    #[tokio::test]
+    async fn magpie_logins_list_on_their_own_platform_and_count_otherwise() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            dir.path().join("logins.json"),
+            r#"[
+                {"id":"cl1","agent":"claude","user":"claude@example.com",
+                 "auth":{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc","refreshToken":"sk-ant-ort01-abc"}}},
+                {"id":"cx1","agent":"codex","user":"codex@example.com",
+                 "auth":{"tokens":{"access_token":"at","refresh_token":"rt","id_token":"id","account_id":"acc"}}}
+            ]"#,
+        )
+        .await
+        .expect("write logins");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let preview = |platform: String| {
+            let dir_display = dir.path().display().to_string();
+            async {
+                preview_external_client_import(
+                    &pool,
+                    PreviewExternalClientImportInput {
+                        client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                        platform,
+                        source_path: Some(dir_display),
+                    },
+                )
+                .await
+                .expect("preview")
+            }
+        };
+
+        let claude_preview = preview("claude".to_string()).await;
+        assert_eq!(claude_preview.counts.total, 1);
+        assert_eq!(claude_preview.items[0].kind, "official");
+        assert_eq!(claude_preview.items[0].display_name, "claude@example.com");
+        assert_eq!(claude_preview.counts.other_platform, 1);
+        assert_eq!(claude_preview.counts.other_platform_counts["codex"], 1);
+
+        let codex_preview = preview("codex".to_string()).await;
+        assert_eq!(codex_preview.counts.total, 1);
+        assert_eq!(codex_preview.items[0].display_name, "codex@example.com");
+        assert_eq!(codex_preview.counts.other_platform_counts["claude"], 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_official_import_overwrites_instead_of_duplicating() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_codex_plus_official_fixture(dir.path(), "第一次").await;
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let import = |dir_display: String, ids: Vec<String>| {
+            async {
+                import_external_client_accounts(
+                    &pool,
+                    ImportExternalClientAccountsInput {
+                        client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                        platform: "codex".to_string(),
+                        source_path: Some(dir_display),
+                        source_ids: ids,
+                    },
+                )
+                .await
+                .expect("import")
+            }
+        };
+
+        let first = import(dir.path().display().to_string(), vec!["relay:of1:official".to_string()]).await;
+        assert_eq!(first.created, 1);
+        let credential_id = first.imported[0].id.clone();
+
+        tokio::fs::remove_file(dir.path().join("settings.json"))
+            .await
+            .expect("replace fixture");
+        write_codex_plus_official_fixture(dir.path(), "改名之后").await;
+        let second = import(dir.path().display().to_string(), vec!["relay:of1:official".to_string()]).await;
+        assert_eq!(second.created, 0);
+        assert_eq!(second.overwritten, 1);
+        assert_eq!(second.imported[0].id, credential_id);
+        assert_eq!(second.imported[0].display_name, "改名之后");
+        assert_eq!(second.imported[0].kind, "official");
+
+        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM route_credentials")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(total, 1, "official 重导不得新增行");
+    }
+
+    #[tokio::test]
+    async fn api_rows_and_official_rows_never_overwrite_each_other() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // officialMixApiKey 的同 relay 同时给出 :api 与 :official 两条。
+        tokio::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"relayProfiles":[{"id":"mix1","name":"混合","relayMode":"mixedApi","officialMixApiKey":true,"upstreamBaseUrl":"https://relay.example/v1","apiKey":"sk-mix","authContents":"{\"tokens\":{\"access_token\":\"at\",\"refresh_token\":\"rt\"}}"}]}"#,
+        )
+        .await
+        .expect("write fixture");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let input = |ids: Vec<&str>| ImportExternalClientAccountsInput {
+            client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+            platform: "codex".to_string(),
+            source_path: Some(dir.path().display().to_string()),
+            source_ids: ids.into_iter().map(String::from).collect(),
+        };
+
+        // 先导 official 行，再让它拥有 :api 的绑定 → api 导入被拒。
+        let official = import_external_client_accounts(
+            &pool,
+            input(vec!["relay:mix1:official"]),
+        )
+        .await
+        .expect("official import");
+        assert_eq!(official.created, 1);
+
+        // 手工把该 official 行的绑定改成 :api（模拟同 id 先后为两种 kind）。
+        sqlx::query(
+            "UPDATE route_credentials SET external_source_id = 'relay:mix1:api' WHERE id = ?",
+        )
+        .bind(&official.imported[0].id)
+        .execute(&pool)
+        .await
+        .expect("rebind");
+
+        let api_attempt = import_external_client_accounts(&pool, input(vec!["relay:mix1:api"]))
+            .await
+            .expect("api import");
+        assert_eq!(api_attempt.failed, 1, "跨 kind 覆盖必须被拒");
+        assert_eq!(api_attempt.created, 0);
+    }
+
+    #[tokio::test]
+    async fn official_import_stores_the_snapshot_verbatim_with_the_email() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            dir.path().join("logins.json"),
+            r#"[{"id":"cx9","agent":"codex","user":"snap@example.com",
+                 "auth":{"tokens":{"id_token":"id-tok","access_token":"at-tok","refresh_token":"rt-tok","account_id":"acc-9"}}}]"#,
+        )
+        .await
+        .expect("write logins");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let outcome = import_external_client_accounts(
+            &pool,
+            ImportExternalClientAccountsInput {
+                client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+                source_ids: vec!["login:cx9".to_string()],
+            },
+        )
+        .await
+        .expect("import");
+        assert_eq!(outcome.created, 1);
+        let row = &outcome.imported[0];
+        assert_eq!(row.kind, "official");
+        assert_eq!(row.email.as_deref(), Some("snap@example.com"));
+
+        let secret: Value = serde_json::from_str(&row.secret_payload_json).expect("secret");
+        // 快照原样落库：没有任何刷新或改写。
+        assert_eq!(secret["access_token"], "at-tok");
+        assert_eq!(secret["refresh_token"], "rt-tok");
+        assert_eq!(secret["id_token"], "id-tok");
+        assert_eq!(secret["account_id"], "acc-9");
+    }
+
+    #[tokio::test]
+    async fn unsupported_entries_count_into_their_own_buckets() {
+        let codex_dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            codex_dir.path().join("settings.json"),
+            r#"{"relayProfiles":[{"id":"agg1","name":"聚合","relayMode":"aggregate"}]}"#,
+        )
+        .await
+        .expect("write fixture");
+        let magpie_dir = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(
+            magpie_dir.path().join("logins.json"),
+            r#"[{"id":"cop1","agent":"copilot","user":"dev@example.com","auth":{}}]"#,
+        )
+        .await
+        .expect("write logins");
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let codex_preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(codex_dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("codex-plus preview");
+        assert_eq!(codex_preview.counts.unsupported, 1);
+        assert_eq!(codex_preview.counts.unsupported_counts["aggregate"], 1);
+        assert_eq!(codex_preview.counts.other_platform, 0);
+
+        let magpie_preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_MAGPIE.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(magpie_dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("magpie preview");
+        assert_eq!(magpie_preview.counts.unsupported, 1);
+        assert_eq!(magpie_preview.counts.unsupported_counts["copilot"], 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_source_directory_flows_through_preview_and_import() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_codex_plus_official_fixture(dir.path(), "显式目录").await;
+
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let preview = preview_external_client_import(
+            &pool,
+            PreviewExternalClientImportInput {
+                client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+            },
+        )
+        .await
+        .expect("preview");
+        assert_eq!(preview.counts.importable, 1);
+        assert_eq!(preview.source_path, dir.path().display().to_string());
+
+        let outcome = import_external_client_accounts(
+            &pool,
+            ImportExternalClientAccountsInput {
+                client: EXTERNAL_CLIENT_CODEX_PLUS.to_string(),
+                platform: "codex".to_string(),
+                source_path: Some(dir.path().display().to_string()),
+                source_ids: vec!["relay:of1:official".to_string()],
+            },
+        )
+        .await
+        .expect("import");
+        assert_eq!(outcome.created, 1);
+    }
+
 
     #[test]
     fn build_payload_merges_custom_headers_with_the_user_agent() {

@@ -340,6 +340,7 @@ fn push_api(
         entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
+                kind: "api".to_string(),
                 display_name: display_name.to_string(),
                 issue_code: "external_import.api_key_missing",
                 platform_hint: Some(protocol_platform(relay)),
@@ -355,6 +356,7 @@ fn push_api(
         entries.push(PreparedExternalEntry {
             source_id,
             body: PreparedBody::Broken {
+                kind: "api".to_string(),
                 display_name: display_name.to_string(),
                 issue_code: "external_import.upstream_missing",
                 platform_hint: Some(protocol_platform(relay)),
@@ -414,6 +416,7 @@ fn push_official(
         entries.push(PreparedExternalEntry {
             source_id: source_id.clone(),
             body: PreparedBody::Broken {
+                kind: "official".to_string(),
                 display_name: display_name.to_string(),
                 issue_code,
                 platform_hint: Some(PlatformId::Codex),
@@ -492,6 +495,7 @@ fn prepare_claude_provider(provider: &Value, entries: &mut Vec<PreparedExternalE
     let body = match cc_switch::extract_api_credential(&synthesized) {
         Ok(extracted) => PreparedBody::Api(extracted),
         Err(issue) => PreparedBody::Broken {
+            kind: "api".to_string(),
             display_name,
             issue_code: issue.code(),
             platform_hint: Some(PlatformId::Claude),
