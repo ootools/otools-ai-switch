@@ -2,6 +2,16 @@
 
 Validated locally on Windows x64 with Node 22.22.2, pnpm 10.33.2, Rust 1.94.1 and Python 3.12.10.
 
+## v0.2.1 release verification
+
+Released 2026-11-26 from commit `7edf982`, annotated tag `v0.2.1`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.2.1> is public, non-draft, non-prerelease, with all **7 assets uploaded** (four `.oplg`, `plugin.json`, `logo.svg`, `SHA256SUMS`).
+
+- Three-platform CI run **45871601600** succeeded on `7edf982`: Windows x64, Linux x64 and macOS ARM64. Each job passed the **84-file / 977-test frontend suite**, typecheck/build/package checks, serial native plugin boundary test, FFI/listener smoke checks, autostart and Nano Banana tests.
+- Published checksums match the CI artifacts byte-for-byte; the unsuffixed fallback is the Windows x64 package (`packageMode=1`). SHA-256 prefixes: fallback/Windows `ace699f5…b8b`, Linux `a25ad62e…f45`, macOS `4bc3306f…503`, manifest `3e12d681…bd`, logo `cea34d58…f424`.
+- Release asset state is `uploaded` for all seven assets; direct HTTPS checks of the combined package and the tag-pinned raw logo both returned HTTP 200.
+- Market publication returned **code=200** with `packageMode=1`, all four package URLs and the tag-pinned logo URL submitted for `ootools/otools-ai-switch` v0.2.1.
+- Local release-version verification: `pnpm typecheck` and `pnpm build` passed; frontend suite **84 files / 977 tests passed**; native **2115 tests passed / 0 failed / 6 ignored**.
+
 ## v0.1.8 release verification
 
 Released 2026-11-16 from commit `9cf5749`, annotated tag `v0.1.8`. GitHub Release <https://github.com/ootools/otools-ai-switch/releases/tag/v0.1.8> is public, non-draft, non-prerelease and the latest stable release, with all **8 assets uploaded**. Release notes match `docs/releases/0.1.8.md`; downloaded `plugin.json` and `SHA256SUMS` match verified local files byte-for-byte. All eight published asset digests and sizes match the publication files.
