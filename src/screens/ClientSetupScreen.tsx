@@ -403,9 +403,6 @@ export function ClientSetupScreen({
   const imageEndpoint = poolImageModels.length
     ? imageGenerationEndpoint(routeProxyQuery.data?.base_url ?? "", DEFAULT_AGENT_PLATFORM)
     : "";
-  const restartClients = clients.filter(
-    (client) => client.restart_required && selected.includes(client.client_key),
-  );
   const directSelectedClients = clients.filter(
     (client) => selected.includes(client.client_key) && directClientKeys.includes(client.client_key),
   );
@@ -635,126 +632,112 @@ export function ClientSetupScreen({
       (client.client_key === CLAUDE_CODE_CLIENT_KEY || client.client_key === "claude");
     return (
       <li
-        className={`rounded-xl border bg-white p-3 ${
-          checked ? "border-stone-300 shadow-sm" : "border-stone-200"
+        className={`flex items-center gap-3 px-3.5 py-2.5 motion-control ${
+          checked ? "bg-stone-50" : "bg-white hover:bg-stone-50/60"
         }`}
         data-testid={`client-card-${client.client_key}`}
         key={client.client_key}
       >
-        <div className="flex items-start gap-3">
-          <input
-            aria-label={`写入 ${client.display_name}`}
-            checked={checked}
-            className="mt-1.5 h-4 w-4 shrink-0 accent-stone-900"
-            disabled={Boolean(capabilityDisabledReason) || writing}
-            onChange={() => toggle(client.client_key)}
-            type="checkbox"
-          />
-          <ClientIcon className="h-9 w-9 shrink-0" clientKey={client.client_key} />
-          <div className="grid min-w-0 flex-1 gap-1">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="flex items-center gap-1.5 text-[13px] font-semibold text-stone-950">
-                {client.display_name}
-                {client.client_key === "codex" ? (
-                  <span
-                    aria-label="Codex CLI、ChatGPT 桌面版、VS Code 扩展、Codeg 等都会读取这个官方路径的配置，通常只需配置这一个。"
-                    className="inline-flex"
-                    title="Codex CLI、ChatGPT 桌面版、VS Code 扩展、Codeg 等都会读取这个官方路径的配置，通常只需配置这一个。"
-                  >
-                    <HelpCircle aria-hidden="true" className="h-3.5 w-3.5 text-stone-400" />
-                  </span>
-                ) : null}
-              </span>
-              <span
-                aria-label={`接口格式 ${interfaceFormatLabels[client.interface_format]}`}
-                className="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-800"
-                title={interfaceFormatHints[client.interface_format]}
-              >
-                {interfaceFormatLabels[client.interface_format]}
-              </span>
-              <span
-                className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
-                  fileStatusTones[client.file_status] ?? "bg-stone-100 text-stone-600"
-                }`}
-              >
-                {fileStatusLabels[client.file_status] ?? client.file_status}
-              </span>
-              {client.native ? (
-                <span className="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-800">
-                  内置
-                </span>
-              ) : null}
-              {client.restart_required ? (
-                <span className="rounded-full bg-orange-50 px-2 py-0.5 text-[11px] font-semibold text-orange-800">
-                  需重启
-                </span>
-              ) : null}
-              {direct ? (
-                <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[11px] font-semibold text-violet-800">
-                  直连中
-                </span>
-              ) : null}
-            </div>
-            {client.config_path ? (
-              <span
-                className="truncate font-mono text-[11px] text-stone-500"
-                title={client.config_path}
-              >
-                {client.config_path}
-              </span>
-            ) : null}
-            <span className="text-[10px] leading-4 text-stone-400">
-              {interfaceFormatHints[client.interface_format]}
-            </span>
-            {client.client_key === "codex" ? (
-              <>
-                <label
-                  className="flex max-w-md cursor-pointer items-start gap-2 rounded-lg border border-stone-200 bg-stone-50/70 px-2.5 py-2 text-[11px] font-semibold text-stone-700"
-                  title="写入配置时让 Codex 继续使用自己的 ChatGPT 登录，保留联网搜索等仅登录可用的功能；需要 Codex 已登录。"
+        <input
+          aria-label={`写入 ${client.display_name}`}
+          checked={checked}
+          className="h-4 w-4 shrink-0 accent-stone-900"
+          disabled={Boolean(capabilityDisabledReason) || writing}
+          onChange={() => toggle(client.client_key)}
+          type="checkbox"
+        />
+        <ClientIcon className="h-8 w-8 shrink-0" clientKey={client.client_key} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="flex items-center gap-1 text-[13px] font-semibold text-stone-950">
+              {client.display_name}
+              {client.client_key === "codex" ? (
+                <span
+                  aria-label="Codex CLI、ChatGPT 桌面版、VS Code 扩展、Codeg 等都会读取这个官方路径的配置，通常只需配置这一个。"
+                  className="inline-flex"
+                  title="Codex CLI、ChatGPT 桌面版、VS Code 扩展、Codeg 等都会读取这个官方路径的配置，通常只需配置这一个。"
                 >
-                  <input
-                    aria-label="保持 Codex 登录态"
-                    checked={codexKeepLoginState}
-                    className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-stone-900"
-                    disabled={!settingsQuery.data || writing || saveCodexLoginMutation.isPending}
-                    onChange={(event) => saveCodexLoginMutation.mutate(event.target.checked)}
-                    type="checkbox"
-                  />
-                  <span>
-                    保持 Codex 登录态
-                    <span className="mt-0.5 block font-normal leading-4 text-stone-500">
-                      保留 ChatGPT 登录以使用联网搜索等登录功能，默认关闭；下次写入配置时生效
-                    </span>
-                  </span>
-                </label>
-                {codexLoginWarning ? (
-                  <p
-                    className="max-w-md rounded-lg border border-amber-200 bg-amber-50/70 px-2.5 py-2 text-[11px] leading-4 text-amber-900"
-                    role="status"
-                  >
-                    {codexLoginWarning}
-                  </p>
-                ) : null}
-              </>
+                  <HelpCircle aria-hidden="true" className="h-3.5 w-3.5 text-stone-400" />
+                </span>
+              ) : null}
+            </span>
+            <span
+              aria-label={`接口格式 ${interfaceFormatLabels[client.interface_format]}`}
+              className="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-800"
+              title={interfaceFormatHints[client.interface_format]}
+            >
+              {interfaceFormatLabels[client.interface_format]}
+            </span>
+            <span
+              className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                fileStatusTones[client.file_status] ?? "bg-stone-100 text-stone-600"
+              }`}
+            >
+              {fileStatusLabels[client.file_status] ?? client.file_status}
+            </span>
+            {client.native ? (
+              <span className="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-800">
+                内置
+              </span>
             ) : null}
-            {client.error_code ? (
-              <span className="font-mono text-[11px] text-red-700">{client.error_code}</span>
+            {direct ? (
+              <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[11px] font-semibold text-violet-800">
+                直连中
+              </span>
             ) : null}
           </div>
-          {isClaudeCode ? (
-            <button
-              aria-label="设置 Claude Code 槽位映射"
-              className="shrink-0 rounded-md border border-stone-200 bg-white px-2.5 py-1.5 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-              onClick={() => {
-                setSlotSettingsError(null);
-                setSlotDialogOpen(true);
-              }}
-              type="button"
+          {client.config_path ? (
+            <div
+              className="mt-0.5 truncate font-mono text-[11px] text-stone-400"
+              title={client.config_path}
             >
-              设置
-            </button>
+              {client.config_path}
+            </div>
+          ) : null}
+          {client.client_key === "codex" ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <label
+                className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] font-semibold text-stone-700"
+                title="写入配置时让 Codex 继续使用自己的 ChatGPT 登录，保留联网搜索等仅登录可用的功能；需要 Codex 已登录。"
+              >
+                <input
+                  aria-label="保持 Codex 登录态"
+                  checked={codexKeepLoginState}
+                  className="h-3.5 w-3.5 shrink-0 accent-stone-900"
+                  disabled={!settingsQuery.data || writing || saveCodexLoginMutation.isPending}
+                  onChange={(event) => saveCodexLoginMutation.mutate(event.target.checked)}
+                  type="checkbox"
+                />
+                保持 Codex 登录态
+                <span className="font-normal text-stone-400">（保留联网搜索，默认关闭）</span>
+              </label>
+              {codexLoginWarning ? (
+                <p
+                  className="w-full rounded-lg border border-amber-200 bg-amber-50/70 px-2.5 py-1.5 text-[11px] leading-4 text-amber-900"
+                  role="status"
+                >
+                  {codexLoginWarning}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {client.error_code ? (
+            <div className="mt-0.5 font-mono text-[11px] text-red-700">{client.error_code}</div>
           ) : null}
         </div>
+        {isClaudeCode ? (
+          <button
+            aria-label="设置 Claude Code 槽位映射"
+            className="shrink-0 rounded-md border border-stone-200 bg-white px-2.5 py-1.5 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+            onClick={() => {
+              setSlotSettingsError(null);
+              setSlotDialogOpen(true);
+            }}
+            type="button"
+          >
+            设置
+          </button>
+        ) : null}
       </li>
     );
   };
@@ -773,7 +756,7 @@ export function ClientSetupScreen({
               </span>
               <div className="min-w-0">
                 <h1 className="text-lg font-semibold leading-tight tracking-tight text-stone-950">
-                  客户端接入
+                  智能体
                 </h1>
                 <p className="mt-1 text-[13px] leading-5 text-stone-600">
                   把同一个算力池接入常用 Agent：勾选要写入的客户端一键写入；其他工具手动复制端点参数。
@@ -850,22 +833,6 @@ export function ClientSetupScreen({
                     );
                   })}
                 </div>
-                {outcomes.some(
-                  (outcome) => clientByTargetKey.get(outcome.target_key)?.restart_required,
-                ) ? (
-                  <p className="text-[11px] text-stone-500">
-                    写入后需重启{" "}
-                    {Array.from(
-                      new Set(
-                        outcomes
-                          .map((outcome) => clientByTargetKey.get(outcome.target_key))
-                          .filter((client) => client?.restart_required)
-                          .map((client) => client?.display_name ?? ""),
-                      ),
-                    ).join("、")}{" "}
-                    才生效（它不监听配置文件变化）。
-                  </p>
-                ) : null}
               </div>
             ) : null}
 
@@ -917,7 +884,9 @@ export function ClientSetupScreen({
                   暂无可写入的客户端。
                 </p>
               ) : (
-                <ul className="grid list-none gap-2 sm:grid-cols-2">{clients.map(renderClientCard)}</ul>
+                <ul className="list-none divide-y divide-stone-100 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-sm">
+                  {clients.map(renderClientCard)}
+                </ul>
               )}
 
               {deepSeekHarnessSelected ? (
@@ -949,13 +918,7 @@ export function ClientSetupScreen({
                 >
                   本次写入成功后将结束{" "}
                   {directSelectedClients.map((client) => client.display_name).join("、")}
-                  {" "}的直连模式，切回算力池；请重启该客户端。未勾选的客户端配置与认证保持不变。
-                </p>
-              ) : null}
-              {restartClients.length > 0 ? (
-                <p className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-950">
-                  写入后需重启 {restartClients.map((client) => client.display_name).join("、")}{" "}
-                  才生效（它不监听配置文件变化）。
+                  {" "}的直连模式，切回算力池。未勾选的客户端配置与认证保持不变。
                 </p>
               ) : null}
 

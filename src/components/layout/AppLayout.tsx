@@ -2,30 +2,21 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import { motion } from "motion/react";
 import {
   BarChart3,
-  ChevronDown,
+  Bot,
   History,
   Info,
   Images,
   Menu,
   Network,
   PlugZap,
+  Server,
   Settings2,
   Sparkles,
   type LucideIcon,
 } from "lucide-react";
 import { AiSwitchLogo } from "../brand/AiSwitchLogo";
 import { AgentIcon, type AgentIconPlatform } from "../brand/AgentIcon";
-import {
-  accountModalities,
-  createDefaultModalityVisibility,
-  modalityForScreen,
-  modalityLabelKeys,
-  modalityScreenById,
-  readModalityVisibility,
-  writeModalityVisibility,
-  type AccountModality,
-  type ModalityVisibility,
-} from "../../lib/accountModalities";
+import { modalityForScreen } from "../../lib/accountModalities";
 import { useI18n } from "../../lib/i18n";
 import { useDragResize } from "../../lib/useDragResize";
 
@@ -67,16 +58,6 @@ type AppLayoutProps = {
   onNavigate: (screen: string) => void;
   onToggleSidebar: () => void;
   sidebarCollapsed: boolean;
-  modalityVisibility?: ModalityVisibility;
-  onModalityVisibilityChange?: (visibility: ModalityVisibility) => void;
-};
-
-const modalityIcons: Record<AccountModality, AgentIconPlatform> = {
-  general: "codex",
-  image: "image",
-  video: "video",
-  audio: "audio",
-  vector: "vector",
 };
 
 function isSettingsArea(screen: string) {
@@ -162,8 +143,6 @@ export function AppLayout({
   onNavigate,
   onToggleSidebar,
   sidebarCollapsed,
-  modalityVisibility,
-  onModalityVisibilityChange,
 }: AppLayoutProps) {
   const { t } = useI18n();
   const appShellRef = useRef<HTMLDivElement | null>(null);
@@ -172,12 +151,8 @@ export function AppLayout({
     () => typeof window !== "undefined" && window.innerWidth < SIDEBAR_DRAWER_BREAKPOINT,
   );
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
-  const [localModalityVisibility, setLocalModalityVisibility] = useState(readModalityVisibility);
-  const [modalityVisibilityOpen, setModalityVisibilityOpen] = useState(false);
   const settingsActive = isSettingsArea(activeScreen);
-  const accountWorkspaceActive = modalityForScreen(activeScreen) !== undefined;
-  const effectiveModalityVisibility = modalityVisibility ?? localModalityVisibility;
-  const visibleModalities = accountModalities.filter((modality) => effectiveModalityVisibility[modality]);
+  const accountWorkspaceActive = activeScreen === "Suppliers" || modalityForScreen(activeScreen) !== undefined;
   const sidebarDrawerVisible = narrowLayout && sidebarDrawerOpen;
   const sidebarContentCollapsed = narrowLayout ? !sidebarDrawerOpen : sidebarCollapsed;
   const desktopGridClass = sidebarCollapsed
@@ -241,29 +216,6 @@ export function AppLayout({
     setSidebarDrawerOpen(false);
     onNavigate(nextScreen);
   };
-
-  const handleModalityVisibilityChange = (modality: AccountModality, visible: boolean) => {
-    const nextVisibility = { ...effectiveModalityVisibility, [modality]: visible };
-    if (onModalityVisibilityChange) {
-      onModalityVisibilityChange(nextVisibility);
-    } else {
-      setLocalModalityVisibility(nextVisibility);
-    }
-  };
-
-  const restoreModalityVisibility = () => {
-    const nextVisibility = createDefaultModalityVisibility();
-    if (onModalityVisibilityChange) {
-      onModalityVisibilityChange(nextVisibility);
-    } else {
-      setLocalModalityVisibility(nextVisibility);
-    }
-  };
-
-  useEffect(() => {
-    writeModalityVisibility(effectiveModalityVisibility);
-  }, [effectiveModalityVisibility]);
-
 
   return (
     <main className="box-border h-screen max-h-[100dvh] overflow-hidden text-stone-950">
@@ -339,129 +291,85 @@ export function AppLayout({
               </div>
             </div>
 
-            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-0.5">
-              <section>
-                <div className={`flex items-center justify-between px-2 pb-1 ${sidebarContentCollapsed ? "hidden" : ""}`}>
-                  <p className={`text-[11px] font-semibold uppercase tracking-wide text-stone-400 ${sidebarContentCollapsed ? "hidden" : ""}`}>
-                    {t("layout.modalities")}
-                  </p>
-                  <div className="relative">
-                    <button
-                      aria-expanded={modalityVisibilityOpen}
-                      aria-label={t("layout.modalityVisibility")}
-                      className="inline-flex items-center gap-0.5 rounded p-0.5 text-stone-400 hover:bg-white/70 hover:text-stone-700"
-                      onClick={() => setModalityVisibilityOpen((current) => !current)}
-                      title={t("layout.modalityVisibility")}
-                      type="button"
-                    >
-                      <Settings2 aria-hidden="true" className="h-3.5 w-3.5" />
-                      <ChevronDown aria-hidden="true" className={`h-3 w-3 motion-control ${modalityVisibilityOpen ? "rotate-180" : ""}`} />
-                    </button>
-                    {modalityVisibilityOpen ? (
-                      <div className="absolute right-0 top-full z-50 mt-1 w-48 rounded-lg border border-stone-200 bg-white p-2 shadow-lg">
-                        {accountModalities.map((modality) => (
-                          <label className="flex items-center gap-2 px-2 py-1.5 text-[12px] text-stone-700" key={modality}>
-                            <input
-                              aria-label={t("settings.modalityVisibility.show", { modality: t(modalityLabelKeys[modality]) })}
-                              checked={effectiveModalityVisibility[modality]}
-                              className="accent-blue-600"
-                              onChange={(event) => handleModalityVisibilityChange(modality, event.target.checked)}
-                              type="checkbox"
-                            />
-                            {t(modalityLabelKeys[modality])}
-                          </label>
-                        ))}
-                        <button
-                          className="mt-1 w-full border-t border-stone-100 px-2 pt-2 text-left text-[11px] font-semibold text-blue-700 hover:text-blue-900"
-                          onClick={restoreModalityVisibility}
-                          type="button"
-                        >
-                          {t("layout.restoreModalityVisibility")}
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-                <div className="space-y-1">
-                  {visibleModalities.map((modality) => (
-                    <NavButton
-                      active={activeScreen === modalityScreenById[modality]}
-                      collapsed={sidebarContentCollapsed}
-                      icon={modalityIcons[modality]}
-                      key={modality}
-                      label={t(modalityLabelKeys[modality])}
-                      onClick={() => handleNavigate(modalityScreenById[modality])}
-                      variant="primary"
-                    />
-                  ))}
-                </div>
-              </section>
-
-              <section>
-                <p
-                  className={`px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-stone-400 ${
-                    sidebarContentCollapsed ? "hidden" : ""
-                  }`}
-                >
-                  {t("layout.system")}
-                </p>
-                <NavButton
-                  active={activeScreen === "Sessions"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={History}
-                  label={t("nav.sessions")}
-                  onClick={() => handleNavigate("Sessions")}
-                />
-                <NavButton
-                  active={activeScreen === "Stats"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={BarChart3}
-                  label={t("nav.stats")}
-                  onClick={() => handleNavigate("Stats")}
-                />
-                  <NavButton
-                    active={activeScreen === "ImageGen"}
-                    collapsed={sidebarContentCollapsed}
-                    icon={Images}
-                    label={t("nav.imagegen")}
-                    onClick={() => handleNavigate("ImageGen")}
-                  />
-                <NavButton
-                  active={activeScreen === "Traffic"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={Network}
-                  label={t("nav.traffic")}
-                  onClick={() => handleNavigate("Traffic")}
-                />
-                <NavButton
-                  active={activeScreen === "MCP"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={PlugZap}
-                  label={t("nav.mcp")}
-                  onClick={() => handleNavigate("MCP")}
-                />
-                <NavButton
-                  active={activeScreen === "Skills"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={Sparkles}
-                  label={t("nav.skills")}
-                  onClick={() => handleNavigate("Skills")}
-                />
-                <NavButton
-                  active={settingsActive}
-                  collapsed={sidebarContentCollapsed}
-                  icon={Settings2}
-                  label={t("nav.settings")}
-                  onClick={() => handleNavigate("Settings")}
-                />
-                <NavButton
-                  active={activeScreen === "About"}
-                  collapsed={sidebarContentCollapsed}
-                  icon={Info}
-                  label={t("nav.about")}
-                  onClick={() => handleNavigate("About")}
-                />
-              </section>
+            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-0.5">
+              <NavButton
+                active={activeScreen === "Suppliers" || modalityForScreen(activeScreen) !== undefined}
+                collapsed={sidebarContentCollapsed}
+                icon="codex"
+                label={t("nav.suppliers")}
+                onClick={() => handleNavigate("Suppliers")}
+                variant="primary"
+              />
+              <NavButton
+                active={activeScreen === "ClientSetup"}
+                collapsed={sidebarContentCollapsed}
+                icon={Bot}
+                label={t("nav.agents")}
+                onClick={() => handleNavigate("ClientSetup")}
+              />
+              <NavButton
+                active={activeScreen === "Gateway"}
+                collapsed={sidebarContentCollapsed}
+                icon={Server}
+                label={t("nav.gateway")}
+                onClick={() => handleNavigate("Gateway")}
+              />
+              <NavButton
+                active={activeScreen === "Sessions"}
+                collapsed={sidebarContentCollapsed}
+                icon={History}
+                label={t("nav.sessions")}
+                onClick={() => handleNavigate("Sessions")}
+              />
+              <NavButton
+                active={activeScreen === "Traffic"}
+                collapsed={sidebarContentCollapsed}
+                icon={Network}
+                label={t("nav.traffic")}
+                onClick={() => handleNavigate("Traffic")}
+              />
+              <NavButton
+                active={activeScreen === "Stats"}
+                collapsed={sidebarContentCollapsed}
+                icon={BarChart3}
+                label={t("nav.stats")}
+                onClick={() => handleNavigate("Stats")}
+              />
+              <NavButton
+                active={activeScreen === "ImageGen"}
+                collapsed={sidebarContentCollapsed}
+                icon={Images}
+                label={t("nav.imagegen")}
+                onClick={() => handleNavigate("ImageGen")}
+              />
+              <NavButton
+                active={activeScreen === "MCP"}
+                collapsed={sidebarContentCollapsed}
+                icon={PlugZap}
+                label={t("nav.mcp")}
+                onClick={() => handleNavigate("MCP")}
+              />
+              <NavButton
+                active={activeScreen === "Skills"}
+                collapsed={sidebarContentCollapsed}
+                icon={Sparkles}
+                label={t("nav.skills")}
+                onClick={() => handleNavigate("Skills")}
+              />
+              <NavButton
+                active={settingsActive}
+                collapsed={sidebarContentCollapsed}
+                icon={Settings2}
+                label={t("nav.settings")}
+                onClick={() => handleNavigate("Settings")}
+              />
+              <NavButton
+                active={activeScreen === "About"}
+                collapsed={sidebarContentCollapsed}
+                icon={Info}
+                label={t("nav.about")}
+                onClick={() => handleNavigate("About")}
+              />
             </div>
           </div>
           {!narrowLayout && !sidebarCollapsed && (

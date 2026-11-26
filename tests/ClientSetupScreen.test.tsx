@@ -280,6 +280,21 @@ describe("ClientSetupScreen", () => {
     expect(screen.getByLabelText("接口格式 Messages")).toBeInTheDocument();
   });
 
+  it("renders the agent list as one row per client", async () => {
+    setup();
+
+    const codex = await screen.findByTestId("client-card-codex");
+    const zcode = screen.getByTestId("client-card-zcode");
+    const claude = screen.getByTestId("client-card-claude_code");
+    const list = codex.parentElement;
+    expect(list?.tagName).toBe("UL");
+    expect(list).not.toHaveClass("sm:grid-cols-2");
+    expect(list).toHaveClass("divide-y");
+    expect(codex).toHaveClass("flex", "items-center");
+    expect(codex.compareDocumentPosition(zcode) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(zcode.compareDocumentPosition(claude) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("checks only the primary CLI by default and leaves Claude Code opt-in", async () => {
     setup();
 
@@ -434,7 +449,7 @@ describe("ClientSetupScreen", () => {
     );
   });
 
-  it("shows the write outcome panel and repeats the restart requirement", async () => {
+  it("shows the write outcome panel with the client name and path", async () => {
     const user = userEvent.setup();
     vi.mocked(writeRouteProxyConfigs).mockResolvedValue(writeOutcomes);
     setup();
@@ -444,7 +459,6 @@ describe("ClientSetupScreen", () => {
 
     expect(await screen.findByText("配置写入结果")).toBeInTheDocument();
     expect(screen.getByText(/ZCode · codex/)).toBeInTheDocument();
-    expect(screen.getAllByText(/写入后需重启 ZCode/).length).toBeGreaterThan(0);
   });
 
   it("offers snapshot rollback and pristine restore in the client setup page", async () => {
@@ -485,16 +499,13 @@ describe("ClientSetupScreen", () => {
     expect(screen.queryByRole("note")).not.toBeInTheDocument();
   });
 
-  it("shows the restart notice only while a restart-required client is checked", async () => {
-    const user = userEvent.setup();
+  it("does not show restart labels for any client", async () => {
     setup();
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
-    expect(screen.queryByText(/写入后需重启 ZCode/)).not.toBeInTheDocument();
-    await user.click(screen.getByRole("checkbox", { name: "写入 ZCode" }));
-    expect(screen.getByText(/写入后需重启 ZCode/)).toBeInTheDocument();
-    await user.click(screen.getByRole("checkbox", { name: "写入 ZCode" }));
-    expect(screen.queryByText(/写入后需重启 ZCode/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/需重启/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: "写入 ZCode" }));
+    expect(screen.queryByText(/需重启/)).not.toBeInTheDocument();
   });
 
   it("saves a custom DeepSeek Harness config path before the write", async () => {
@@ -960,8 +971,6 @@ describe("ClientSetupScreen", () => {
     // `zcode_codex` is an internal key and means nothing to the user.
     expect(screen.queryByText(/zcode_codex/)).not.toBeInTheDocument();
     expect(screen.getByText(/ZCode · codex/)).toBeInTheDocument();
-    // The user may switch windows right after writing, so repeat the notice here.
-    expect(screen.getAllByText(/需重启 ZCode/).length).toBeGreaterThan(0);
     // Same guarantee the outcome panel always made: no credential in it.
     expect(screen.queryByText(/sk-ai-switch/)).not.toBeInTheDocument();
   });

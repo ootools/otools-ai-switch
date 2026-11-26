@@ -3,7 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AppLayout } from "../src/components/layout/AppLayout";
-import { createDefaultModalityVisibility } from "../src/lib/accountModalities";
 import { I18nProvider } from "../src/lib/i18n";
 
 function dispatchPointerEvent(
@@ -64,43 +63,37 @@ describe("AppLayout", () => {
     expect(screen.getByText("about content").parentElement).toHaveClass("overflow-y-auto", "p-2", "sm:p-3");
   });
 
-  it("shows five independent account modalities instead of agent platforms", () => {
-    window.localStorage.setItem("ai-switch.agent-visibility", JSON.stringify({ codex: false, claude: false }));
+  it("shows one unified suppliers entry instead of per-modality routes", () => {
     render(
       <I18nProvider initialLanguage="zh-CN">
-        <AppLayout activeScreen="PoolVideo" onNavigate={vi.fn()} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+        <AppLayout activeScreen="Suppliers" onNavigate={vi.fn()} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
           <div>content</div>
         </AppLayout>
       </I18nProvider>,
     );
-    const modalities = ["通用", "图片", "视频", "音频", "向量"];
-    const buttons = modalities.map((name) => screen.getByRole("button", { name }));
-    for (let index = 1; index < buttons.length; index += 1) {
-      expect(buttons[index - 1].compareDocumentPosition(buttons[index]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    }
-    expect(screen.getByRole("button", { name: "视频" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getAllByRole("button").filter((button) => button.getAttribute("aria-current") === "page")).toHaveLength(1);
-    for (const name of ["Codex", "Claude", "Grok", "Gemini", "OpenCode", "OpenClaw", "Hermes"]) {
+    const suppliers = screen.getByRole("button", { name: "供应商" });
+    expect(suppliers).toHaveAttribute("aria-current", "page");
+    for (const name of ["通用", "图片", "视频", "音频", "向量"]) {
       expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
     }
+    expect(screen.getByRole("button", { name: "智能体" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "网关" })).toBeInTheDocument();
   });
 
-  it("navigates each modality to its own route and closes the narrow drawer", async () => {
+  it("navigates to the unified suppliers route and closes the narrow drawer", async () => {
     setViewportWidth(500);
     const onNavigate = vi.fn();
     render(
       <I18nProvider initialLanguage="zh-CN">
-        <AppLayout activeScreen="PoolGeneral" onNavigate={onNavigate} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+        <AppLayout activeScreen="About" onNavigate={onNavigate} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
           <div>content</div>
         </AppLayout>
       </I18nProvider>,
     );
-    for (const [label, route] of [["通用", "PoolGeneral"], ["图片", "PoolImage"], ["视频", "PoolVideo"], ["音频", "PoolAudio"], ["向量", "PoolVector"]]) {
-      await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
-      await userEvent.click(screen.getByRole("button", { name: label }));
-      expect(onNavigate).toHaveBeenLastCalledWith(route);
-      expect(screen.getByTestId("app-sidebar")).not.toHaveClass("app-sidebar-drawer");
-    }
+    await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    await userEvent.click(screen.getByRole("button", { name: "供应商" }));
+    expect(onNavigate).toHaveBeenLastCalledWith("Suppliers");
+    expect(screen.getByTestId("app-sidebar")).not.toHaveClass("app-sidebar-drawer");
   });
 
 
@@ -120,7 +113,7 @@ describe("AppLayout", () => {
       onNavigate={navigate} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
       <div>traffic view</div>
     </AppLayout></I18nProvider>);
-    const button = screen.getByRole("button", { name: "Live routing" });
+    const button = screen.getByRole("button", { name: "Visualization" });
     expect(button).toHaveAttribute("aria-current", "page");
     await userEvent.click(button);
     expect(navigate).toHaveBeenCalledWith("Traffic");
@@ -142,19 +135,25 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
+    await userEvent.click(screen.getByRole("button", { name: "供应商" }));
+    await userEvent.click(screen.getByRole("button", { name: /智能体/ }));
+    await userEvent.click(screen.getByRole("button", { name: /网关/ }));
     await userEvent.click(screen.getByRole("button", { name: "统计" }));
     await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
     await userEvent.click(screen.getByRole("button", { name: /技能/ }));
     expect(screen.queryByRole("button", { name: /客户端接入/ })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /关于/ }));
 
+    expect(onNavigate).toHaveBeenCalledWith("Suppliers");
+    expect(onNavigate).toHaveBeenCalledWith("ClientSetup");
+    expect(onNavigate).toHaveBeenCalledWith("Gateway");
     expect(onNavigate).toHaveBeenCalledWith("Stats");
     expect(onNavigate).toHaveBeenCalledWith("MCP");
     expect(onNavigate).toHaveBeenCalledWith("Skills");
     expect(onNavigate).toHaveBeenCalledWith("About");
   });
 
-  it("lists usage first in the system group and highlights it on its own", () => {
+  it("places visualization directly above usage and highlights usage on its own", () => {
     const onNavigate = vi.fn();
 
     render(
@@ -166,20 +165,20 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
+    const visualization = screen.getByRole("button", { name: "可视化" });
     const stats = screen.getByRole("button", { name: "统计" });
     const mcp = screen.getByRole("button", { name: /MCP/ });
-    // 统计 moved out of the pool status bar, so it leads the system group.
+    expect(visualization.compareDocumentPosition(stats) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(stats.compareDocumentPosition(mcp) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(stats).toHaveAttribute("aria-current", "page");
     expect(mcp).not.toHaveAttribute("aria-current");
   });
 
-  it("hides only the disabled modality from the sidebar", () => {
+  it("does not expose per-modality sidebar buttons regardless of visibility", () => {
     render(
       <I18nProvider initialLanguage="zh-CN">
         <AppLayout
-          activeScreen="PoolGeneral"
-          modalityVisibility={{ ...createDefaultModalityVisibility(), video: false }}
+          activeScreen="Suppliers"
           onNavigate={vi.fn()}
           onToggleSidebar={vi.fn()}
           sidebarCollapsed={false}
@@ -189,16 +188,15 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
-    expect(screen.getByRole("button", { name: "通用" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "音频" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "供应商" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "视频" })).not.toBeInTheDocument();
   });
 
-  it("toggles and persists modality visibility from the sidebar menu", async () => {
+  it("keeps modality visibility out of the merged sidebar", () => {
     render(
       <I18nProvider initialLanguage="zh-CN">
         <AppLayout
-          activeScreen="PoolGeneral"
+          activeScreen="Suppliers"
           onNavigate={vi.fn()}
           onToggleSidebar={vi.fn()}
           sidebarCollapsed={false}
@@ -208,14 +206,7 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "模态显示选项" }));
-    await userEvent.click(screen.getByRole("checkbox", { name: "显示 视频" }));
-
-    expect(screen.queryByRole("button", { name: "视频" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "音频" })).toBeInTheDocument();
-    expect(JSON.parse(window.localStorage.getItem("ai-switch.modality-visibility") ?? "{}").video).toBe(false);
-    await userEvent.click(screen.getByRole("button", { name: "显示全部模态" }));
-    expect(screen.getByRole("button", { name: "视频" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "模态显示选项" })).not.toBeInTheDocument();
   });
 
   it("highlights About on its own instead of the Settings area", () => {
@@ -290,11 +281,11 @@ describe("AppLayout", () => {
 
     expect(screen.getByRole("button", { name: "展开侧栏" })).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByTestId("app-shell")).toHaveClass("min-[600px]:grid-cols-[56px_minmax(0,1fr)]");
-    expect(screen.getByRole("button", { name: "通用" })).toHaveAttribute("title", "通用");
-    expect(screen.getByRole("button", { name: "通用" }).querySelector("svg")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "通用" }).querySelector("span.font-medium")).toHaveClass("sr-only");
+    expect(screen.getByRole("button", { name: "供应商" })).toHaveAttribute("title", "供应商");
+    expect(screen.getByRole("button", { name: "供应商" }).querySelector("svg")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "供应商" }).querySelector("span.font-medium")).toHaveClass("sr-only");
     expect(screen.queryByRole("combobox", { name: "语言" })).not.toBeInTheDocument();
-    expect(screen.getByText("账号池")).toHaveClass("hidden");
+    expect(screen.queryByRole("button", { name: "模态显示选项" })).not.toBeInTheDocument();
   });
 
   it("opens the full sidebar as a fixed drawer on narrow windows", async () => {
@@ -330,7 +321,7 @@ describe("AppLayout", () => {
       "aria-expanded",
       "true",
     );
-    expect(screen.getByText("账号池")).not.toHaveClass("hidden");
+    expect(screen.getByRole("button", { name: "供应商" })).toBeInTheDocument();
     expect(screen.getByText("content").parentElement).toHaveClass("col-start-2");
 
     await userEvent.click(screen.getByTestId("app-sidebar-drawer-backdrop"));

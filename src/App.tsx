@@ -34,6 +34,7 @@ import { MotionPage, MotionProvider, type MotionDirection } from "./components/m
 import { ImageGenerationScreen } from "./imagegen/ImageGenerationScreen";
 import { ClientSetupScreen, type ClientSetupFocus } from "./screens/ClientSetupScreen";
 import { CodexChannelsScreen } from "./screens/CodexChannelsScreen";
+import { GatewayScreen } from "./screens/GatewayScreen";
 import { TrafficScreen } from "./screens/TrafficScreen";
 
 const queryClient = createQueryClient();
@@ -57,6 +58,8 @@ const implementedScreens = new Set([
   "Skills",
   "Stats",
   "Traffic",
+  "Suppliers",
+  "Gateway",
   "About",
 ]);
 
@@ -67,8 +70,8 @@ export type PoolScopeFocus = {
 };
 
 export function App() {
-  const [screen, setScreen] = useState(modalityScreenById.general);
-  const screenRef = useRef(modalityScreenById.general);
+  const [screen, setScreen] = useState("Suppliers");
+  const screenRef = useRef("Suppliers");
   const [navigationDirection, setNavigationDirection] = useState<MotionDirection>("neutral");
   const [sessionPlatform, setSessionPlatform] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -128,9 +131,9 @@ export function App() {
   }, []);
   const openAccountsWithProvider = useCallback((provider: string) => {
     setNavigationDirection("forward");
-    screenRef.current = modalityScreenById.general;
+    screenRef.current = "Suppliers";
     setAccountProviderFocus({ provider, nonce: Date.now() });
-    setScreen(modalityScreenById.general);
+    setScreen("Suppliers");
   }, []);
   const handleProviderFilterFocusConsumed = useCallback((nonce: number) => {
     setAccountProviderFocus((current) => (current?.nonce === nonce ? null : current));
@@ -139,8 +142,8 @@ export function App() {
   const handleDeepLinkImported = useCallback(
     (_platform: string, options?: { joinedPool?: boolean }) => {
       setNavigationDirection("forward");
-      screenRef.current = modalityScreenById.general;
-      setScreen(modalityScreenById.general);
+      screenRef.current = "Suppliers";
+      setScreen("Suppliers");
       // 所有导入账号都属于统一池；导入厂商不再决定导航入口。
       setPoolScopeFocus({
         platform: "codex",
@@ -163,14 +166,26 @@ export function App() {
           <LowDiskSpaceBanner />
           <AppLayout
             activeScreen={screen}
-            modalityVisibility={modalityVisibility}
-            onModalityVisibilityChange={setModalityVisibility}
             onNavigate={navigate}
             onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
             sidebarCollapsed={sidebarCollapsed}
           >
             <AnimatePresence initial={false} mode="wait">
               <MotionPage direction={navigationDirection} key={screen}>
+                {screen === "Suppliers" && (
+                  <CodexChannelsScreen
+                    imageGenerationEnabled
+                    onOpenImageStudio={() => navigate("ImageGen")}
+                    onOpenSessions={openSessions}
+                    onOpenClientSetup={(platform, clientKey) => openClientSetup({ platform, clientKey })}
+                    onPoolScopeFocusConsumed={handlePoolScopeFocusConsumed}
+                    onProviderFilterFocusConsumed={handleProviderFilterFocusConsumed}
+                    poolScopeFocus={poolScopeFocus}
+                    providerFilterFocus={accountProviderFocus}
+                    sidebarCollapsed={sidebarCollapsed}
+                  />
+                )}
+                {screen === "Gateway" && <GatewayScreen />}
                 {accountModality && (
                   <CodexChannelsScreen
                     imageGenerationEnabled
