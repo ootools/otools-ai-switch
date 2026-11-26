@@ -179,7 +179,6 @@ export function App() {
                     onOpenImageStudio={() => navigate("ImageGen")}
                     onOpenSessions={openSessions}
                     onOpenClientSetup={(platform, clientKey) => openClientSetup({ platform, clientKey })}
-                    onOpenTraffic={() => navigate("Traffic")}
                     onPoolScopeFocusConsumed={handlePoolScopeFocusConsumed}
                     onProviderFilterFocusConsumed={handleProviderFilterFocusConsumed}
                     poolScopeFocus={poolScopeFocus}

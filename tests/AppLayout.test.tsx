@@ -293,7 +293,7 @@ describe("AppLayout", () => {
     expect(screen.getByRole("button", { name: "通用" })).toHaveAttribute("title", "通用");
     expect(screen.getByRole("button", { name: "通用" }).querySelector("svg")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "通用" }).querySelector("span.font-medium")).toHaveClass("sr-only");
-    expect(screen.getByRole("combobox", { name: "语言" }).parentElement).toHaveClass("hidden");
+    expect(screen.queryByRole("combobox", { name: "语言" })).not.toBeInTheDocument();
     expect(screen.getByText("账号池")).toHaveClass("hidden");
   });
 

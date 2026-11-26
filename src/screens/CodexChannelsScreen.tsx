@@ -74,7 +74,6 @@ function storeSegment(segment: CodexSegment) {
 export function CodexChannelsScreen({
   onOpenSessions,
   onOpenClientSetup,
-  onOpenTraffic,
   sidebarCollapsed,
   onPoolScopeFocusConsumed,
   onProviderFilterFocusConsumed,
@@ -86,7 +85,6 @@ export function CodexChannelsScreen({
 }: {
   onOpenSessions?: (platform: PlatformId) => void;
   onOpenClientSetup?: (platform: string, clientKey?: string) => void;
-  onOpenTraffic?: () => void;
   sidebarCollapsed?: boolean;
   onPoolScopeFocusConsumed?: (nonce: number) => void;
   onProviderFilterFocusConsumed?: (nonce: number) => void;
@@ -147,7 +145,6 @@ export function CodexChannelsScreen({
         capabilityFilter={SEGMENT_CAPABILITIES[segment]}
         onOpenSessions={onOpenSessions}
         onOpenClientSetup={onOpenClientSetup}
-        onOpenTraffic={onOpenTraffic}
         onPoolScopeFocusConsumed={segment === "general" ? onPoolScopeFocusConsumed : undefined}
         onProviderFilterFocusConsumed={segment === "general" ? onProviderFilterFocusConsumed : undefined}
         platform="codex"

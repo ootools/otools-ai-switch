@@ -36,7 +36,6 @@ import {
   ScanText,
   ScrollText,
   Send,
-  Settings2,
   SlidersHorizontal,
   Square,
   Trash2,
@@ -66,7 +65,6 @@ import {
 } from "../components/accounts/ExternalClientImportPanel";
 import { CodexOAuthDialog } from "../components/accounts/CodexOAuthDialog";
 import { SubscriptionLoginDialog } from "../components/accounts/SubscriptionLoginDialog";
-import { CodexBaselineModelsDialog } from "../components/accounts/CodexBaselineModelsDialog";
 import { DirectModeDialog, hasAcceptedDirectModeNotice, rememberDirectModeNotice } from "../components/accounts/DirectModeDialog";
 import { AgentIcon } from "../components/brand/AgentIcon";
 import type { DirectModeStatus } from "../lib/api/types";
@@ -149,7 +147,6 @@ import {
   saveSettings,
   setRouteCredentialStatuses,
   moveRoutePoolGroupMembers,
-  setRoutePoolBaselineModels,
   setRoutePoolModelMode,
   startRouteProxy,
   stopRouteProxy,
@@ -243,7 +240,6 @@ import {
 } from "../lib/accountProviders";
 import { VIDEO_CAPABILITY, VIDEO_DIALECTS } from "../lib/videoPlatforms";
 import { openExternal } from "../lib/openExternal";
-import { copySensitiveText } from "../lib/routeCredentialTransfer";
 import {
   adjustCodexBaseUrlForInterfaceFormat,
   type CodexBaseUrlAdjustment,
@@ -703,7 +699,6 @@ type AccountsScreenProps = {
   onPoolScopeFocusConsumed?: (nonce: number) => void;
   /** 工具栏「写入配置」：跳到客户端接入页（可带直连恢复预选的客户端）。 */
   onOpenClientSetup?: (platform: string, clientKey?: string) => void;
-  onOpenTraffic?: () => void;
   onProviderFilterFocusConsumed?: (nonce: number) => void;
   providerFilterFocus?: { provider: string; nonce: number } | null;
   poolScopeFocus?: {
@@ -2905,108 +2900,6 @@ function modelTestRequestBody(interfaceFormat: string, model: string) {
   };
 }
 
-function windowsDoubleQuote(value: string) {
-  return '"' + value.replace(/"/g, '""') + '"';
-}
-
-function shellSingleQuote(value: string) {
-  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
-}
-
-/// PowerShell's own single-quoted string: `''` is the literal escape, and the
-/// content is never subject to the native-argument mangling below.
-function powerShellSingleQuote(value: string) {
-  return "'" + value.replace(/'/g, "''") + "'";
-}
-
-function compactJsonForCurl(value: string) {
-  try {
-    const compact = JSON.stringify(JSON.parse(value));
-    return typeof compact === "string" ? compact : value;
-  } catch {
-    return value.replace(/\r?\n/g, " ").trim();
-  }
-}
-
-function joinUrl(baseUrl: string, path: string) {
-  return baseUrl.replace(/\/+$/, "") + "/" + path.replace(/^\/+/, "");
-}
-
-type ModelTestCurlShell = "posix" | "powershell" | "cmd";
-
-/// Builds the copy-paste connectivity probe for one shell.
-///
-/// The three forms are genuinely different, not cosmetic variants. Windows
-/// PowerShell 5.1 — still what Win+X and the Start menu open on Windows 11 —
-/// strips quotes out of arguments it hands to a native `.exe`, so BOTH the POSIX
-/// form (`'{"a":1}'`) and the CMD form (`"{""a"":1}"`) arrive as `{a:1}` and the
-/// gateway answers `invalid character 'a' looking for beginning of object key
-/// string`. `--%` and backslash-escaping each fix 5.1 while breaking 7, so
-/// neither is usable. Assigning the body to a PowerShell single-quoted variable
-/// and piping it to `--data-binary '@-'` is the one shape verified to work on
-/// both 5.1 and 7: stdin never passes through argument parsing at all.
-function modelTestCurlCommand({
-  activePlatform,
-  codexEndpoint,
-  outcome,
-  proxyKey,
-  proxyBaseUrl,
-  requestedModel,
-  shell = "posix",
-}: {
-  activePlatform: PlatformKey;
-  codexEndpoint: CodexModelTestEndpoint;
-  outcome: RoutePoolModelTestOutcome | null;
-  proxyBaseUrl: string;
-  proxyKey: string;
-  requestedModel: string;
-  shell?: ModelTestCurlShell;
-}) {
-  const interfaceFormat =
-    outcome?.interface_format ||
-    (activePlatform === "codex" ? codexModelTestInterfaceFormat(codexEndpoint) : defaultInterfaceFormat(activePlatform));
-  const model = requestedModel.trim() || defaultRequestedModel(activePlatform, interfaceFormat);
-  const requestPath =
-    outcome?.route_proxy_entry_path || modelTestProxyPath(activePlatform, interfaceFormat, model);
-  const requestBody =
-    outcome?.request_body_json?.trim() || JSON.stringify(modelTestRequestBody(interfaceFormat, model), null, 2);
-  const url = joinUrl(proxyBaseUrl.trim(), requestPath);
-  const tlsOptions = url.toLowerCase().startsWith("https://") ? ["--ssl-no-revoke"] : [];
-  const body = compactJsonForCurl(requestBody);
-  const quote =
-    shell === "cmd"
-      ? windowsDoubleQuote
-      : shell === "powershell"
-        ? powerShellSingleQuote
-        : shellSingleQuote;
-  // Git Bash resolves plain `curl`; on Windows shells `curl` is a PowerShell
-  // alias for Invoke-WebRequest, so the `.exe` suffix is required there.
-  const program = shell === "posix" ? "curl" : "curl.exe";
-
-  const request = [
-    program + " " + quote(url),
-    ...tlsOptions,
-    "-X POST",
-    "-H " + quote("Content-Type: application/json"),
-    "-H " + quote("Authorization: Bearer " + proxyKey),
-    "-H " + quote("x-ai-switch-platform: " + activePlatform),
-  ];
-
-  if (shell === "powershell") {
-    // $OutputEncoding governs how the pipe encodes text for the native command;
-    // its default in 5.1 mangles non-ASCII bodies into `?`.
-    return [
-      "$OutputEncoding = [System.Text.UTF8Encoding]::new($false);",
-      "$body = " + quote(body) + ";",
-      "$body |",
-      ...request,
-      "--data-binary " + quote("@-"),
-    ].join(" ");
-  }
-
-  return [...request, "--data-raw " + quote(body)].join(" ");
-}
-
 function modelTestRouteChainItems(outcome: RoutePoolModelTestOutcome) {
   const entry =
     outcome.route_proxy_entry_url ?? outcome.route_proxy_entry_path ?? outcome.request_path;
@@ -3549,7 +3442,6 @@ export function AccountsScreen({
   sidebarCollapsed = false,
   onPoolScopeFocusConsumed,
   onOpenClientSetup,
-  onOpenTraffic,
   onProviderFilterFocusConsumed,
   providerFilterFocus = null,
   poolScopeFocus = null,
@@ -3652,9 +3544,6 @@ export function AccountsScreen({
   const [accountFilterMenuOpen, setAccountFilterMenuOpen] = useState(false);
   const [refreshMenuOpen, setRefreshMenuOpen] = useState(false);
   const [modelTestMenuOpen, setModelTestMenuOpen] = useState(false);
-  const [modelTestMenuCopied, setModelTestMenuCopied] = useState<
-    "curl" | "curl-powershell" | "curl-cmd" | null
-  >(null);
   const [copiedCredentialId, setCopiedCredentialId] = useState<string | null>(null);
   const [copyingCredential, setCopyingCredential] = useState<RouteCredential | null>(null);
   const [openActionMenuId, setOpenActionMenuId] = useState<string | null>(null);
@@ -3854,7 +3743,6 @@ export function AccountsScreen({
   const [modelTestDialogOpen, setModelTestDialogOpen] = useState(false);
   const [modelTestToolCall, setModelTestToolCall] = useState(false);
   const [routePoolModelsDialogOpen, setRoutePoolModelsDialogOpen] = useState(false);
-  const [baselineModelsDialogOpen, setBaselineModelsDialogOpen] = useState(false);
   const [proxyOperationError, setProxyOperationError] = useState<{ operation: "start" | "stop"; error: unknown } | null>(null);
   const [liveLogOpen, setLiveLogOpen] = useState(false);
   const [liveLogEntries, setLiveLogEntries] = useState<RouteProxyLiveLogEntry[]>([]);
@@ -3945,7 +3833,6 @@ export function AccountsScreen({
     setAccountFilterMenuOpen(false);
     setRefreshMenuOpen(false);
     setModelTestMenuOpen(false);
-    setModelTestMenuCopied(null);
     setCopiedCredentialId(null);
     setBatchStatus("");
     // Source ids are platform-scoped in the preview, so a leftover selection
@@ -4069,7 +3956,6 @@ export function AccountsScreen({
     setAccountFilterMenuOpen(false);
     setRefreshMenuOpen(false);
     setModelTestMenuOpen(false);
-    setModelTestMenuCopied(null);
     setBatchStatus("");
   }, [accountView, selectedGroupId]);
 
@@ -5457,18 +5343,6 @@ export function AccountsScreen({
   // Pool-wide client behavior switches. Claude Code reads these from its own
   // settings file, which the whole pool shares, so they cannot be per-account.
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
-  /** `null` until the user picks, so the dialog defaults to the native client. */
-  const saveBaselineModelsMutation = useMutation({
-    mutationFn: (models: string[]) =>
-      setRoutePoolBaselineModels({ platform: "codex", models }),
-    onSuccess: (state) => {
-      queryClient.setQueryData(["route-pool", "codex", "active"], state);
-      void queryClient.invalidateQueries({ queryKey: ["route-pool", "codex"] });
-      void queryClient.invalidateQueries({ queryKey: ["route-credential-page", "codex"] });
-      void queryClient.invalidateQueries({ queryKey: ["route-config-stale"] });
-      setBaselineModelsDialogOpen(false);
-    },
-  });
   // Config is written on demand, so mapping and client-config edits sit unapplied
   // until the user asks for a write. The backend answers this by rendering through
   // the real adapter and diffing against disk, so the hint cannot drift from what
@@ -6282,38 +6156,6 @@ export function AccountsScreen({
     setModelTestDialogOpen(true);
   };
 
-  const copyModelTestCurl = async (shell: ModelTestCurlShell = "posix") => {
-    const proxyBaseUrl = routeProxyQuery.data?.base_url?.trim();
-    if (!routeServiceReady || !proxyBaseUrl) {
-      setRoutePoolFeedback({
-        type: "error",
-        message: "复制 curl 失败：算力池路由尚未启用。",
-      });
-      return;
-    }
-    try {
-      const proxyKey = await getRouteProxyKey(activePlatform);
-      const command = modelTestCurlCommand({
-        activePlatform,
-        codexEndpoint: codexModelTestEndpoint,
-        outcome: modelTestOutcome,
-        proxyBaseUrl,
-        proxyKey,
-        requestedModel: routeTestModel,
-        shell,
-      });
-      await copySensitiveText(command);
-      setModelTestMenuCopied(shell === "posix" ? "curl" : `curl-${shell}`);
-      setModelTestMenuOpen(false);
-      window.setTimeout(() => setModelTestMenuCopied(null), 1400);
-    } catch (error) {
-      setRoutePoolFeedback({
-        type: "error",
-        message: "复制 curl 失败：" + formatApiError(error, "剪贴板不可用。"),
-      });
-    }
-  };
-
   const openRoutePoolModelsDialog = () => {
     setModelTestMenuOpen(false);
     routePoolModelsMutation.reset();
@@ -6782,31 +6624,7 @@ export function AccountsScreen({
             </div>
 
             <div aria-label="算力池操作" role="group" className="flex shrink-0 items-center gap-1 sm:gap-2">
-              {!mediaView && onOpenTraffic ? (
-                <button
-                  aria-label="实时路由"
-                  className="grid h-6 w-6 shrink-0 place-items-center border border-stone-300 bg-white text-indigo-600 motion-control hover:bg-stone-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
-                  onClick={onOpenTraffic}
-                  title="实时路由：查看客户端与账号调用关系"
-                  type="button"
-                >
-                  <Network aria-hidden="true" className="h-3.5 w-3.5" />
-                </button>
-              ) : null}
-              {!mediaView && activePlatform === "codex" ? (
-                <button
-                  aria-label="配置 Codex 基线模型"
-                  className="grid h-6 w-6 shrink-0 place-items-center border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-400"
-                  onClick={() => {
-                    saveBaselineModelsMutation.reset();
-                    setBaselineModelsDialogOpen(true);
-                  }}
-                  title="配置 Codex 基线模型"
-                  type="button"
-                >
-                  <Settings2 aria-hidden="true" className="h-3.5 w-3.5" />
-                </button>
-              ) : !mediaView && activePlatform !== "codex" ? (
+              {!mediaView && activePlatform !== "codex" ? (
                 <button
                   aria-label="会话管理"
                   className="grid h-6 w-6 shrink-0 place-items-center border border-stone-300 bg-white text-stone-700 motion-control hover:bg-stone-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-400"
@@ -6901,14 +6719,10 @@ export function AccountsScreen({
                   title="更多测试操作"
                   type="button"
                 >
-                  {modelTestMenuCopied ? (
-                    <Check aria-hidden="true" className="h-3 w-3 text-emerald-600" />
-                  ) : (
-                    <ChevronDown
-                      aria-hidden="true"
-                      className={"h-3 w-3 motion-control " + (modelTestMenuOpen ? "rotate-180" : "")}
-                    />
-                  )}
+                  <ChevronDown
+                    aria-hidden="true"
+                    className={"h-3 w-3 motion-control " + (modelTestMenuOpen ? "rotate-180" : "")}
+                  />
                 </button>
                 <MotionMenu
                   ariaLabel="算力池测试菜单"
@@ -6917,41 +6731,6 @@ export function AccountsScreen({
                   origin="top-right"
                   role="menu"
                 >
-                    {!mediaView ? <>
-                    <button
-                      aria-label="复制 curl 执行语句"
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium text-stone-700 motion-control hover:bg-stone-100"
-                      onClick={() => void copyModelTestCurl("posix")}
-                      role="menuitem"
-                      title="Git Bash / WSL / macOS / Linux"
-                      type="button"
-                    >
-                      <Copy aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-                      复制 curl（Bash）
-                    </button>
-                    <button
-                      aria-label="复制 PowerShell curl 执行语句"
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium text-stone-700 motion-control hover:bg-stone-100"
-                      onClick={() => void copyModelTestCurl("powershell")}
-                      role="menuitem"
-                      title="Windows PowerShell 5.1 与 PowerShell 7 都适用"
-                      type="button"
-                    >
-                      <Copy aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-                      复制 curl（PowerShell）
-                    </button>
-                    <button
-                      aria-label="复制 CMD curl 执行语句"
-                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium text-stone-700 motion-control hover:bg-stone-100"
-                      onClick={() => void copyModelTestCurl("cmd")}
-                      role="menuitem"
-                      title="cmd.exe"
-                      type="button"
-                    >
-                      <Copy aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-                      复制 curl（CMD）
-                    </button>
-                    </> : null}
                     <button
                       aria-label="查看模型列表"
                       className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium text-stone-700 motion-control hover:bg-stone-100"
@@ -9032,20 +8811,6 @@ export function AccountsScreen({
             </div>
           </div>
         </div>
-      )}
-      {baselineModelsDialogOpen && (
-        <CodexBaselineModelsDialog
-          defaultModels={routePoolQuery.data?.default_baseline_models ?? []}
-          error={
-            saveBaselineModelsMutation.error
-              ? formatApiError(saveBaselineModelsMutation.error, "保存 Codex 基线模型失败。")
-              : null
-          }
-          loading={saveBaselineModelsMutation.isPending}
-          models={routePoolQuery.data?.baseline_models ?? []}
-          onClose={() => setBaselineModelsDialogOpen(false)}
-          onSave={(models) => saveBaselineModelsMutation.mutate(models)}
-        />
       )}
       {routePoolModelsDialogOpen && (
         <div className="motion-overlay fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"

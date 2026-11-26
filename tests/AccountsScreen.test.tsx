@@ -402,14 +402,12 @@ function renderScreen(
   queryClient = createQueryClient(),
   capabilityFilter?: string,
   onOpenClientSetup: (platform: string, clientKey?: string) => void = vi.fn(),
-  onOpenTraffic?: () => void,
 ) {
   const result = render(
     <QueryClientProvider client={queryClient}>
       <AccountsScreen
         capabilityFilter={capabilityFilter}
         onOpenClientSetup={onOpenClientSetup}
-        onOpenTraffic={onOpenTraffic}
         platform={platform}
         sidebarCollapsed={sidebarCollapsed}
       />
@@ -538,14 +536,10 @@ function dispatchPointerEvent(
 }
 
 describe("AccountsScreen", () => {
-  it("opens live routing from the top pool toolbar even while the service is idle", async () => {
-    const openTraffic = vi.fn();
-    renderScreen("codex", "in_pool", false, createQueryClient(), undefined, vi.fn(), openTraffic);
+  it("does not expose a live-routing shortcut in the pool toolbar", async () => {
+    renderScreen("codex", "in_pool");
     const toolbar = screen.getByRole("group", { name: "算力池操作" });
-    const button = within(toolbar).getByRole("button", { name: "实时路由" });
-    expect(button).toBeEnabled();
-    await userEvent.click(button);
-    expect(openTraffic).toHaveBeenCalledOnce();
+    expect(within(toolbar).queryByRole("button", { name: "实时路由" })).not.toBeInTheDocument();
   });
 
   it("直连首次说明取消时不写入任何客户端", async () => {
@@ -1185,7 +1179,7 @@ describe("AccountsScreen", () => {
     expect(within(listActions).getByRole("button", { name: "新增账号" })).toBeInTheDocument();
     expect(within(listActions).getByRole("button", { name: "刷新账号列表" })).toBeInTheDocument();
     expect(within(screen.getByTestId("account-workspace-scroll-region")).queryByRole("button", { name: "新增账号" })).not.toBeInTheDocument();
-    expect(within(poolActions).queryByRole("button", { name: "配置 Codex 基线模型" }) !== null).toBe(!capability);
+    expect(within(poolActions).queryByRole("button", { name: "配置 Codex 基线模型" })).not.toBeInTheDocument();
     // 展示模式收进了刷新下拉，工具栏上不再单摆切换按钮。
     expect(within(listActions).queryByRole("button", { name: "列表模式" })).not.toBeInTheDocument();
 
@@ -1213,7 +1207,7 @@ describe("AccountsScreen", () => {
     expect(workspace).toHaveClass("bg-transparent");
     expect(scrollRegion).toHaveClass("bg-transparent");
     const poolStrip = screen.getByTestId("pool-status-strip");
-    expect(within(poolStrip).getByRole("button", { name: "配置 Codex 基线模型" })).toBeInTheDocument();
+    expect(within(poolStrip).queryByRole("button", { name: "配置 Codex 基线模型" })).not.toBeInTheDocument();
     expect(poolStrip).toHaveClass("w-full");
     expect(screen.getByTestId("account-workspace-toolbar").children).toHaveLength(1);
     expect(screen.queryByTestId("workspace-toolbar-leading")).not.toBeInTheDocument();
@@ -1868,7 +1862,7 @@ describe("AccountsScreen", () => {
 
     const poolStrip = await screen.findByTestId("pool-status-strip");
     expect(screen.queryByTestId("workspace-toolbar-leading")).not.toBeInTheDocument();
-    expect(within(poolStrip).getByRole("button", { name: "配置 Codex 基线模型" })).toBeInTheDocument();
+    expect(within(poolStrip).queryByRole("button", { name: "配置 Codex 基线模型" })).not.toBeInTheDocument();
   });
 
   it("reorders accounts when a dragged handle is released over the placeholder slot", async () => {
@@ -2548,48 +2542,12 @@ describe("AccountsScreen", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("opens the Codex baseline model editor and saves ordered models", async () => {
-    const user = userEvent.setup();
-    vi.mocked(setRoutePoolBaselineModels).mockImplementation(async ({ platform, models }) => ({
-      platform,
-      groups: [],
-      group_id: null,
-      active_group_id: null,
-      account_ids: [],
-      model_mode: "aggregate",
-      baseline_models: models,
-      default_baseline_models: [
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
-      ],
-      stats: statsFixture({}),
-    }));
-    renderScreen();
+  it("keeps the baseline model editor out of the account pool toolbar", async () => {
+    expect(screen.queryByRole("button", { name: "配置 Codex 基线模型" })).not.toBeInTheDocument();
+  });
 
-    await user.click(await screen.findByRole("button", { name: "配置 Codex 基线模型" }));
-    expect(await screen.findByRole("dialog", { name: "Codex 基线模型" })).toBeInTheDocument();
-    expect(screen.getByLabelText("基线模型 1")).toHaveValue("gpt-6-astra");
-
-    await user.click(screen.getByRole("button", { name: "添加模型" }));
-    await user.type(screen.getByLabelText("基线模型 6"), "custom-x");
-    await user.click(screen.getByRole("button", { name: "保存" }));
-
-    await waitFor(() =>
-      expect(setRoutePoolBaselineModels).toHaveBeenCalledWith({
-        platform: "codex",
-        models: [
-          "gpt-6-astra",
-          "gpt-5.6-sol",
-          "gpt-5.6-terra",
-          "gpt-5.6-luna",
-          "gpt-5.5",
-          "custom-x",
-        ],
-      }),
-    );
+  it("no longer saves baseline models from the account screen", async () => {
+    expect(setRoutePoolBaselineModels).not.toHaveBeenCalled();
   });
 
   it("keeps side toolbar content visible when the window is not pinned to the top", () => {
@@ -2606,7 +2564,7 @@ describe("AccountsScreen", () => {
     expect(workspace).toHaveStyle("grid-template-rows: 60px minmax(0, 1fr) 32px");
     expect(toolbar).toContainElement(screen.getByTestId("pool-status-strip"));
     expect(screen.queryByTestId("workspace-toolbar-leading")).not.toBeInTheDocument();
-    expect(within(screen.getByTestId("pool-status-strip")).getByRole("button", { name: "配置 Codex 基线模型" })).toBeInTheDocument();
+    expect(within(screen.getByTestId("pool-status-strip")).queryByRole("button", { name: "配置 Codex 基线模型" })).not.toBeInTheDocument();
   });
 
   it("fills the account list area and centers the empty state when no accounts exist", async () => {
@@ -7506,7 +7464,7 @@ describe("AccountsScreen", () => {
       }),
     );
   });
-  it("keeps pool testing available outside the pool list and copies a curl command", async () => {
+  it("keeps pool testing available outside the pool list without curl copy actions", async () => {
     poolStateByPlatform.set("codex", ["cred-official-1"]);
     vi.mocked(getRouteProxyStatus).mockResolvedValue({
       running: true,
@@ -7522,49 +7480,9 @@ describe("AccountsScreen", () => {
 
     await userEvent.click(screen.getByLabelText("打开算力池测试菜单"));
     expect(screen.getByRole("menu", { name: "算力池测试菜单" })).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText("复制 curl 执行语句"));
-
-    await waitFor(() =>
-      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-        // Plain `curl` in Bash; on Windows shells it is an Invoke-WebRequest alias.
-        expect.stringContaining("curl 'https://127.0.0.1:43111/responses'"),
-      ),
-    );
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      expect.stringContaining("--ssl-no-revoke"),
-    );
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      expect.stringContaining("--data-raw '{\"model\""),
-    );
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      expect.stringContaining('x-ai-switch-platform: codex'),
-    );
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      expect.stringContaining('Authorization: Bearer sk-ai-switch-codex-key'),
-    );
-
-    await userEvent.click(screen.getByLabelText("打开算力池测试菜单"));
-    await userEvent.click(screen.getByLabelText("复制 CMD curl 执行语句"));
-    await waitFor(() =>
-      expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
-        expect.stringContaining('--data-raw "{""model""'),
-      ),
-    );
-
-    // PowerShell 5.1 strips quotes out of native-command arguments, so neither of
-    // the two forms above survives it — the body has to reach curl over stdin.
-    await userEvent.click(screen.getByLabelText("打开算力池测试菜单"));
-    await userEvent.click(screen.getByLabelText("复制 PowerShell curl 执行语句"));
-    await waitFor(() => {
-      const command = vi.mocked(navigator.clipboard.writeText).mock.lastCall?.[0] ?? "";
-      expect(command).toContain("$body = '{\"model\"");
-      expect(command).toContain("$body | curl.exe 'https://127.0.0.1:43111/responses'");
-      expect(command).toContain("--data-binary '@-'");
-      // The 5.1 default pipe encoding turns non-ASCII bodies into `?`.
-      expect(command).toContain("$OutputEncoding = [System.Text.UTF8Encoding]::new($false);");
-      // --data-raw would put the JSON back into argument parsing, undoing the fix.
-      expect(command).not.toContain("--data-raw");
-    });
+    expect(screen.queryByLabelText("复制 curl 执行语句")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("复制 PowerShell curl 执行语句")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("复制 CMD curl 执行语句")).not.toBeInTheDocument();
   });
 
   it("keeps pool endpoint parameters out of the test menu and hands the write entry over", async () => {

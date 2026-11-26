@@ -3,6 +3,7 @@ import { motion } from "motion/react";
 import {
   BarChart3,
   ChevronDown,
+  History,
   Info,
   Images,
   Menu,
@@ -25,11 +26,10 @@ import {
   type AccountModality,
   type ModalityVisibility,
 } from "../../lib/accountModalities";
-import { supportedLanguages, useI18n, type Language } from "../../lib/i18n";
+import { useI18n } from "../../lib/i18n";
 import { useDragResize } from "../../lib/useDragResize";
 
 export const settingsFeatureScreens = [
-  "Sessions",
   "Log",
   "Insights",
 ] as const;
@@ -66,8 +66,6 @@ type AppLayoutProps = {
   activeScreen: string;
   onNavigate: (screen: string) => void;
   onToggleSidebar: () => void;
-  onLanguageChange?: (language: Language) => void;
-  languageSaving?: boolean;
   sidebarCollapsed: boolean;
   modalityVisibility?: ModalityVisibility;
   onModalityVisibilityChange?: (visibility: ModalityVisibility) => void;
@@ -163,13 +161,11 @@ export function AppLayout({
   activeScreen,
   onNavigate,
   onToggleSidebar,
-  onLanguageChange,
-  languageSaving = false,
   sidebarCollapsed,
   modalityVisibility,
   onModalityVisibilityChange,
 }: AppLayoutProps) {
-  const { language, setLanguage, t } = useI18n();
+  const { t } = useI18n();
   const appShellRef = useRef<HTMLDivElement | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth);
   const [narrowLayout, setNarrowLayout] = useState(
@@ -232,15 +228,6 @@ export function AppLayout({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [sidebarDrawerVisible]);
-
-  const handleLanguageChange = (nextLanguage: Language) => {
-    if (onLanguageChange) {
-      onLanguageChange(nextLanguage);
-      return;
-    }
-
-    setLanguage(nextLanguage);
-  };
 
   const handleToggleSidebar = () => {
     if (narrowLayout) {
@@ -352,27 +339,6 @@ export function AppLayout({
               </div>
             </div>
 
-            <label
-              className={`mb-5 items-center justify-between gap-2 rounded-2xl border border-white/70 bg-white/50 px-3 py-2 text-[12px] font-medium text-stone-500 backdrop-blur-xl ${
-                sidebarContentCollapsed ? "hidden" : "flex"
-              }`}
-            >
-              <span>{t("layout.language")}</span>
-              <select
-                aria-label={t("layout.language")}
-                className="rounded-lg border border-stone-200 bg-white/80 px-2 py-1 text-[12px] font-medium text-stone-800 outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-200"
-                disabled={languageSaving}
-                onChange={(event) => handleLanguageChange(event.target.value as Language)}
-                value={language}
-              >
-                {supportedLanguages.map((option) => (
-                  <option key={option.code} value={option.code}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
             <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-0.5">
               <section>
                 <div className={`flex items-center justify-between px-2 pb-1 ${sidebarContentCollapsed ? "hidden" : ""}`}>
@@ -439,6 +405,13 @@ export function AppLayout({
                 >
                   {t("layout.system")}
                 </p>
+                <NavButton
+                  active={activeScreen === "Sessions"}
+                  collapsed={sidebarContentCollapsed}
+                  icon={History}
+                  label={t("nav.sessions")}
+                  onClick={() => handleNavigate("Sessions")}
+                />
                 <NavButton
                   active={activeScreen === "Stats"}
                   collapsed={sidebarContentCollapsed}
