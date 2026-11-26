@@ -1,6 +1,6 @@
 [package]
 name = "otools-ai-switch-native"
-version = "0.2.0"
+version = "0.2.1"
 description = "AI Switch business core for the OTools native plugin ABI"
 authors = ["xyito"]
 edition = "2021"
@@ -42,6 +42,14 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 sha1 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 x509-parser = "0.16"
+# Optional local PII model. `load-dynamic` keeps ort-sys from downloading or
+# linking ONNX Runtime at build time — the runtime is fetched on demand by the
+# user and loaded from the plugin data dir. Do NOT enable default features.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
