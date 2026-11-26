@@ -94,6 +94,12 @@ pub struct ProxyRequestRow {
     pub price_currency: Option<String>,
     pub price_source: Option<String>,
     pub upstream_response_id: Option<String>,
+    /// Whole-request wall time, promoted out of `metadata_json`.
+    pub success: Option<i64>,
+    pub duration_ms: Option<i64>,
+    /// First-output time, promoted out of `metadata_json`; NULL before this
+    /// field existed or on a stream that never produced content.
+    pub ttft_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

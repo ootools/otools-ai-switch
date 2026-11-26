@@ -4,7 +4,7 @@
 //! change cannot land on one surface and be forgotten on the other.
 
 use crate::error::AppError;
-use crate::services::usage_overview_service::{self, UsageOverview};
+use crate::services::usage_overview_service::{self, UsageCsv, UsageOverview};
 use sqlx::SqlitePool;
 
 const DEFAULT_PAGE: i64 = 1;
@@ -46,6 +46,25 @@ pub async fn get_usage_overview_core(
         normalize_utc_offset(utc_offset_minutes),
     )
     .await
+}
+
+/// Export the full window as CSV, independent of the UI's pagination.
+pub async fn export_usage_csv_core(
+    pool: &SqlitePool,
+    since: Option<String>,
+    until: Option<String>,
+    _utc_offset_minutes: Option<i32>,
+) -> Result<UsageCsv, AppError> {
+    let since = since
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let until = until
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let window = super::usage_stats::parse_window_bounded(since, until)?;
+    usage_overview_service::export_usage_csv(pool, since, until, window).await
 }
 
 /// Rejects an offset no real timezone uses rather than trusting the wire.

@@ -3,7 +3,7 @@ use crate::models::config_snapshot::{
     ConfigSnapshotRecord, ConfigSnapshotSummary, NewConfigSnapshot,
 };
 use chrono::Utc;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 pub struct ConfigSnapshotRepository;
@@ -88,6 +88,34 @@ impl ConfigSnapshotRepository {
             return Err(snapshot_not_found(id));
         }
         Ok(())
+    }
+
+    /// The first successful write for a target: its `before_hash` / private
+    /// backup are the pristine, pre-AI-Switch file. Restoring that snapshot is
+    /// how "restore native" returns a client to its original config without
+    /// reimplementing every adapter's key-removal rules.
+    pub async fn earliest_successful_write(
+        pool: &SqlitePool,
+        target_app_id: &str,
+    ) -> Result<Option<ConfigSnapshotRecord>, AppError> {
+        sqlx::query_as::<_, ConfigSnapshotRecord>(
+            "SELECT id, target_app_id, platform, operation, operation_group_id,
+                    source_snapshot_id, path, before_hash, after_hash, backup_path,
+                    original_file_existed, metadata_json, status, error_code, created_at, updated_at
+             FROM config_snapshots
+             WHERE target_app_id = ? AND operation = 'write' AND status = 'succeeded'
+             ORDER BY created_at ASC, rowid ASC LIMIT 1",
+        )
+        .bind(target_app_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| {
+            database_error(
+                "database.config_snapshot_earliest_write",
+                "Could not find the first config write",
+                err,
+            )
+        })
     }
 
     pub async fn get(pool: &SqlitePool, id: &str) -> Result<ConfigSnapshotRecord, AppError> {
@@ -233,6 +261,48 @@ mod tests {
     use crate::database::repositories::target_repository::TargetRepository;
     use crate::database::{create_memory_pool, run_migrations};
     use crate::models::config_snapshot::NewConfigSnapshot;
+
+    #[tokio::test]
+    async fn earliest_successful_write_is_the_pristine_snapshot() {
+        let pool = create_memory_pool().await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        TargetRepository::ensure_defaults(&pool)
+            .await
+            .expect("target defaults");
+        let target = TargetRepository::get_by_key(&pool, "codex")
+            .await
+            .expect("Codex target");
+
+        for (index, before) in ["first", "second"].into_iter().enumerate() {
+            let snapshot = ConfigSnapshotRepository::prepare(
+                &pool,
+                NewConfigSnapshot {
+                    target_app_id: Some(target.id.clone()),
+                    platform: Some("codex".to_string()),
+                    operation: "write".to_string(),
+                    operation_group_id: Some(format!("group-{index}")),
+                    source_snapshot_id: None,
+                    path: "C:/Users/test/.codex/config.toml".to_string(),
+                    before_hash: Some(before.to_string()),
+                    after_hash: Some(format!("after-{index}")),
+                    backup_path: Some(format!("private/{index}.bin")),
+                    original_file_existed: true,
+                    metadata_json: "{}".to_string(),
+                },
+            )
+            .await
+            .expect("prepare");
+            ConfigSnapshotRepository::mark_status(&pool, &snapshot.id, "succeeded", None, None)
+                .await
+                .expect("succeed");
+        }
+
+        let earliest = ConfigSnapshotRepository::earliest_successful_write(&pool, &target.id)
+            .await
+            .expect("query")
+            .expect("snapshot");
+        assert_eq!(earliest.before_hash.as_deref(), Some("first"));
+    }
 
     #[tokio::test]
     async fn prepared_snapshot_can_succeed_and_be_listed_without_private_fields() {

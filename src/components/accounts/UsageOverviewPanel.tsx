@@ -1,13 +1,15 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BarChart3, ChevronLeft, ChevronRight, List, Settings2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ModelPricingDialog } from "./ModelPricingDialog";
 import { MotionNumber } from "../motion/MotionPrimitives";
 import { UsageTrendChart } from "./UsageTrendChart";
-import { getUsageOverview } from "../../lib/api/client";
+import { exportUsageCsv, getQuotaOverview, getUsageOverview, refreshRouteCredentialsQuota } from "../../lib/api/client";
 import { formatCompactCount, formatCostMicros, formatExactCount } from "../../lib/usageFormat";
 import { decodeStoredBody, parseUsageMetadata, prettyJsonOrText } from "../../lib/usageMetadata";
 import type {
+  UsageOverview,
+  QuotaOverview,
   UsageOverviewGroupRow,
   UsageOverviewRow,
   UsageRowSource,
@@ -21,6 +23,7 @@ const periods = [
   { key: "month", label: "本月" },
   { key: "30d", label: "30d" },
   { key: "all", label: "累计" },
+  { key: "custom", label: "自定义" },
 ] as const;
 
 type Period = (typeof periods)[number]["key"];
@@ -42,6 +45,9 @@ const groupViews = [
 
 type GroupView = (typeof groupViews)[number]["key"];
 
+/** The Stats page stays one sidebar item; speed is an in-page view. */
+type OverviewView = "usage" | "speed" | "quota";
+
 const pageSize = 20;
 
 /**
@@ -55,7 +61,7 @@ const refreshMs = 30_000;
 /** Rows shown in a grouping table before the rest are summarized away. */
 const groupRowLimit = 12;
 
-function periodSince(period: Period, now = new Date()) {
+function periodSince(period: Period, customSince = "", now = new Date()) {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   switch (period) {
     case "today": {
@@ -87,6 +93,9 @@ function periodSince(period: Period, now = new Date()) {
     case "all": {
       return null;
     }
+    case "custom": {
+      return customSince ? new Date(customSince).toISOString() : null;
+    }
   }
 }
 
@@ -96,6 +105,11 @@ function formatTime(value: string | null | undefined) {
   }
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+/** TPS is stored as tok/s × 1000 to stay integer through IPC. */
+function formatTps(milli: number | null | undefined) {
+  return milli == null ? "—" : `${(milli / 1000).toFixed(1)} tok/s`;
 }
 
 const sourceLabels: Record<UsageRowSource, string> = {
@@ -332,6 +346,24 @@ function RequestDetail({ row }: { row: UsageOverviewRow }) {
         {metadata?.durationMs ? (
           <DetailField label="耗时" value={`${metadata.durationMs} ms`} />
         ) : null}
+        {metadata?.ttftMs ? (
+          <>
+            <DetailField label="首 Token 耗时 (TTFT)" value={`${metadata.ttftMs} ms`} />
+            <DetailField
+              label="输出 TPS"
+              value={
+                Number(metadata.durationMs) > Number(metadata.ttftMs) && row.output_tokens > 0
+                  ? formatTps(
+                      Math.floor(
+                        (row.output_tokens * 1_000_000) /
+                          (Number(metadata.durationMs) - Number(metadata.ttftMs)),
+                      ),
+                    )
+                  : "—"
+              }
+            />
+          </>
+        ) : null}
         {metadata?.targetUrl ? (
           <DetailField label="上游地址" mono value={metadata.targetUrl} />
         ) : null}
@@ -431,6 +463,193 @@ function RequestRow({
   );
 }
 
+/** Quota tab: read-only snapshot plus renewal warnings from the backend. */
+function QuotaView({ data }: { data: QuotaOverview }) {
+  const queryClient = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    setMessage(null);
+    try {
+      const outcomes = await refreshRouteCredentialsQuota("codex");
+      await queryClient.invalidateQueries({ queryKey: ["quota-overview"] });
+      const failed = outcomes.filter((outcome) => !outcome.updated).length;
+      setMessage(
+        failed > 0
+          ? `已刷新 ${outcomes.length - failed} 个账号，${failed} 个失败。`
+          : `已刷新 ${outcomes.length} 个账号。`,
+      );
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[12px] text-stone-500">
+          官方账号额度快照与续期提醒。刷新会向订阅上游查询，不会改写客户端配置。
+        </p>
+        <button
+          className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-stone-600 motion-control hover:bg-stone-50 disabled:opacity-40"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+          type="button"
+        >
+          {refreshing ? "刷新中…" : "刷新额度"}
+        </button>
+      </div>
+      {message ? <p className="text-[11px] text-stone-500">{message}</p> : null}
+      <div className="grid gap-2 sm:grid-cols-3">
+        <SummaryCard
+          label="官方账号"
+          title={formatExactCount(data.official_account_count)}
+          value={formatCompactCount(data.official_account_count)}
+        />
+        <SummaryCard
+          label="有额度数据"
+          title={formatExactCount(data.with_quota_count)}
+          value={formatCompactCount(data.with_quota_count)}
+        />
+        <SummaryCard
+          label="续期提醒"
+          title={formatExactCount(data.reminders.length)}
+          value={formatCompactCount(data.reminders.length)}
+        />
+      </div>
+      {data.reminders.length > 0 ? (
+        <div className="space-y-1 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
+          {data.reminders.map((reminder) => (
+            <p key={`${reminder.credential_id}-${reminder.window}`}>
+              <span className="font-semibold">{reminder.display_name}</span> · {reminder.message}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      <div className="overflow-hidden rounded-xl border border-stone-200 bg-white">
+        <div className="grid grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr_1.2fr] gap-2 border-b border-stone-100 bg-stone-50 px-3 py-2 text-[11px] font-medium text-stone-500">
+          <span>账号</span>
+          <span className="text-right">5h 剩余</span>
+          <span className="text-right">周剩余</span>
+          <span className="text-right">限额</span>
+          <span className="text-right">最近重置</span>
+        </div>
+        {data.rows.length === 0 ? (
+          <p className="px-3 py-4 text-[12px] text-stone-500">还没有官方订阅账号。</p>
+        ) : (
+          <div className="divide-y divide-stone-100">
+            {data.rows.map((row) => (
+              <div
+                className="grid grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr_1.2fr] gap-2 px-3 py-2 text-[12px]"
+                key={row.id}
+              >
+                <span className="truncate text-stone-800" title={row.display_name}>
+                  {row.display_name}
+                  <span className="ml-1 text-[10px] text-stone-400">{row.provider}</span>
+                </span>
+                <span className="text-right text-stone-600">{formatCompactCount(row.primary_remain ?? 0)}</span>
+                <span className="text-right text-stone-600">{formatCompactCount(row.weekly_remain ?? 0)}</span>
+                <span className="text-right text-stone-600">
+                  {row.quota_limit == null ? "—" : formatCompactCount(row.quota_limit)}
+                </span>
+                <span className="truncate text-right text-stone-500" title={row.reset_primary ?? undefined}>
+                  {formatTime(row.reset_primary)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Speed view. Only proxy-backed rows have HTTP timing: a CLI transcript has no
+ * network start/first-token instants, so it is excluded rather than counted as
+ * a zero. The sample counts beside each number are the honest denominator.
+ */
+function SpeedView({ overview }: { overview: UsageOverview }) {
+  const speed = overview.speed;
+  const samples = overview.rows.filter(
+    (row) => row.source !== "session_only" && row.ttft_ms != null,
+  );
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <SummaryCard
+          label="TTFT 中位数"
+          title={`样本 ${formatExactCount(speed.ttft_sample_count)} 条`}
+          value={speed.ttft_p50_ms == null ? "—" : `${speed.ttft_p50_ms} ms`}
+        />
+        <SummaryCard
+          label="TTFT p95"
+          title={`样本 ${formatExactCount(speed.ttft_sample_count)} 条`}
+          value={speed.ttft_p95_ms == null ? "—" : `${speed.ttft_p95_ms} ms`}
+        />
+        <SummaryCard
+          label="输出 TPS 中位数"
+          title={`样本 ${formatExactCount(speed.tps_sample_count)} 条；TPS = 输出 token ÷ (总耗时 − TTFT)`}
+          value={formatTps(speed.tps_p50_milli)}
+        />
+        <SummaryCard
+          label="输出 TPS p95"
+          title={`样本 ${formatExactCount(speed.tps_sample_count)} 条`}
+          value={formatTps(speed.tps_p95_milli)}
+        />
+      </div>
+      <p className="text-[11px] text-stone-400">
+        仅统计经过本代理且成功的请求。本机 CLI 会话记录没有网络时间戳，不参与速度统计；流式请求才可能产生首 token 样本，
+        非流式与失败请求同样不计入。
+      </p>
+      <div className="overflow-hidden rounded-xl border border-stone-200 bg-white">
+        <div className="grid grid-cols-[1.4fr_1fr_0.8fr_0.8fr_0.8fr] gap-2 border-b border-stone-100 bg-stone-50 px-3 py-2 text-[11px] font-medium text-stone-500">
+          <span>模型</span>
+          <span>时间</span>
+          <span className="text-right">TTFT</span>
+          <span className="text-right">输出 TPS</span>
+          <span className="text-right">总耗时</span>
+        </div>
+        {samples.length === 0 ? (
+          <p className="px-3 py-4 text-[12px] text-stone-500">当前筛选范围内没有带首 token 计时的请求。</p>
+        ) : (
+          <div className="divide-y divide-stone-100">
+            {samples.slice(0, 20).map((row) => {
+              const ttft = row.ttft_ms ?? 0;
+              const generation = Math.max(0, (row.duration_ms ?? 0) - ttft);
+              return (
+                <div
+                  className="grid grid-cols-[1.4fr_1fr_0.8fr_0.8fr_0.8fr] gap-2 px-3 py-2 text-[12px]"
+                  key={row.id}
+                >
+                  <span className="truncate text-stone-800" title={row.model}>{row.model}</span>
+                  <span className="truncate text-stone-500">{formatTime(row.occurred_at)}</span>
+                  <span className="text-right text-stone-600">{ttft} ms</span>
+                  <span className="text-right text-stone-600">
+                    {generation > 0 && row.output_tokens > 0
+                      ? formatTps(Math.floor((row.output_tokens * 1_000_000) / generation))
+                      : "—"}
+                  </span>
+                  <span className="text-right text-stone-600">{row.duration_ms ?? "—"} ms</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {samples.length > 20 ? (
+          <p className="border-t border-stone-100 px-3 py-2 text-[11px] text-stone-500">
+            另有 {samples.length - 20} 条未显示。
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /**
  * `standalone` renders the panel as a top-level page instead of a section
  * hanging under the account workspace's filter bar.
@@ -442,17 +661,40 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
   const [groupView, setGroupView] = useState<GroupView>("list");
   const [pricingOpen, setPricingOpen] = useState(false);
   const [expandedRowId, setExpandedRowId] = useState<string | null>(null);
+  const [view, setView] = useState<OverviewView>("usage");
+  const [customSince, setCustomSince] = useState("");
+  const [customUntil, setCustomUntil] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState<string | null>(null);
 
+  // Custom bounds are explicit and stable, so they belong in the key. Rolling
+  // presets derive `since` from `now` and deliberately stay out of it — putting
+  // a derived timestamp in the key would refetch on every render.
+  const customBounds = period === "custom" ? `${customSince}|${customUntil}` : null;
+  const customValid =
+    period !== "custom" ||
+    (Boolean(customSince) &&
+      Boolean(customUntil) &&
+      new Date(customSince).getTime() < new Date(customUntil).getTime());
   const query = useQuery({
-    // `since` is deliberately not part of the key. The rolling presets derive it
-    // from `now`, so a key carrying it changes on every render, and each
-    // settling fetch renders into the next one — an unbounded request loop where
-    // every request is a full session-corpus scan. Recomputing it inside
-    // `queryFn` keeps the window fresh on every poll while the key stays stable.
-    queryKey: ["usage-overview", period, page, pageSize],
-    queryFn: () => getUsageOverview(periodSince(period), page, pageSize),
+    queryKey: ["usage-overview", period, page, pageSize, customBounds],
+    queryFn: () =>
+      getUsageOverview(
+        periodSince(period, customSince),
+        page,
+        pageSize,
+        period === "custom" && customUntil ? new Date(customUntil).toISOString() : null,
+      ),
+    enabled: customValid,
     placeholderData: keepPreviousData,
     refetchInterval: refreshMs,
+  });
+
+  const quotaQuery = useQuery({
+    queryKey: ["quota-overview"],
+    queryFn: getQuotaOverview,
+    refetchInterval: refreshMs,
+    enabled: view === "quota",
   });
 
   const overview = query.data;
@@ -475,6 +717,36 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
   const selectPeriod = (next: Period) => {
     setPeriod(next);
     setPage(1);
+    setExportNote(null);
+  };
+
+  const handleExport = async () => {
+    if (!customValid || exporting) {
+      return;
+    }
+    setExporting(true);
+    setExportNote(null);
+    try {
+      const result = await exportUsageCsv(
+        periodSince(period, customSince),
+        period === "custom" && customUntil ? new Date(customUntil).toISOString() : null,
+      );
+      const url = URL.createObjectURL(new Blob([result.content], { type: "text/csv;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `ai-switch-usage-${period}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setExportNote(
+        result.truncated
+          ? `已导出前 50000 条（共 ${formatExactCount(result.row_count)} 条，已达上限）。`
+          : `已导出 ${formatExactCount(result.row_count)} 条请求。`,
+      );
+    } catch (error) {
+      setExportNote(errorMessage(error));
+    } finally {
+      setExporting(false);
+    }
   };
 
   const activeGroup = groupDimensions.find((item) => item.key === dimension);
@@ -520,6 +792,31 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <div className="flex gap-1 rounded-xl bg-stone-100 p-1">
+            {([["usage", "用量"], ["speed", "速度"], ["quota", "额度"]] as const).map(([key, label]) => (
+              <button
+                aria-pressed={view === key}
+                className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold motion-control ${
+                  view === key ? "bg-white text-stone-950 shadow-sm" : "text-stone-500 hover:text-stone-900"
+                }`}
+                key={key}
+                onClick={() => setView(key)}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <button
+            aria-label="导出 CSV"
+            className="rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-stone-600 motion-control hover:bg-stone-50 disabled:opacity-40"
+            disabled={!customValid || exporting}
+            onClick={() => void handleExport()}
+            title="导出当前时间窗内的全部请求"
+            type="button"
+          >
+            {exporting ? "导出中…" : "导出 CSV"}
+          </button>
           <button
             aria-label="配置模型价格"
             className="grid h-8 w-8 place-items-center rounded-lg border border-stone-200 bg-white text-stone-500 motion-control hover:bg-stone-50 hover:text-stone-900"
@@ -529,7 +826,7 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
           >
             <Settings2 aria-hidden="true" className="h-4 w-4" />
           </button>
-          <div className="grid grid-cols-7 gap-1 rounded-xl bg-stone-100 p-1">
+          <div className="grid grid-cols-8 gap-1 rounded-xl bg-stone-100 p-1">
           {periods.map((item) => (
             <button
               className={`rounded-lg px-2 py-1 text-[11px] font-semibold motion-control ${
@@ -548,14 +845,59 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
         </div>
       </div>
 
-      {query.isError ? (
+      {period === "custom" ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] text-stone-600">
+          <label className="flex items-center gap-2">
+            从
+            <input
+              aria-label="自定义开始时间"
+              className="rounded-lg border border-stone-200 bg-white px-2 py-1 text-[12px] outline-none focus:border-blue-400"
+              onChange={(event) => setCustomSince(event.target.value)}
+              type="datetime-local"
+              value={customSince}
+            />
+          </label>
+          <label className="flex items-center gap-2">
+            到
+            <input
+              aria-label="自定义结束时间"
+              className="rounded-lg border border-stone-200 bg-white px-2 py-1 text-[12px] outline-none focus:border-blue-400"
+              onChange={(event) => setCustomUntil(event.target.value)}
+              type="datetime-local"
+              value={customUntil}
+            />
+          </label>
+          {!customValid ? <span className="text-[11px] text-red-600">开始时间必须早于结束时间</span> : null}
+        </div>
+      ) : null}
+      {exportNote ? <p className="text-[11px] text-stone-500">{exportNote}</p> : null}
+
+      {view === "quota" ? (
+        quotaQuery.isError ? (
+          <p className="rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-700" role="alert">
+            {errorMessage(quotaQuery.error)}
+          </p>
+        ) : !quotaQuery.data ? (
+          <p className="text-[12px] text-stone-500" role="status">
+            正在读取账号额度…
+          </p>
+        ) : (
+          <QuotaView data={quotaQuery.data} />
+        )
+      ) : query.isError ? (
         <p className="rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-700" role="alert">
           {errorMessage(query.error)}
+        </p>
+      ) : !customValid ? (
+        <p className="text-[12px] text-stone-500" role="status">
+          请选择有效的开始与结束时间。
         </p>
       ) : !overview ? (
         <p className="text-[12px] text-stone-500" role="status">
           正在读取本机会话记录…首次扫描较慢，之后会走缓存。
         </p>
+      ) : view === "speed" ? (
+        <SpeedView overview={overview} />
       ) : (
         <>
           <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">

@@ -97,23 +97,44 @@ pub async fn save_model_price_configs_core(
 }
 
 pub(crate) fn parse_window(since: Option<&str>) -> Result<TimeWindow, AppError> {
-    let Some(since) = since.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(TimeWindow::default());
+    parse_window_bounded(since, None)
+}
+
+/// An explicit `[since, until)` window for CSV export. `until` is exclusive so
+/// two adjacent windows cannot double-count a request on the boundary.
+pub(crate) fn parse_window_bounded(
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<TimeWindow, AppError> {
+    let parse = |value: &str| -> Result<i64, AppError> {
+        chrono::DateTime::parse_from_rfc3339(value.trim())
+            .map(|parsed| parsed.timestamp_millis())
+            .map_err(|error| AppError::Validation {
+                code: "validation.invalid_timestamp",
+                message: format!("timestamps must be RFC 3339: {error}"),
+                details: Some(value.to_string()),
+                recoverable: true,
+            })
     };
-
-    let start = chrono::DateTime::parse_from_rfc3339(since)
-        .map(|parsed| parsed.timestamp_millis())
-        .map_err(|error| AppError::Validation {
-            code: "validation.invalid_timestamp",
-            message: format!("`since` must be an RFC 3339 timestamp: {error}"),
-            details: Some(since.to_string()),
-            recoverable: true,
-        })?;
-
-    Ok(TimeWindow {
-        start_ms: Some(start),
-        end_ms: None,
-    })
+    let start_ms = match since.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(since) => Some(parse(since)?),
+        None => None,
+    };
+    let end_ms = match until.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(until) => Some(parse(until)?),
+        None => None,
+    };
+    if let (Some(start), Some(end)) = (start_ms, end_ms) {
+        if end <= start {
+            return Err(AppError::Validation {
+                code: "validation.invalid_timestamp",
+                message: "`until` must be later than `since`".to_string(),
+                details: None,
+                recoverable: true,
+            });
+        }
+    }
+    Ok(TimeWindow { start_ms, end_ms })
 }
 
 #[cfg(test)]
@@ -149,7 +170,42 @@ mod tests {
     }
 
     #[test]
+    fn bounded_window_sets_an_exclusive_end() {
+        let window = parse_window_bounded(
+            Some("2026-08-19T00:00:00Z"),
+            Some("2026-08-20T00:00:00Z"),
+        )
+        .expect("window");
+        assert!(window.start_ms.is_some());
+        assert_eq!(
+            window.end_ms,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+    }
+
+    #[test]
+    fn an_end_before_the_start_is_rejected() {
+        let error = parse_window_bounded(
+            Some("2026-08-20T00:00:00Z"),
+            Some("2026-08-19T00:00:00Z"),
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            error,
+            AppError::Validation {
+                code: "validation.invalid_timestamp",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn invalid_since_is_rejected_rather_than_ignored() {
+
         // Silently treating a bad timestamp as "all time" would inflate the
         // numbers shown for a narrow period.
         let error = parse_window(Some("last tuesday")).expect_err("must reject");

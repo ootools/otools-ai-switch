@@ -31,6 +31,7 @@ import { useDragResize } from "../../lib/useDragResize";
 export const settingsFeatureScreens = [
   "Sessions",
   "Log",
+  "Insights",
 ] as const;
 
 const SIDEBAR_DEFAULT_WIDTH = 216;

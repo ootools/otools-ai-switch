@@ -704,6 +704,11 @@ pub struct ModelMapping {
     /// through `supports_1m` instead, so the two never apply to one platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Codex-only: the full upstream window, independent of the smaller
+    /// `context_window` used as Codex's auto-compact threshold. `None` keeps
+    /// the historical behavior where both values are identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u32>,
     /// Codex-only: the reasoning efforts advertised for this alias. `None` means
     /// "use the baseline profile for this model id", which is what every mapping
     /// written before this field existed relies on.

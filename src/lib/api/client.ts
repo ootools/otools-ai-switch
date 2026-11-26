@@ -23,6 +23,7 @@ import type {
   ExternalClientImportPreview,
   FetchedRouteModel,
   ImportExternalClientAccountsInput,
+  ImportedCodexAccount,
   ImportJob,
   CreateApiRouteCredentialInput,
   NewOfficialAccount,
@@ -66,6 +67,11 @@ import type {
   TargetApp,
   TargetConfigStatus,
   UsageOverview,
+  QuotaOverview,
+  SubscriptionVendor,
+  PrivacyMaskAuditRow,
+  PiiModelStatusView,
+  PiiDownloadProgress,
   UsageHistoryStorage,
   ResponseBodyCleanup,
   UpdateOfficialAccount,
@@ -153,6 +159,11 @@ export function listConfigSnapshots(
 
 export function rollbackConfigSnapshot(id: string): Promise<ConfigWriteOutcome> {
   return invoke("rollback_config_snapshot", { id });
+}
+
+/** Restore the exact pre-AI-Switch bytes of a client's config. */
+export function restoreNativeConfig(targetKey: string): Promise<ConfigWriteOutcome> {
+  return invoke("restore_native_config", { targetKey });
 }
 
 export function listPlatformCapabilities(): Promise<PlatformCapability[]> {
@@ -293,9 +304,11 @@ export function getUsageOverview(
   since: string | null,
   page: number,
   pageSize: number,
+  until?: string | null,
 ): Promise<UsageOverview> {
   return invoke("get_usage_overview", {
     since: since ?? null,
+    until: until ?? null,
     page,
     page_size: pageSize,
     // The chart's buckets are cut at *this* client's midnight. `since` is already
@@ -303,6 +316,66 @@ export function getUsageOverview(
     // instead sliced the first and last bucket at a different instant and shifted
     // every hour label — invisible on the desktop, wrong on a paired phone in
     // another timezone. getTimezoneOffset is minutes *behind* UTC, hence the sign.
+    utc_offset_minutes: -new Date().getTimezoneOffset(),
+  });
+}
+
+export function getPiiModelStatus(): Promise<PiiModelStatusView> {
+  return invoke("get_pii_model_status", {});
+}
+
+export function startPiiModelDownload(mirror?: string | null): Promise<void> {
+  return invoke("start_pii_model_download", { mirror: mirror ?? null });
+}
+
+export function cancelPiiModelDownload(): Promise<void> {
+  return invoke("cancel_pii_model_download", {});
+}
+
+export function deletePiiModel(): Promise<void> {
+  return invoke("delete_pii_model", {});
+}
+
+export function warmPiiModel(): Promise<PiiModelStatusView> {
+  return invoke("warm_pii_model", {});
+}
+
+/** Audit rows for local privacy masking. Placeholders only, never secrets. */
+export function getPrivacyMaskInsights(limit = 50): Promise<PrivacyMaskAuditRow[]> {
+  return invoke("get_privacy_mask_insights", { limit });
+}
+
+/** A read-only aggregate of every official account's quota and renewals. */
+export function getQuotaOverview(): Promise<QuotaOverview> {
+  return invoke("get_quota_overview", {});
+}
+
+/** Detect a vendor's locally logged-in credentials file (read-only). */
+export function detectSubscriptionLogin(vendor: SubscriptionVendor): Promise<string | null> {
+  return invoke("detect_subscription_login", { vendor });
+}
+
+/** Import the detected login file as an official account. */
+export function importSubscriptionLogin(
+  vendor: SubscriptionVendor,
+  batchName: string,
+  path?: string | null,
+): Promise<ImportedCodexAccount[]> {
+  return invoke("import_subscription_login", {
+    vendor,
+    batchName,
+    path: path ?? null,
+  });
+}
+
+/** Export the whole window as CSV, not just the current request-list page. */
+export function exportUsageCsv(
+  since: string | null,
+  until: string | null,
+): Promise<{ content: string; row_count: number; truncated: boolean }> {
+  return invoke("export_usage_csv", {
+    since: since ?? null,
+    until: until ?? null,
     utc_offset_minutes: -new Date().getTimezoneOffset(),
   });
 }

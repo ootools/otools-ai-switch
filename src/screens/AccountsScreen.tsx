@@ -65,6 +65,7 @@ import {
   useExternalClientImportPreview,
 } from "../components/accounts/ExternalClientImportPanel";
 import { CodexOAuthDialog } from "../components/accounts/CodexOAuthDialog";
+import { SubscriptionLoginDialog } from "../components/accounts/SubscriptionLoginDialog";
 import { CodexBaselineModelsDialog } from "../components/accounts/CodexBaselineModelsDialog";
 import { DirectModeDialog, hasAcceptedDirectModeNotice, rememberDirectModeNotice } from "../components/accounts/DirectModeDialog";
 import { AgentIcon } from "../components/brand/AgentIcon";
@@ -1094,6 +1095,10 @@ function buildOneClickMappings(models: FetchedRouteModel[], existing: ModelMappi
       if (contextWindow !== null) {
         rebuilt.context_window = contextWindow;
       }
+      const maxWindow = normalizeCodexContextWindow(carried.max_context_window);
+      if (maxWindow !== null) {
+        rebuilt.max_context_window = maxWindow;
+      }
       const reasoningLevels = normalizeCodexReasoningLevels(carried.reasoning_levels);
       if (reasoningLevels.length > 0) {
         rebuilt.reasoning_levels = reasoningLevels;
@@ -1136,6 +1141,7 @@ function parseModelMappingsFromConfig(configJson: string): ModelMapping[] {
               ? true
               : null,
           context_window: normalizeCodexContextWindow(item.context_window),
+          max_context_window: normalizeCodexContextWindow(item.max_context_window),
           reasoning_levels: reasoningLevels.length > 0 ? reasoningLevels : null,
         };
       });
@@ -1198,6 +1204,10 @@ function normalizeModelMappings(mappings: ModelMapping[], platform: PlatformKey)
       const contextWindow = normalizeCodexContextWindow(mapping.context_window);
       if (contextWindow !== null) {
         normalizedMapping.context_window = contextWindow;
+      }
+      const maxWindow = normalizeCodexContextWindow(mapping.max_context_window);
+      if (maxWindow !== null) {
+        normalizedMapping.max_context_window = maxWindow;
       }
       const reasoningLevels = normalizeCodexReasoningLevels(mapping.reasoning_levels);
       // An empty list is stored as "absent" so the row keeps following the
@@ -2316,6 +2326,7 @@ function CodexMappingCapabilityFields({
   onPatch: (patch: Partial<ModelMapping>) => void;
 }) {
   const contextWindow = normalizeCodexContextWindow(mapping.context_window);
+  const maxWindow = normalizeCodexContextWindow(mapping.max_context_window);
   const declaredLevels = normalizeCodexReasoningLevels(mapping.reasoning_levels);
   const effectiveLevels = codexEffectiveReasoningLevels(mapping.from, declaredLevels);
   const followsBaseline = usesCodexBaselineReasoning(declaredLevels);
@@ -2414,6 +2425,31 @@ function CodexMappingCapabilityFields({
           value={contextWindow === null ? "" : String(contextWindow)}
         />
       ) : null}
+      <label className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-stone-500">
+        完整窗口
+        <input
+          aria-label={`完整窗口 ${index + 1}`}
+          className="w-28 rounded-lg border border-stone-200 bg-white px-2 py-1 text-[12px] font-medium text-stone-800 outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+          max={CODEX_CONTEXT_WINDOW_MAX}
+          min={1}
+          onChange={(event) => {
+            const raw = event.target.value;
+            if (!raw) {
+              onPatch({ max_context_window: null });
+              return;
+            }
+            const parsed = Number(raw);
+            if (!Number.isFinite(parsed) || parsed <= 0) return;
+            onPatch({
+              max_context_window: Math.min(Math.trunc(parsed), CODEX_CONTEXT_WINDOW_MAX),
+            });
+          }}
+          placeholder="跟随上下文"
+          title="Codex 完整上游窗口；留空则与上下文长度相同"
+          type="number"
+          value={maxWindow === null ? "" : String(maxWindow)}
+        />
+      </label>
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <span className="text-[11px] font-semibold text-stone-500">推理程度</span>
         {levelChoices.map((level) => {
@@ -3690,6 +3726,7 @@ export function AccountsScreen({
   const [editApiProvider, setEditApiProvider] = useState("custom");
   const [officialBatchName, setOfficialBatchName] = useState("");
   const [codexOAuthOpen, setCodexOAuthOpen] = useState(false);
+  const [subscriptionLoginOpen, setSubscriptionLoginOpen] = useState(false);
   const [codexOAuthError, setCodexOAuthError] = useState<string | null>(null);
   const [officialFilePaths, setOfficialFilePaths] = useState<string[]>([]);
   const [filePickerError, setFilePickerError] = useState<string | null>(null);
@@ -9817,6 +9854,20 @@ export function AccountsScreen({
                       </button>
                     )}
                     <button
+                      aria-label="订阅登录接入"
+                      className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-[13px] font-semibold text-blue-900 motion-control hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={!desktop || createMutation.isPending}
+                      onClick={() => {
+                        if (!officialBatchName.trim()) { setCodexOAuthError("批量名称不能为空"); return; }
+                        setCodexOAuthError(null);
+                        setSubscriptionLoginOpen(true);
+                      }}
+                      title={desktop ? "导入本机已登录的 Claude / Gemini / Grok / Copilot 订阅" : "此功能仅桌面端可用。"}
+                      type="button"
+                    >
+                      订阅登录接入
+                    </button>
+                    <button
                       aria-label="导入 JSON 文件"
                       className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-[13px] font-semibold text-blue-900 motion-control hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
                       disabled={!desktop}
@@ -9903,6 +9954,18 @@ export function AccountsScreen({
           batchName={officialBatchName}
           onClose={() => setCodexOAuthOpen(false)}
           onImported={handleCodexOAuthImported}
+        />
+      )}
+
+      {createOpen && subscriptionLoginOpen && activePlatform === "codex" && (
+        <SubscriptionLoginDialog
+          batchName={officialBatchName}
+          onClose={() => setSubscriptionLoginOpen(false)}
+          onImported={async (accounts) => {
+            for (const account of accounts) {
+              await handleCodexOAuthImported(account);
+            }
+          }}
         />
       )}
 

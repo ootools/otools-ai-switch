@@ -86,6 +86,10 @@ pub(super) const CLAUDE_SUBAGENT_MODEL_ENV_KEY: &str = "CLAUDE_CODE_SUBAGENT_MOD
 /// including Claude Code's own background subtasks.
 pub(super) const CLAUDE_FALLBACK_MODEL_ENV_KEY: &str = "ANTHROPIC_MODEL";
 
+/// Global long-conversation threshold: Claude Code auto-compacts at this many
+/// tokens instead of its own default.
+pub(super) const CLAUDE_AUTO_COMPACT_WINDOW_ENV_KEY: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
 fn set_or_remove(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
     match value.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => {
@@ -205,6 +209,15 @@ impl TargetAdapter for JsonAgentAdapter {
         // remove what it doesn't, so a stale value never hardens into an
         // explicit setting. Claude-only — gemini/grok have no model slots.
         if self.writes_claude_model_env {
+            let compact = input
+                .claude_env
+                .auto_compact_window
+                .map(|window| window.to_string());
+            set_or_remove(
+                env,
+                CLAUDE_AUTO_COMPACT_WINDOW_ENV_KEY,
+                compact.as_deref(),
+            );
             set_or_remove(
                 env,
                 CLAUDE_SUBAGENT_MODEL_ENV_KEY,

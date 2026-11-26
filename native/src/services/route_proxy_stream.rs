@@ -19,6 +19,7 @@ use super::response_failure_service::{
 use crate::models::route_pool::RouteUsageBreakdown;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// Terminal markers that mean "this stream ended on purpose".
 ///
@@ -507,6 +508,10 @@ pub struct StreamOutcome {
     /// from start to finish means the upstream really did not reason — see
     /// [`StreamObserver::reasoning_deltas`].
     pub reasoning_deltas: usize,
+    /// When the first real output frame arrived, for time-to-first-token.
+    /// `None` when the stream never produced content (or was not observed from
+    /// its start), which the speed aggregates treat as "no sample".
+    pub first_content_at: Option<Instant>,
     /// 续写所需的 item / 正文状态（spec 第 5 节）。
     pub continuation: StreamContinuationState,
 }
@@ -562,6 +567,41 @@ fn reasoning_text_in_frame(value: &Value) -> Option<&str> {
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta"
     ) {
         return non_empty_text(value.get("delta").and_then(Value::as_str));
+    }
+    None
+}
+
+/// 首帧真实正文（含推理）里带出的文字，或 `None`。
+///
+/// 判断的是「模型开始产出内容」这一刻，而不是「上游开始发 SSE 帧」：
+/// `response.created` / `response.output_item.added` / role 预奏帧都可能先到，
+/// 它们只是建流，拿它们当首 token 会把 TTFT 算成几乎为零。三种上游方言都要
+/// 认：Responses 的 `response.output_text.delta`、Chat 的
+/// `choices[0].delta.content`、Anthropic 的 `text_delta`。推理 delta 也算
+/// 内容——用户等的就是它，而不是之后才到的正文。
+fn content_text_in_frame(value: &Value) -> Option<&str> {
+    if let Some(text) = reasoning_text_in_frame(value) {
+        return Some(text);
+    }
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("response.output_text.delta" | "response.output_text.done")
+    ) {
+        if let Some(text) = non_empty_text(value.get("delta").and_then(Value::as_str)) {
+            return Some(text);
+        }
+    }
+    if let Some(text) = non_empty_text(
+        value
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str),
+    ) {
+        return Some(text);
+    }
+    if value.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta") {
+        if let Some(text) = non_empty_text(value.pointer("/delta/text").and_then(Value::as_str)) {
+            return Some(text);
+        }
     }
     None
 }
@@ -644,6 +684,10 @@ pub struct StreamObserver {
     /// can fill the whole budget before the first delta arrives. Counting every
     /// frame costs one branch and cannot be truncated away.
     reasoning_deltas: usize,
+    /// First frame carrying real model output, used for time-to-first-token.
+    /// Set once; later frames never overwrite it. `None` on a stream that only
+    /// carried preludes, failed before output, or was watched non-streamingly.
+    first_content_at: Option<Instant>,
     /// Tail of the previous chunk, so a terminal marker straddling a chunk
     /// boundary is still found.
     marker_carry: String,
@@ -685,6 +729,7 @@ impl StreamObserver {
             saw_data_frame: false,
             saw_terminal_marker: false,
             reasoning_deltas: 0,
+            first_content_at: None,
             marker_carry: String::new(),
             streaming_request,
             audio_stream: false,
@@ -904,6 +949,7 @@ impl StreamObserver {
             },
             failure: self.failure,
             reasoning_deltas: self.reasoning_deltas,
+            first_content_at: self.first_content_at,
             continuation: self.continuation,
         }
     }
@@ -951,12 +997,22 @@ impl StreamObserver {
             return;
         };
         self.note_semantic_failure(&value);
+        // First real output wins; prelude frames carry no text and must not
+        // start the clock. `get_or_insert_with` keeps this a single branch on
+        // every later frame.
+        if self.first_content_at.is_none() && content_text_in_frame(&value).is_some() {
+            self.first_content_at = Some(Instant::now());
+        }
         if self.audio_stream {
             match value["type"].as_str() {
                 Some("speech.audio.delta") => {
-                    self.audio_started |= value["audio"]
+                    let has_audio = value["audio"]
                         .as_str()
                         .is_some_and(|audio| !audio.is_empty());
+                    if has_audio && self.first_content_at.is_none() {
+                        self.first_content_at = Some(Instant::now());
+                    }
+                    self.audio_started |= has_audio;
                 }
                 Some("speech.audio.done") if self.audio_started => {
                     self.saw_terminal_marker = true;
@@ -1182,6 +1238,27 @@ impl StreamObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_content_ignores_preludes_and_accepts_all_three_dialects() {
+        let prelude: Value = serde_json::from_str(r#"{"type":"response.created","response":{"id":"r1"}}"#).unwrap();
+        assert!(content_text_in_frame(&prelude).is_none());
+
+        let reasoning: Value = serde_json::from_str(r#"{"type":"response.reasoning_summary_text.delta","delta":"think"}"#).unwrap();
+        assert!(content_text_in_frame(&reasoning).is_some());
+
+        let responses: Value = serde_json::from_str(r#"{"type":"response.output_text.delta","delta":"hi"}"#).unwrap();
+        assert!(content_text_in_frame(&responses).is_some());
+
+        let chat: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        assert!(content_text_in_frame(&chat).is_some());
+
+        let anthropic: Value = serde_json::from_str(r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#).unwrap();
+        assert!(content_text_in_frame(&anthropic).is_some());
+
+        let empty: Value = serde_json::from_str(r#"{"choices":[{"delta":{"content":""}}]}"#).unwrap();
+        assert!(content_text_in_frame(&empty).is_none());
+    }
 
     #[test]
     fn framer_keeps_utf8_text_and_crlf_across_every_byte_boundary() {

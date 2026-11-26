@@ -841,6 +841,9 @@ impl RouteConfigService {
         let account_mappings = Self::claude_pool_mappings(pool).await?;
         let settings = SettingsService::load(paths).await?;
         let automatic = ClaudeEnvPlan {
+            auto_compact_window: settings
+                .long_conversation_enabled
+                .then_some(settings.long_conversation_compact_window),
             subagent_model: Self::resolve_alias_write(
                 &account_mappings,
                 CLAUDE_SUBAGENT_MODEL_ALIAS,
@@ -1055,8 +1058,31 @@ impl RouteConfigService {
         let mode = RoutePoolRepository::model_mode(pool, PlatformId::Codex.as_str()).await?;
         let baseline_models =
             RoutePoolRepository::baseline_models(pool, PlatformId::Codex.as_str()).await?;
-        let payload =
+        let mut payload =
             codex_model_catalog_payload_with_baseline(&members, mode, Some(&baseline_models));
+        // Global long-conversation mode lowers Codex's auto-compact threshold
+        // while `max_context_window` keeps the model's full upstream window.
+        let compact_window = match AppPaths::resolve() {
+            Ok(paths) => match SettingsService::load(&paths).await {
+                Ok(settings) if settings.long_conversation_enabled => {
+                    Some(settings.long_conversation_compact_window)
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        if let (Some(threshold), Some(models)) = (
+            compact_window,
+            payload.get_mut("models").and_then(Value::as_array_mut),
+        ) {
+            for model in models {
+                if let Some(window) = model.get_mut("context_window").and_then(|v| v.as_u64()) {
+                    *model
+                        .get_mut("context_window")
+                        .expect("checked above") = Value::from(window.min(threshold as u64));
+                }
+            }
+        }
         // The desktop build filters every model's ladder through a global
         // enabled-efforts set that defaults to low/medium/high/xhigh/ultra/
         // persistent and therefore has no `max`. A model that declares `max`
@@ -4249,6 +4275,7 @@ model_provider = "ai-switch"
     fn automatic_slot_plan() -> ClaudeEnvPlan {
         ClaudeEnvPlan {
             subagent_model: Some(CLAUDE_SUBAGENT_MODEL_ALIAS.to_string()),
+            auto_compact_window: None,
             fallback_model: None,
             slots: CLAUDE_MODEL_SLOTS
                 .iter()

@@ -6,6 +6,14 @@ fn default_route_proxy_request_body_limit_mib() -> u32 {
     DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB
 }
 
+fn default_long_conversation_compact_window() -> u32 {
+    272_000
+}
+
+fn default_pii_model_threshold_percent() -> u32 {
+    80
+}
+
 fn default_true() -> bool {
     true
 }
@@ -75,6 +83,31 @@ pub struct AppSettings {
     /// it removes `experimental_bearer_token` from the provider table.
     #[serde(default)]
     pub codex_keep_login_state: bool,
+    /// Replace secrets in outbound prompts with deterministic placeholders.
+    /// Off by default; a failure to mask blocks the request rather than
+    /// forwarding the original values.
+    #[serde(default)]
+    pub privacy_masking_enabled: bool,
+    /// `{"mask_secrets":true,"mask_emails":true,"custom_words":["…"]}`.
+    #[serde(default)]
+    pub privacy_mask_rules_json: Option<String>,
+    /// Optional local PII model. Disabled by default; enabling it requires a
+    /// one-time download of the model and ONNX Runtime into the plugin's data dir.
+    #[serde(default)]
+    pub pii_model_enabled: bool,
+    /// Global long-conversation mode: lower Codex's auto-compact threshold while
+    /// keeping the full upstream window, and inject the matching env key into
+    /// Claude Code's config.
+    #[serde(default)]
+    pub long_conversation_enabled: bool,
+    #[serde(default = "default_long_conversation_compact_window")]
+    pub long_conversation_compact_window: u32,
+    /// Mirror base URL for downloads. The pinned SHA-256 still applies.
+    #[serde(default)]
+    pub pii_model_mirror_base_url: Option<String>,
+    /// Minimum confidence for a model-detected span to be masked.
+    #[serde(default = "default_pii_model_threshold_percent")]
+    pub pii_model_threshold_percent: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +131,13 @@ pub struct AppSettingsView {
     pub proxy_url: Option<String>,
     pub route_proxy_request_body_limit_mib: u32,
     pub codex_keep_login_state: bool,
+    pub privacy_masking_enabled: bool,
+    pub privacy_mask_rules_json: Option<String>,
+    pub pii_model_enabled: bool,
+    pub pii_model_mirror_base_url: Option<String>,
+    pub pii_model_threshold_percent: u32,
+    pub long_conversation_enabled: bool,
+    pub long_conversation_compact_window: u32,
 }
 
 impl AppSettingsView {
@@ -122,6 +162,13 @@ impl AppSettingsView {
             proxy_url: settings.proxy_url,
             route_proxy_request_body_limit_mib: settings.route_proxy_request_body_limit_mib,
             codex_keep_login_state: settings.codex_keep_login_state,
+            privacy_masking_enabled: settings.privacy_masking_enabled,
+            privacy_mask_rules_json: settings.privacy_mask_rules_json,
+            pii_model_enabled: settings.pii_model_enabled,
+            long_conversation_enabled: settings.long_conversation_enabled,
+            long_conversation_compact_window: settings.long_conversation_compact_window,
+            pii_model_mirror_base_url: settings.pii_model_mirror_base_url,
+            pii_model_threshold_percent: settings.pii_model_threshold_percent,
         }
     }
 }
@@ -147,6 +194,13 @@ impl AppSettings {
             proxy_url: None,
             route_proxy_request_body_limit_mib: DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB,
             codex_keep_login_state: false,
+            privacy_masking_enabled: false,
+            privacy_mask_rules_json: None,
+            pii_model_enabled: false,
+            long_conversation_enabled: false,
+            long_conversation_compact_window: 272_000,
+            pii_model_mirror_base_url: None,
+            pii_model_threshold_percent: 80,
         }
     }
 }

@@ -52,6 +52,8 @@ pub mod route_proxy_diagnostics_service;
 pub mod route_proxy_https_service;
 pub mod route_proxy_https_trust;
 pub mod route_proxy_live_log;
+pub mod privacy_mask_service;
+pub mod pii_model;
 pub mod route_proxy_service;
 pub mod route_proxy_stream;
 pub mod route_quota_service;

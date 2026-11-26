@@ -72,6 +72,13 @@ mod tests {
             proxy_enabled: true,
             proxy_url: Some("http://127.0.0.1:7890".to_string()),
             codex_keep_login_state: true,
+            privacy_masking_enabled: false,
+            privacy_mask_rules_json: None,
+            pii_model_enabled: false,
+            long_conversation_enabled: false,
+            long_conversation_compact_window: 272_000,
+            pii_model_mirror_base_url: None,
+            pii_model_threshold_percent: 80,
         };
 
         SettingsService::save(&paths, &settings)

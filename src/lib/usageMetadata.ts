@@ -19,6 +19,8 @@ export type ParsedUsageMetadata = {
   traceId: string | null;
   /** Stringified because the proxy writes it as a number. */
   durationMs: string | null;
+  /** Time to first real output frame; null on legacy/buffered requests. */
+  ttftMs: string | null;
   errorMessage: string | null;
   requestedModel: string | null;
   upstreamModel: string | null;
@@ -32,6 +34,7 @@ const EMPTY_FIELDS = {
   targetUrl: null,
   traceId: null,
   durationMs: null,
+  ttftMs: null,
   errorMessage: null,
   requestedModel: null,
   upstreamModel: null,
@@ -180,6 +183,7 @@ export function parseUsageMetadata(metadataJson: string): ParsedUsageMetadata {
     targetUrl: field(record, "target_url"),
     traceId: field(record, "trace_id"),
     durationMs: field(record, "duration_ms"),
+    ttftMs: field(record, "ttft_ms"),
     errorMessage: field(record, "error_message"),
     requestedModel: field(record, "requested_model"),
     upstreamModel: field(record, "upstream_model"),

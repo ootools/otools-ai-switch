@@ -21,6 +21,7 @@ import { BatchesScreen } from "./screens/BatchesScreen";
 import { DashboardScreen } from "./screens/DashboardScreen";
 import { ImportsScreen } from "./screens/ImportsScreen";
 import { OperationLogScreen } from "./screens/OperationLogScreen";
+import { InsightsScreen } from "./screens/InsightsScreen";
 import { CryptoToolsScreen } from "./screens/CryptoToolsScreen";
 import { OcrScreen } from "./screens/OcrScreen";
 import { ProvidersScreen } from "./screens/ProvidersScreen";
@@ -51,6 +52,7 @@ const implementedScreens = new Set([
   "Sessions",
   "ClientSetup",
   "Log",
+  "Insights",
   "MCP",
   "Skills",
   "Stats",
@@ -220,6 +222,7 @@ export function App() {
                 {screen === "Traffic" && <TrafficScreen onBack={() => navigate(modalityScreenById.general)} />}
                 {screen === "About" && <AboutScreen />}
                 {screen === "Log" && <OperationLogScreen />}
+                {screen === "Insights" && <InsightsScreen />}
                 {!implementedScreens.has(screen) && (
                   <div className="rounded-2xl border border-stone-200 bg-white/80 p-5 text-sm text-stone-500 shadow-sm">
                     {screen}

@@ -150,7 +150,7 @@ fn parse_auth_json_inner(
     })
 }
 
-pub(super) async fn import_account(
+pub(crate) async fn import_account(
     pool: &SqlitePool,
     batch_name: &str,
     credential: ParsedOfficialCredential,

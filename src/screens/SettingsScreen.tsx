@@ -12,6 +12,7 @@ import { normalizeLanguage, supportedLanguages, useI18n, type Language } from ".
 import { normalizeThemePreference, type ThemePreference } from "../lib/theme";
 import { RouteProxyHttpsSettings } from "../components/settings/route-proxy-https-settings";
 import { NotificationSettings } from "../components/settings/notification-settings";
+import { PiiModelSettings } from "../components/settings/PiiModelSettings";
 import { UsageStorageSettings } from "../components/settings/usage-storage-settings";
 import { useState } from "react";
 import { MotionPresence } from "../components/motion/MotionPrimitives";
@@ -25,17 +26,21 @@ import {
 
 type FeatureEntry = {
   screen?: string;
-  section?: "https" | "notification";
+  section?: "https" | "notification" | "privacy";
   titleKey:
     | "nav.sessions"
     | "nav.log"
     | "settings.https.title"
-    | "notification.title";
+    | "notification.title"
+    | "settings.privacy.title"
+    | "nav.insights";
   descriptionKey:
     | "settings.feature.sessions"
     | "settings.feature.log"
     | "settings.feature.https"
-    | "notification.subtitle";
+    | "notification.subtitle"
+    | "settings.feature.privacy"
+    | "settings.feature.insights";
   icon: ComponentType<{ className?: string }>;
 };
 
@@ -58,6 +63,18 @@ const featureEntries: FeatureEntry[] = [
     titleKey: "settings.https.title",
     descriptionKey: "settings.feature.https",
     icon: LockKeyhole,
+  },
+  {
+    section: "notification",
+    titleKey: "settings.privacy.title",
+    descriptionKey: "settings.feature.privacy",
+    icon: LockKeyhole,
+  },
+  {
+    screen: "Insights",
+    titleKey: "nav.insights",
+    descriptionKey: "settings.feature.insights",
+    icon: Network,
   },
   {
     section: "notification",
@@ -89,7 +106,7 @@ export function SettingsScreen({
 }: SettingsScreenProps) {
   const queryClient = useQueryClient();
   const { language, setLanguage, t } = useI18n();
-  const [activeSection, setActiveSection] = useState<"https" | "notification">("notification");
+  const [activeSection, setActiveSection] = useState<"https" | "notification" | "privacy">("notification");
   const [localModalityVisibility, setLocalModalityVisibility] = useState(createDefaultModalityVisibility);
   // Proxy drafts as `null` = "follow the loaded settings"; they overlay the
   // settings while the user edits. Hooks stay above the loading early-returns.
@@ -98,6 +115,9 @@ export function SettingsScreen({
   const [proxyError, setProxyError] = useState<string | null>(null);
   const [requestBodyLimitDraft, setRequestBodyLimitDraft] = useState<string | null>(null);
   const [requestBodyLimitError, setRequestBodyLimitError] = useState(false);
+  const [compactWindowDraft, setCompactWindowDraft] = useState<string | null>(null);
+  const [privacyRulesDraft, setPrivacyRulesDraft] = useState<string | null>(null);
+  const [privacyRuleError, setPrivacyRuleError] = useState(false);
   const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings });
   const saveMutation = useMutation({
     mutationFn: saveSettings,
@@ -237,6 +257,76 @@ export function SettingsScreen({
             <RouteProxyHttpsSettings />
           </motion.div>
         )}
+        {activeSection === "privacy" && (
+          <motion.div
+            key="settings-privacy"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+              <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.privacy.title")}</h2>
+              <label className="flex items-center gap-2 text-[13px] font-medium text-stone-700">
+                <input
+                  aria-label={t("settings.privacy.title")}
+                  checked={settings.privacy_masking_enabled ?? false}
+                  className="accent-blue-600"
+                  onChange={(event) =>
+                    saveMutation.mutate({
+                      ...settings,
+                      privacy_masking_enabled: event.target.checked,
+                    })
+                  }
+                  type="checkbox"
+                />
+                开启本地脱敏
+              </label>
+              <label className="flex flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+                规则（JSON）
+                <textarea
+                  aria-label="隐私脱敏规则 JSON"
+                  className="min-h-24 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 font-mono text-[12px] outline-none focus:border-blue-400"
+                  onChange={(event) => {
+                    setPrivacyRulesDraft(event.target.value);
+                    setPrivacyRuleError(false);
+                  }}
+                  value={
+                    privacyRulesDraft ??
+                    settings.privacy_mask_rules_json ??
+                    '{"mask_secrets":true,"mask_emails":true,"custom_words":[]}'
+                  }
+                />
+              </label>
+              {privacyRuleError ? (
+                <p className="text-[12px] text-red-700" role="alert">规则不是合法 JSON。</p>
+              ) : null}
+              <button
+                className="rounded-xl border border-stone-300 bg-white px-3 py-2 text-[12px] font-semibold text-stone-700 motion-control hover:bg-stone-50"
+                onClick={() => {
+                  const text =
+                    privacyRulesDraft ??
+                    settings.privacy_mask_rules_json ??
+                    '{"mask_secrets":true,"mask_emails":true,"custom_words":[]}';
+                  try {
+                    JSON.parse(text);
+                    setPrivacyRuleError(false);
+                    saveMutation.mutate({ ...settings, privacy_mask_rules_json: text });
+                  } catch {
+                    setPrivacyRuleError(true);
+                  }
+                }}
+                type="button"
+              >
+                保存规则
+              </button>
+              <p className="text-[11px] leading-5 text-stone-500">
+                v1 规则识别密钥 / 令牌、邮箱和自定义词；可选本地模型进一步识别姓名与地址（见下方）。
+              </p>
+              <PiiModelSettings settings={settings} />
+            </div>
+          </motion.div>
+        )}
         {activeSection === "notification" && (
           <motion.div
             key="settings-notification"
@@ -275,6 +365,50 @@ export function SettingsScreen({
         {requestBodyLimitError && (
           <p role="alert" className="text-[12px] font-medium text-red-700">{t("settings.requestBodyLimit.invalid")}</p>
         )}
+      </div>
+
+      <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">
+        <h2 className="text-[15px] font-semibold text-stone-950">{t("settings.longConversation.title")}</h2>
+        <p className="text-[12px] text-stone-500">{t("settings.longConversation.hint")}</p>
+        <label className="flex max-w-xl items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2.5 text-[12px] font-semibold text-stone-700">
+          <input
+            aria-label={t("settings.longConversation.enable")}
+            checked={settings.long_conversation_enabled ?? false}
+            className="mt-0.5"
+            disabled={saveMutation.isPending}
+            onChange={(event) =>
+              saveMutation.mutate({
+                ...settings,
+                long_conversation_enabled: event.target.checked,
+              })
+            }
+            type="checkbox"
+          />
+          <span>{t("settings.longConversation.enable")}</span>
+        </label>
+        <label className="flex max-w-sm flex-col gap-1.5 text-[12px] font-semibold text-stone-600">
+          <span>{t("settings.longConversation.window")}</span>
+          <input
+            aria-label={t("settings.longConversation.window")}
+            className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-[13px] font-medium text-stone-900 shadow-sm outline-none motion-control focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            disabled={saveMutation.isPending}
+            min={1}
+            step={1000}
+            type="number"
+            value={compactWindowDraft ?? settings.long_conversation_compact_window ?? 272000}
+            onChange={(event) => setCompactWindowDraft(event.target.value)}
+            onBlur={() => {
+              const value = Number(compactWindowDraft);
+              if (Number.isInteger(value) && value > 0) {
+                saveMutation.mutate({
+                  ...settings,
+                  long_conversation_compact_window: value,
+                });
+              }
+              setCompactWindowDraft(null);
+            }}
+          />
+        </label>
       </div>
 
       <div className="space-y-3 rounded-2xl border border-stone-200 bg-white/82 p-4 shadow-sm">

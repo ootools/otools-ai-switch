@@ -14,25 +14,26 @@ use uuid::Uuid;
 
 pub struct RoutePoolRepository;
 
-/// Pull the two request stats the account list reads out of the metadata JSON,
-/// so they can be stored as real columns beside it.
+/// Pull the request stats the account list and speed aggregates read out of
+/// `metadata_json`, so they can be stored as real columns beside it.
 ///
-/// Returns `(success, duration_ms)` as nullable columns. Anything that isn't a
-/// clean value — unparseable JSON, a missing key, a non-numeric duration — maps
-/// to `None`, which is byte-for-byte the pre-migration state the list already
-/// treats as "not a success" / "no timing". `success` is stored as SQLite's
-/// 1/0, matching what `json_extract(..., '$.success')` returned for the boolean
-/// the aggregates compared against `= 1`.
-fn request_stat_columns(metadata_json: &str) -> (Option<i64>, Option<i64>) {
+/// Returns `(success, duration_ms, ttft_ms)` as nullable columns. Anything that
+/// isn't a clean value — unparseable JSON, a missing key, a non-numeric value —
+/// maps to `None`, which is the pre-migration state the readers already treat
+/// as "not a success" / "no timing" / "no TTFT sample". `success` is stored as
+/// SQLite's 1/0, matching what `json_extract(..., '$.success')` returned for the
+/// boolean the aggregates compared against `= 1`.
+fn request_stat_columns(metadata_json: &str) -> (Option<i64>, Option<i64>, Option<i64>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
-        return (None, None);
+        return (None, None, None);
     };
     let success = value
         .get("success")
         .and_then(serde_json::Value::as_bool)
         .map(i64::from);
     let duration_ms = value.get("duration_ms").and_then(serde_json::Value::as_i64);
-    (success, duration_ms)
+    let ttft_ms = value.get("ttft_ms").and_then(serde_json::Value::as_i64);
+    (success, duration_ms, ttft_ms)
 }
 
 /// 统一账号池（G-P8 P4a）的池身份：所有账号、组、成员都在这一个池里。
@@ -1150,15 +1151,15 @@ impl RoutePoolRepository {
         metadata_json: &str,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
-        // Mirror `success`/`duration_ms` into their columns for the request rows
-        // this path also writes (route_pool routing calls come through here).
-        // Token and cost rows carry neither key, so both stay NULL — which is
-        // exactly what the request-only aggregates expect to skip.
-        let (success, duration_ms) = request_stat_columns(metadata_json);
+        // Mirror `success`/`duration_ms`/`ttft_ms` into their columns for the
+        // request rows this path also writes (route_pool routing calls come
+        // through here). Token and cost rows carry none of them, so all stay
+        // NULL — exactly what the request-only aggregates expect to skip.
+        let (success, duration_ms, ttft_ms) = request_stat_columns(metadata_json);
         sqlx::query(
             "INSERT INTO usage_events
-             (id, route_credential_id, source_label, metric_type, amount, unit, metadata_json, success, duration_ms, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, route_credential_id, source_label, metric_type, amount, unit, metadata_json, success, duration_ms, ttft_ms, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(account_id)
@@ -1169,6 +1170,7 @@ impl RoutePoolRepository {
         .bind(metadata_json)
         .bind(success)
         .bind(duration_ms)
+        .bind(ttft_ms)
         .bind(&now)
         .execute(pool)
         .await
@@ -1191,22 +1193,22 @@ impl RoutePoolRepository {
         upstream_response_id: Option<&str>,
     ) -> Result<(), AppError> {
         let now = Utc::now().to_rfc3339();
-        // The account list reads these two from real columns now, so lift them
+        // The account list reads these from real columns now, so lift them
         // out of the metadata document at write time. Parsing one small object
         // on the write path is cheap; it spares every list refresh from having
         // to `json_extract` them out of a blob padded with the response preview.
         // `metadata_json` stays the source of truth other readers rely on, so a
         // parse failure or a missing key simply leaves the column NULL — exactly
         // the state a pre-migration row is in, which the aggregates already read
-        // as "not a success" / "no timing".
-        let (success, duration_ms) = request_stat_columns(metadata_json);
+        // as "not a success" / "no timing" / "no TTFT sample".
+        let (success, duration_ms, ttft_ms) = request_stat_columns(metadata_json);
         sqlx::query(
             "INSERT INTO usage_events
              (id, route_credential_id, source_label, metric_type, amount, unit,
               metadata_json, input_tokens, output_tokens, cache_tokens,
               price_usd_micros, price_cny_micros, price_currency, price_source,
-              upstream_response_id, success, duration_ms, created_at)
-             VALUES (?, ?, ?, 'request', 1, 'count', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              upstream_response_id, success, duration_ms, ttft_ms, created_at)
+             VALUES (?, ?, ?, 'request', 1, 'count', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(account_id)
@@ -1222,6 +1224,7 @@ impl RoutePoolRepository {
         .bind(upstream_response_id)
         .bind(success)
         .bind(duration_ms)
+        .bind(ttft_ms)
         .bind(&now)
         .execute(pool)
         .await
@@ -1251,8 +1254,23 @@ impl RoutePoolRepository {
         pool: &SqlitePool,
         since: Option<&str>,
     ) -> Result<Vec<ProxyRequestRow>, AppError> {
+        Self::list_request_events_in_window(pool, since, None).await
+    }
+
+    /// Bounded version used by CSV export: a custom window has an explicit end
+    /// and must not drag the whole history out of SQLite.
+    pub async fn list_request_events_in_window(
+        pool: &SqlitePool,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<ProxyRequestRow>, AppError> {
         let since_clause = if since.is_some() {
             " AND ue.created_at >= ?"
+        } else {
+            ""
+        };
+        let until_clause = if until.is_some() {
+            " AND ue.created_at < ?"
         } else {
             ""
         };
@@ -1265,15 +1283,19 @@ impl RoutePoolRepository {
                     ue.metadata_json, ue.created_at,
                     ue.input_tokens, ue.output_tokens, ue.cache_tokens,
                     ue.price_usd_micros, ue.price_cny_micros, ue.price_currency,
-                    ue.price_source, ue.upstream_response_id
+                    ue.price_source, ue.upstream_response_id,
+                    ue.success, ue.duration_ms, ue.ttft_ms
              FROM usage_events ue
              LEFT JOIN route_credentials a ON a.id = ue.route_credential_id
-             WHERE ue.metric_type = 'request'{since_clause}
+             WHERE ue.metric_type = 'request'{since_clause}{until_clause}
              ORDER BY ue.created_at DESC, ue.id DESC"
         );
         let mut query = sqlx::query(&sql);
         if let Some(since) = since {
             query = query.bind(since);
+        }
+        if let Some(until) = until {
+            query = query.bind(until);
         }
         let rows = query
             .fetch_all(pool)
@@ -1303,6 +1325,9 @@ impl RoutePoolRepository {
                 price_currency: row.get("price_currency"),
                 price_source: row.get("price_source"),
                 upstream_response_id: row.get("upstream_response_id"),
+                success: row.get("success"),
+                duration_ms: row.get("duration_ms"),
+                ttft_ms: row.get("ttft_ms"),
             })
             .collect())
     }

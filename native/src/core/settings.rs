@@ -40,6 +40,15 @@ pub async fn save_settings_core(
     // behaving the way the persisted settings still describe.
     close_to_tray.set_enabled(settings.close_to_tray);
     route_proxy.set_request_body_limit_mib(settings.route_proxy_request_body_limit_mib);
+    route_proxy.set_privacy_masking(
+        settings.privacy_masking_enabled,
+        settings.privacy_mask_rules_json.clone(),
+    );
+    crate::services::pii_model::pii_model_runtime()
+        .set_enabled(
+            settings.pii_model_enabled,
+            settings.pii_model_threshold_percent,
+        );
     // Same order rule: the env now matches what was actually persisted. An
     // explicit disable clears the vars; clients built afterwards pick it up.
     proxy_service::apply(&settings);

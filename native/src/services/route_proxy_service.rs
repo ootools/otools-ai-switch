@@ -95,7 +95,7 @@ use sqlx::{Row, SqlitePool};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -474,6 +474,8 @@ pub struct RouteProxyRuntimeState {
     active_attempts: RouteProxyActiveAttemptRegistry,
     live_log: RouteProxyLiveLog,
     request_body_limit_mib: Arc<AtomicU32>,
+    privacy_masking_enabled: Arc<AtomicBool>,
+    privacy_mask_rules_json: Arc<std::sync::RwLock<Option<String>>>,
     #[cfg(test)]
     test_listen_port: u16,
 }
@@ -488,6 +490,8 @@ impl Default for RouteProxyRuntimeState {
             request_body_limit_mib: Arc::new(AtomicU32::new(
                 DEFAULT_ROUTE_PROXY_REQUEST_BODY_LIMIT_MIB,
             )),
+            privacy_masking_enabled: Arc::new(AtomicBool::new(false)),
+            privacy_mask_rules_json: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             test_listen_port: 0,
         }
@@ -562,6 +566,8 @@ pub(crate) struct ProxyAppState {
     proxy_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
     /// Shared with the runtime so saving settings affects existing listeners.
     request_body_limit_mib: Arc<AtomicU32>,
+    privacy_masking_enabled: Arc<AtomicBool>,
+    privacy_mask_rules_json: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -658,6 +664,14 @@ impl RouteProxyRuntimeState {
         self.request_body_limit_mib.store(limit_mib, Ordering::Relaxed);
     }
 
+    /// Update the live masking configuration without restarting the listener.
+    pub fn set_privacy_masking(&self, enabled: bool, rules_json: Option<String>) {
+        self.privacy_masking_enabled.store(enabled, Ordering::Relaxed);
+        if let Ok(mut current) = self.privacy_mask_rules_json.write() {
+            *current = rules_json;
+        }
+    }
+
     pub fn activity(&self) -> RouteCredentialActivityRegistry {
         self.activity.clone()
     }
@@ -731,6 +745,8 @@ pub(crate) fn build_proxy_state(
         upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
         proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
         request_body_limit_mib: runtime.request_body_limit_mib.clone(),
+        privacy_masking_enabled: runtime.privacy_masking_enabled.clone(),
+        privacy_mask_rules_json: runtime.privacy_mask_rules_json.clone(),
     }
 }
 
@@ -1191,6 +1207,101 @@ async fn forward_request_in_generation(
                 format!("Could not read proxy request body: {err}")
             }
         })?;
+
+    // Local privacy masking happens while the body is still one buffer, before
+    // model rewriting and before compression. Retry attempts reuse the same
+    // bytes, so every attempt carries identical placeholders.
+    let privacy_rules_json = state
+        .privacy_mask_rules_json
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let privacy_rules = crate::services::privacy_mask_service::PrivacyRules::from_json(
+        privacy_rules_json.as_deref(),
+    );
+    let privacy_enabled = state.privacy_masking_enabled.load(Ordering::Relaxed)
+        && headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("application/json"));
+    let (body_bytes, mask_records, model_labels): (
+        axum::body::Bytes,
+        Option<std::sync::Arc<crate::services::privacy_mask_service::MaskRecords>>,
+        std::collections::HashMap<String, String>,
+    ) = if privacy_enabled {
+        let model = crate::services::pii_model::pii_model_runtime();
+        let entries = crate::services::privacy_mask_service::collect_json_strings(&body_bytes)
+            .unwrap_or_default();
+        let texts: Vec<&str> = entries.iter().map(|(_, text)| text.as_str()).collect();
+        let detected = if model.enabled() {
+            match model.detect_all(&texts) {
+                Ok(spans) => spans,
+                Err(error) => {
+                    return Err(format!(
+                        "route_proxy.pii_detection_failed: 本地 PII 模型不可用（{error}）。请到 设置 → 隐私脱敏 下载或修复模型；本次请求未发送。"
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let by_path: std::collections::HashMap<String, Vec<crate::services::pii_model::ModelSpan>> =
+            entries
+                .iter()
+                .zip(detected)
+                .map(|((path, _), spans)| (path.clone(), spans))
+                .collect();
+        match crate::services::privacy_mask_service::mask_body_with_detector(
+            &body_bytes,
+            &privacy_rules,
+            |path, _text| by_path.get(path).cloned().unwrap_or_default(),
+        ) {
+            Ok((masked, records, labels)) => (
+                axum::body::Bytes::from(masked),
+                Some(std::sync::Arc::new(records)),
+                labels,
+            ),
+            // Fail closed: never forward the original secrets because the
+            // masker could not parse this document.
+            Err(error) => {
+                return Err(format!("route_proxy.masking_failed: Cannot mask this request safely: {error}"));
+            }
+        }
+    } else {
+        (body_bytes, None, std::collections::HashMap::new())
+    };
+
+    // Audit rows keep only the placeholder and the value's shape — never the
+    // original secret itself.
+    if let Some(records) = &mask_records {
+        let now = chrono::Utc::now().to_rfc3339();
+        for (placeholder, original) in records.iter().take(50) {
+            let kind = if let Some(label) = model_labels.get(placeholder) {
+                format!("model:{label}")
+            } else if original.starts_with("sk-") {
+                "api_key".to_string()
+            } else if original.contains('@') {
+                "email".to_string()
+            } else {
+                "custom_word".to_string()
+            };
+            let prefix: String = original.chars().take(2).collect();
+            let _ = sqlx::query(
+                "INSERT INTO privacy_mask_audit
+                 (id, occurred_at, platform, rule_kind, placeholder, direction, char_length, prefix)
+                 VALUES (?, ?, ?, ?, ?, 'mask', ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&now)
+            .bind(&platform)
+            .bind(kind)
+            .bind(placeholder)
+            .bind(original.chars().count() as i64)
+            .bind(prefix)
+            .execute(pool)
+            .await;
+        }
+    }
 
     // Anthropic's token-counting endpoint, answered locally. No bridge can
     // convert it, and most third-party relays do not implement it — forwarding
@@ -1846,6 +1957,7 @@ async fn forward_request_in_generation(
                 quota_failure_recorded: false,
                 client_headers: outbound_headers.clone(),
                 upstream_query: upstream_query.clone(),
+                mask_records: mask_records.clone(),
                 _activity_lease: activity_lease,
             };
             let body = Body::from_stream(observed_audio_stream(
@@ -1896,6 +2008,7 @@ async fn forward_request_in_generation(
                             .map(str::to_string),
                         tool_namespaces.clone(),
                         custom_tool_names.clone(),
+                        mask_records.clone(),
                     )
                 });
             let mut stream = Box::pin(upstream.bytes_stream());
@@ -2220,6 +2333,7 @@ async fn forward_request_in_generation(
                 quota_failure_recorded: false,
                 client_headers: outbound_headers.clone(),
                 upstream_query: upstream_query.clone(),
+                mask_records: mask_records.clone(),
                 // Held until the stream ends so the account's concurrency slot
                 // is not handed out while this response is still in flight.
                 _activity_lease: activity_lease,
@@ -2443,6 +2557,13 @@ async fn forward_request_in_generation(
             response_bytes =
                 restore_custom_tools_in_responses_payload(&response_bytes, &custom_tool_names)
                     .into();
+        }
+        if let Some(records) = &mask_records {
+            let restored = crate::services::privacy_mask_service::restore_placeholders(
+                &String::from_utf8_lossy(&response_bytes),
+                records,
+            );
+            response_bytes = axum::body::Bytes::from(restored.into_bytes());
         }
         // Capture official subscription/quota signals (e.g. Grok free-usage-exhausted).
         let quota_exhausted = if credential.kind == "official" {
@@ -3122,6 +3243,29 @@ fn route_proxy_request_metadata(
         }
     }
     metadata.to_string()
+}
+
+/// Attach a sampled time-to-first-token to a finished metadata document.
+///
+/// Only the streaming finish path knows when the first real output frame
+/// arrived; every other caller (buffered replies, pre-send failures, retries)
+/// legitimately has no sample and keeps the document unchanged. The value is
+/// also read back into a real column by `request_stat_columns`, so it must use
+/// the same `ttft_ms` key the migration backfills from.
+fn with_ttft_ms(metadata: String, ttft_ms: Option<i64>) -> String {
+    let Some(ttft_ms) = ttft_ms else {
+        return metadata;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&metadata) else {
+        return metadata;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("ttft_ms".to_string(), json!(ttft_ms));
+        if let Ok(text) = serde_json::to_string(&value) {
+            return text;
+        }
+    }
+    metadata
 }
 
 /// Cap one response preview and hand it back as plain text.
@@ -4069,6 +4213,8 @@ struct StreamCompletion {
     client_headers: HeaderMap,
     /// 原请求的 query（如 `beta=true`）；重建续写 URL 需要。
     upstream_query: Option<String>,
+    /// Placeholders used on this request, for restoring the streamed reply.
+    mask_records: Option<std::sync::Arc<crate::services::privacy_mask_service::MaskRecords>>,
     _activity_lease: RouteCredentialActivityLease,
 }
 
@@ -4132,12 +4278,21 @@ impl StreamCompletion {
             quota_failure_recorded,
             client_headers: _client_headers,
             upstream_query: _upstream_query,
+            mask_records: _mask_records,
             _activity_lease,
         } = self;
         drop(active_attempt);
 
         let preview = observer.preview().to_vec();
         let outcome = observer.finish();
+        // Wall-clock `duration_ms` keeps its meaning (whole request). TTFT is a
+        // separate sample: first real output frame minus the same start instant.
+        // A stream that produced no content has no sample, not a zero.
+        let ttft_ms = outcome.first_content_at.map(|first_content_at| {
+            first_content_at
+                .saturating_duration_since(request_start)
+                .as_millis() as i64
+        });
         let truncated = outcome.disconnected_before_completion;
         // Prefer the upstream's own failure sentence whenever it sent one. The
         // context-limit classifier already narrows *when* that sentence changes
@@ -4159,21 +4314,24 @@ impl StreamCompletion {
             .or_else(|| requested_model.clone());
         apply_estimated_price(&mut usage, priced_model.as_deref());
 
-        let metadata = route_proxy_request_metadata(
-            attempt,
-            &platform,
-            client_key.as_deref(),
-            &credential,
-            &path,
-            Some(&target_url),
-            Some(status.as_u16()),
-            !truncated,
-            trace_id.as_deref(),
-            request_start,
-            error_message.as_deref(),
-            requested_model.as_deref(),
-            upstream_model.as_deref(),
-            Some(&preview),
+        let metadata = with_ttft_ms(
+            route_proxy_request_metadata(
+                attempt,
+                &platform,
+                client_key.as_deref(),
+                &credential,
+                &path,
+                Some(&target_url),
+                Some(status.as_u16()),
+                !truncated,
+                trace_id.as_deref(),
+                request_start,
+                error_message.as_deref(),
+                requested_model.as_deref(),
+                upstream_model.as_deref(),
+                Some(&preview),
+            ),
+            ttft_ms,
         );
         let _ = insert_route_credential_request_event(
             &state,
@@ -4311,6 +4469,9 @@ struct StreamResponseTransform {
     saw_block: bool,
     finished: bool,
     item_holdback: crate::services::route_stream_continuation::ResponsesItemHoldback,
+    /// Placeholders to restore in streamed text. Tool-call argument fragments
+    /// are intentionally not restored in v1.
+    mask_records: Option<std::sync::Arc<crate::services::privacy_mask_service::MaskRecords>>,
 }
 
 /// The request facts the whole-body fallback needs.
@@ -4329,11 +4490,13 @@ impl StreamResponseTransform {
         content_type: Option<String>,
         tool_namespaces: std::collections::BTreeMap<String, String>,
         custom_tool_names: std::collections::HashSet<String>,
+        mask_records: Option<std::sync::Arc<crate::services::privacy_mask_service::MaskRecords>>,
     ) -> Self {
         Self {
             framer: crate::services::route_proxy_stream::SseFramer::new(),
             bridge: Some(bridge),
             custom_tool_names,
+            mask_records,
             whole_body: Some(WholeBodyTransform {
                 kind,
                 status: status.as_u16(),
@@ -4368,6 +4531,10 @@ impl StreamResponseTransform {
     /// 工具名恢复之后再暂存，首次流和续写都不会泄漏半截调用。
     fn hold_restored_records(&mut self, text: &str) -> Result<String, String> {
         let text = self.restore_custom_tools(text);
+        let text = match &self.mask_records {
+            Some(records) => crate::services::privacy_mask_service::restore_placeholders(&text, records),
+            None => text,
+        };
         let mut output = String::new();
         for block in text.split("\n\n").filter(|block| !block.trim().is_empty()) {
             for block in self.item_holdback.push_block(block)? {
@@ -14084,6 +14251,7 @@ mod tests {
                             Some(content_type.to_string()),
                             namespaces.clone(),
                             custom_tools.clone(),
+                            None,
                         );
                         let mut streamed = Vec::new();
                         for chunk in body.as_bytes().chunks(chunk_size) {
@@ -18542,6 +18710,8 @@ data: [DONE]\n\n";
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+            privacy_masking_enabled: Arc::new(AtomicBool::new(false)),
+            privacy_mask_rules_json: Arc::new(std::sync::RwLock::new(None)),
         };
 
         let mut headers = HeaderMap::new();
@@ -18613,6 +18783,8 @@ data: [DONE]\n\n";
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+            privacy_masking_enabled: Arc::new(AtomicBool::new(false)),
+            privacy_mask_rules_json: Arc::new(std::sync::RwLock::new(None)),
         };
 
         let error = resolve_platform(&state, &HeaderMap::new(), None)
@@ -18645,6 +18817,8 @@ data: [DONE]\n\n";
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+            privacy_masking_enabled: Arc::new(AtomicBool::new(false)),
+            privacy_mask_rules_json: Arc::new(std::sync::RwLock::new(None)),
         };
 
         let key = "sk-invalid";
@@ -18687,6 +18861,8 @@ data: [DONE]\n\n";
             upstream_timeouts: ProxyAppState::default_upstream_timeouts(),
             proxy_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_body_limit_mib: RouteProxyRuntimeState::default().request_body_limit_mib,
+            privacy_masking_enabled: Arc::new(AtomicBool::new(false)),
+            privacy_mask_rules_json: Arc::new(std::sync::RwLock::new(None)),
         };
 
         let mut headers = HeaderMap::new();

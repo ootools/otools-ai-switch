@@ -52,6 +52,11 @@ pub struct UsageOverviewRow {
     /// HTTP status, only ever present on a row with a proxy side.
     pub status: Option<String>,
     pub success: bool,
+    /// Whole-request wall time on the proxy side. NULL on transcript-only rows.
+    pub duration_ms: Option<i64>,
+    /// Time to the first real output frame. NULL on transcript-only rows and
+    /// on streams that never produced content.
+    pub ttft_ms: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_write_tokens: i64,
@@ -72,6 +77,69 @@ pub struct UsageOverviewTotals {
     pub cache_write_tokens: i64,
     pub cache_read_tokens: i64,
     pub cost_micros: i64,
+}
+
+/// Speed metrics computed over proxy-backed rows only.
+///
+/// A CLI transcript has no HTTP timing, so including it would silently mix
+/// "no sample" into "slow". Both halves carry their sample count so the UI can
+/// say how many requests actually support the number. TPS is stored as tokens
+/// per 1000 ms (`_milli`) to stay integer all the way through the IPC boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageOverviewSpeed {
+    pub ttft_sample_count: i64,
+    pub ttft_p50_ms: Option<i64>,
+    pub ttft_p95_ms: Option<i64>,
+    pub tps_sample_count: i64,
+    pub tps_p50_milli: Option<i64>,
+    pub tps_p95_milli: Option<i64>,
+}
+
+/// Nearest-rank percentile on an already sorted slice. `p` is 0..=1.
+fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = (((sorted.len() - 1) as f64) * p).round() as usize;
+    sorted.get(index).copied()
+}
+
+/// Derive TTFT / output-throughput percentiles from the merged rows.
+///
+/// Hard exclusions, in order: transcript-only rows (no proxy timing), failed
+/// requests (a failure's duration says nothing about generation speed), and
+/// missing/negative timings. TTFT needs its own sample; TPS additionally needs
+/// output tokens and a positive generation window.
+fn speed_stats(rows: &[UsageOverviewRow]) -> UsageOverviewSpeed {
+    let mut ttft_samples = Vec::new();
+    let mut tps_samples = Vec::new();
+    for row in rows {
+        if row.source == UsageRowSource::SessionOnly || !row.success {
+            continue;
+        }
+        let Some(duration_ms) = row.duration_ms.filter(|value| *value >= 0) else {
+            continue;
+        };
+        if let Some(ttft_ms) = row.ttft_ms.filter(|value| *value >= 0 && *value <= duration_ms) {
+            ttft_samples.push(ttft_ms);
+            let generation_ms = duration_ms - ttft_ms;
+            if generation_ms > 0 && row.output_tokens > 0 {
+                // tok/s = tokens / (generation_ms / 1000). Store tok/s × 1000
+                // so fractional rates survive the integer IPC boundary.
+                tps_samples.push(row.output_tokens.saturating_mul(1_000_000) / generation_ms);
+            }
+        }
+    }
+    ttft_samples.sort_unstable();
+    tps_samples.sort_unstable();
+    UsageOverviewSpeed {
+        ttft_sample_count: ttft_samples.len() as i64,
+        ttft_p50_ms: percentile(&ttft_samples, 0.50),
+        ttft_p95_ms: percentile(&ttft_samples, 0.95),
+        tps_sample_count: tps_samples.len() as i64,
+        tps_p50_milli: percentile(&tps_samples, 0.50),
+        tps_p95_milli: percentile(&tps_samples, 0.95),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +241,7 @@ pub struct UsageOverviewIntegrity {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageOverview {
     pub totals: UsageOverviewTotals,
+    pub speed: UsageOverviewSpeed,
     pub rows: Vec<UsageOverviewRow>,
     pub groups: UsageOverviewGroups,
     pub series: UsageTrendSeries,
@@ -362,6 +431,8 @@ fn merged_row(entry: SessionUsageEntry, proxy: ProxyRequestRow) -> UsageOverview
         path: facts.path,
         status: facts.status,
         success: facts.success,
+        duration_ms: proxy.duration_ms,
+        ttft_ms: proxy.ttft_ms,
         input_tokens: entry.usage.input_tokens.max(0),
         output_tokens: entry.usage.output_tokens.max(0),
         cache_write_tokens: entry.usage.cache_write_tokens.max(0),
@@ -392,6 +463,9 @@ fn session_only_row(entry: SessionUsageEntry, index: usize) -> UsageOverviewRow 
         // that returned usage, so it succeeded.
         status: None,
         success: true,
+        // A transcript carries no HTTP timing at all — never invent one.
+        duration_ms: None,
+        ttft_ms: None,
         input_tokens: entry.usage.input_tokens.max(0),
         output_tokens: entry.usage.output_tokens.max(0),
         cache_write_tokens: entry.usage.cache_write_tokens.max(0),
@@ -430,6 +504,8 @@ fn proxy_only_row(row: ProxyRequestRow) -> UsageOverviewRow {
         path: facts.path,
         status: facts.status,
         success: facts.success,
+        duration_ms: row.duration_ms,
+        ttft_ms: row.ttft_ms,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_write_tokens: usage.cache_write_tokens,
@@ -934,6 +1010,7 @@ fn assemble_overview(
 
     let rows = merge_entries(session_entries, proxy_rows);
     let totals = summarize(&rows);
+    let speed = speed_stats(&rows);
     let groups = group_all(&rows);
     let series = build_trend_series(&rows, frame);
     let integrity = integrity_of(
@@ -945,6 +1022,7 @@ fn assemble_overview(
 
     UsageOverview {
         totals,
+        speed,
         row_count: rows.len() as i64,
         rows: paginate(&rows, page, page_size),
         groups,
@@ -952,6 +1030,99 @@ fn assemble_overview(
         page,
         page_size,
         integrity,
+    }
+}
+
+/// A bounded CSV export: the UI aggregates over the whole window, so an export
+/// must not be limited to the one page currently on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCsv {
+    /// UTF-8 with BOM (Excel opens it with the right codepage).
+    pub content: String,
+    pub row_count: i64,
+    pub truncated: bool,
+}
+
+/// RFC-4180 quoting: wrap fields containing a comma, quote or newline and
+/// double embedded quotes. Everything else is written verbatim.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Cap rows per export so a multi-year history cannot OOM the host. The flag
+/// travels back to the UI, which states the truncation rather than silently
+/// handing out a partial file.
+const CSV_MAX_ROWS: usize = 50_000;
+
+/// Export every merged request in a window as CSV.
+///
+/// Unlike `build_usage_overview` this does not paginate: the export has to
+/// cover the same window the summary cards describe. It reuses `merge_entries`
+/// so deduplication on the upstream response id is identical to the UI's.
+pub async fn export_usage_csv(
+    pool: &SqlitePool,
+    since: Option<&str>,
+    until: Option<&str>,
+    window: TimeWindow,
+) -> Result<UsageCsv, AppError> {
+    let proxy_rows =
+        RoutePoolRepository::list_request_events_in_window(pool, since, until).await?;
+    let (session_entries, _scanned, _truncated) =
+        tokio::task::spawn_blocking(move || session_usage_service::collect_session_entries(window))
+            .await
+            .map_err(|error| AppError::Filesystem {
+                code: "filesystem.session_usage_scan_failed",
+                message: format!("Failed to scan session usage: {error}"),
+                details: None,
+                recoverable: true,
+            })?;
+    let rows = merge_entries(session_entries, proxy_rows);
+    Ok(serialize_usage_csv(&rows))
+}
+
+/// Serialize rows without any IO, so quoting and the row cap can be unit tested.
+fn serialize_usage_csv(rows: &[UsageOverviewRow]) -> UsageCsv {
+    let mut out = String::from("\u{feff}occurred_at,source,provider,model,account,status,success,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd,price_source,duration_ms,ttft_ms\n");
+    for row in rows.iter().take(CSV_MAX_ROWS) {
+        let fields = [
+            row.occurred_at.clone().unwrap_or_default(),
+            match row.source {
+                UsageRowSource::Matched => "matched",
+                UsageRowSource::SessionOnly => "session_only",
+                UsageRowSource::ProxyOnly => "proxy_only",
+            }
+            .to_string(),
+            row.provider.clone(),
+            row.model.clone(),
+            row.account_name.clone().unwrap_or_default(),
+            row.status.clone().unwrap_or_default(),
+            row.success.to_string(),
+            row.input_tokens.to_string(),
+            row.output_tokens.to_string(),
+            row.cache_read_tokens.to_string(),
+            row.cache_write_tokens.to_string(),
+            format!("{:.6}", row.cost_micros as f64 / 1_000_000.0),
+            row.price_source.clone().unwrap_or_default(),
+            row.duration_ms.map(|v| v.to_string()).unwrap_or_default(),
+            row.ttft_ms.map(|v| v.to_string()).unwrap_or_default(),
+        ];
+        out.push_str(
+            &fields
+                .iter()
+                .map(|field| csv_field(field))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+    }
+    UsageCsv {
+        content: out,
+        row_count: rows.len() as i64,
+        truncated: rows.len() > CSV_MAX_ROWS,
     }
 }
 
@@ -996,7 +1167,64 @@ mod tests {
             price_currency: Some("usd".to_string()),
             price_source: Some("upstream".to_string()),
             upstream_response_id: response_id.map(str::to_string),
+            success: Some(1),
+            duration_ms: None,
+            ttft_ms: None,
         }
+    }
+
+    #[test]
+    fn csv_serialization_quotes_fields_and_counts_rows() {
+        let mut row = proxy_only_row(priced_proxy_row(0, None));
+        row.model = "gpt, \"fast\"\nnext".to_string();
+        let csv = serialize_usage_csv(&[row]);
+        assert!(csv.content.starts_with('\u{feff}'));
+        assert!(csv.content.contains("\"gpt, \"\"fast\"\"\nnext\""));
+        assert_eq!(csv.row_count, 1);
+        assert!(!csv.truncated);
+    }
+
+    #[test]
+    fn speed_stats_exclude_transcripts_failures_and_zero_output() {
+
+
+        let mut samples = Vec::new();
+        for (index, ttft, output) in [(0, 100, 100), (1, 200, 200), (2, 300, 300)] {
+            let mut row = proxy_only_row(priced_proxy_row(index, None));
+            row.success = true;
+            // Keep the generation window constant at 1000 ms so the three
+            // outputs map directly to 100/200/300 tok/s.
+            row.duration_ms = Some(1_000 + ttft);
+            row.ttft_ms = Some(ttft);
+            row.output_tokens = output;
+            samples.push(row);
+        }
+        // A transcript has no HTTP timing even if something fabricated a value.
+        let mut transcript = session_only_row(session_entry(None, "m", 10), 0);
+        transcript.duration_ms = Some(10);
+        transcript.ttft_ms = Some(5);
+        let mut failed = proxy_only_row(priced_proxy_row(3, None));
+        failed.success = false;
+        failed.duration_ms = Some(1_000);
+        failed.ttft_ms = Some(100);
+        failed.output_tokens = 100;
+        let mut no_output = proxy_only_row(priced_proxy_row(4, None));
+        no_output.success = true;
+        no_output.duration_ms = Some(1_000);
+        no_output.ttft_ms = Some(100);
+        no_output.output_tokens = 0;
+
+        samples.extend([transcript, failed, no_output]);
+        let stats = speed_stats(&samples);
+        // The zero-output row has a TTFT sample but no TPS sample: it produced a
+        // first frame (e.g. reasoning) and then no output tokens.
+        assert_eq!(stats.ttft_sample_count, 4);
+        assert_eq!(stats.ttft_p50_ms, Some(200));
+        assert_eq!(stats.ttft_p95_ms, Some(300));
+        // generation window is 1000 ms for all three: 100/200/300 tok/s.
+        assert_eq!(stats.tps_sample_count, 3);
+        assert_eq!(stats.tps_p50_milli, Some(200_000));
+        assert_eq!(stats.tps_p95_milli, Some(300_000));
     }
 
     #[test]
@@ -1095,6 +1323,8 @@ mod tests {
             path: None,
             status: None,
             success: true,
+            duration_ms: None,
+            ttft_ms: None,
             input_tokens: 100,
             output_tokens: 10,
             cache_write_tokens: 2,
@@ -1403,6 +1633,9 @@ mod tests {
             price_currency: Some("usd".to_string()),
             price_source: Some("upstream".to_string()),
             upstream_response_id: response_id.map(str::to_string),
+            success: Some(1),
+            duration_ms: None,
+            ttft_ms: None,
         }
     }
 

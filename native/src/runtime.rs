@@ -53,6 +53,18 @@ impl PluginRuntime {
             crate::services::proxy_service::apply_startup(&settings);
             let route_proxy = crate::services::route_proxy_service::RouteProxyRuntimeState::default();
             route_proxy.set_request_body_limit_mib(settings.route_proxy_request_body_limit_mib);
+            route_proxy.set_privacy_masking(
+                settings.privacy_masking_enabled,
+                settings.privacy_mask_rules_json.clone(),
+            );
+            let pii_model = crate::services::pii_model::pii_model_runtime();
+            pii_model.configure(paths.clone());
+            pii_model.set_enabled(
+                settings.pii_model_enabled,
+                settings.pii_model_threshold_percent,
+            );
+            let watchdog = pii_model.clone();
+            tokio::spawn(async move { watchdog.idle_watchdog().await });
             let state = Arc::new(AppState {
                 paths, pool, route_proxy,
                 // Exists before any task or event emitter can run.
@@ -60,6 +72,7 @@ impl PluginRuntime {
                 config_writes: Default::default(), deeplink_protocols: Default::default(), close_to_tray: Default::default(),
             });
             let emitter = EventEmitter::Web(state.event_broadcaster.clone());
+            crate::services::pii_model::pii_download().configure(state.paths.clone(), emitter.clone());
             state.route_proxy.activity().set_emitter(emitter.clone());
             state.route_proxy.active_attempts().set_emitter(emitter.clone());
             state.route_proxy.live_log().set_emitter(emitter);
@@ -114,6 +127,7 @@ impl PluginRuntime {
             }
             let _ = RouteProxyService::force_stop(&state.route_proxy).await;
             crate::web::handlers::shutdown_oauth().await;
+            crate::services::pii_model::pii_model_runtime().shutdown();
             for task in &tasks {
                 task.abort();
             }

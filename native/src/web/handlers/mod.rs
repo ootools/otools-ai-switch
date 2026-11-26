@@ -4,12 +4,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
+use crate::web::event_bridge::EventEmitter;
 use crate::core::sessions::{get_session_messages_core, list_sessions_core};
 use crate::core::settings::{get_settings_core, save_settings_core};
 use crate::core::usage_history::{
     clear_response_bodies_core, compact_usage_history_core, get_usage_history_storage_core,
 };
-use crate::core::usage_overview::get_usage_overview_core;
+use crate::core::subscription_login::{
+    detect_subscription_login, import_subscription_login_core, SubscriptionVendor,
+};
+use crate::core::quota_overview::get_quota_overview_core;
+use crate::core::usage_overview::{export_usage_csv_core, get_usage_overview_core};
 use crate::core::usage_stats::{
     get_model_price_configs_core, get_session_usage_stats_core, reload_model_price_overrides_core,
     save_model_price_configs_core,
@@ -519,6 +524,19 @@ pub async fn dispatch_command(
                 .map_err(to_error)?,
             )
         }
+        "restore_native_config" => {
+            let target_key = required_string_arg(&args, "targetKey")?;
+            to_value(
+                ConfigWriteCoordinator::restore_native(
+                    &state.paths,
+                    &state.pool,
+                    &state.config_writes,
+                    &target_key,
+                )
+                .await
+                .map_err(to_error)?,
+            )
+        }
         "get_settings" => to_value(
             get_settings_core(&state.paths, &state.deeplink_protocols)
                 .await
@@ -580,6 +598,83 @@ pub async fn dispatch_command(
                 .and_then(|value| i32::try_from(value).ok());
             to_value(
                 get_usage_overview_core(&state.pool, since, page, page_size, utc_offset_minutes)
+                    .await
+                    .map_err(to_error)?,
+            )
+        }
+        "detect_subscription_login" => {
+            let vendor: SubscriptionVendor = parse_arg(&args, "vendor")?;
+            to_value(detect_subscription_login(vendor).map_err(to_error)?)
+        }
+        "import_subscription_login" => {
+            let vendor: SubscriptionVendor = parse_arg(&args, "vendor")?;
+            let batch_name = required_string_arg(&args, "batchName")?;
+            let path = optional_string_arg(&args, "path")?;
+            to_value(
+                import_subscription_login_core(
+                    &state.pool,
+                    vendor,
+                    &batch_name,
+                    path.as_deref(),
+                )
+                .await
+                .map_err(to_error)?,
+            )
+        }
+        "get_quota_overview" => to_value(
+            get_quota_overview_core(&state.pool).await.map_err(to_error)?,
+        ),
+        "export_usage_csv" => {
+            let since = optional_string_arg(&args, "since")?;
+            let until = optional_string_arg(&args, "until")?;
+            let utc_offset_minutes = optional_i64_arg(&args, "utc_offset_minutes")?
+                .and_then(|value| i32::try_from(value).ok());
+            to_value(
+                export_usage_csv_core(&state.pool, since, until, utc_offset_minutes)
+                    .await
+                    .map_err(to_error)?,
+            )
+        }
+        "get_pii_model_status" => {
+            configure_pii_model(&state);
+            to_value(crate::services::pii_model::pii_model_runtime().status())
+        }
+        "start_pii_model_download" => {
+            configure_pii_model(&state);
+            let mirror = optional_string_arg(&args, "mirror")?;
+            crate::services::pii_model::pii_model_runtime().invalidate_verification();
+            to_value(
+                crate::services::pii_model::pii_download()
+                    .start(mirror)
+                    .map_err(to_error)?,
+            )
+        }
+        "cancel_pii_model_download" => {
+            configure_pii_model(&state);
+            crate::services::pii_model::pii_download().cancel();
+            to_value(true)
+        }
+        "delete_pii_model" => {
+            configure_pii_model(&state);
+            crate::services::pii_model::pii_download()
+                .delete()
+                .await
+                .map_err(to_error)?;
+            crate::services::pii_model::pii_model_runtime().invalidate_verification();
+            to_value(true)
+        }
+        "warm_pii_model" => {
+            configure_pii_model(&state);
+            to_value(
+                crate::services::pii_model::pii_model_runtime()
+                    .warm()
+                    .map_err(to_error)?,
+            )
+        }
+        "get_privacy_mask_insights" => {
+            let limit = optional_i64_arg(&args, "limit")?.unwrap_or(50);
+            to_value(
+                crate::services::privacy_mask_service::privacy_mask_insights(&state.pool, limit)
                     .await
                     .map_err(to_error)?,
             )
@@ -1178,6 +1273,15 @@ pub(crate) async fn shutdown_oauth() {
     if let Some(current) = runtime.take() {
         current.shutdown().await;
     }
+}
+
+fn configure_pii_model(state: &AppState) {
+    use crate::services::pii_model::{pii_download, pii_model_runtime};
+    pii_model_runtime().configure(state.paths.clone());
+    pii_download().configure(
+        state.paths.clone(),
+        EventEmitter::Web(state.event_broadcaster.clone()),
+    );
 }
 
 fn codex_login_state() -> Result<Value, ApiError> {

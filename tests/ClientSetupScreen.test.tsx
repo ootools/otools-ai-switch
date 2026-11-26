@@ -30,6 +30,8 @@ vi.mock("../src/lib/api/client", () => ({
   setRoutePoolModelMode: vi.fn(),
   updateClaudeAccountSlotMappings: vi.fn(),
   writeRouteProxyConfigs: vi.fn(),
+  rollbackConfigSnapshot: vi.fn(),
+  restoreNativeConfig: vi.fn(),
 }));
 
 vi.mock("../src/lib/transport", () => ({
@@ -50,6 +52,8 @@ import {
   listPlatformCapabilities,
   listRouteCredentials,
   routeConfigWriteIsStale,
+  restoreNativeConfig,
+  rollbackConfigSnapshot,
   saveSettings,
   setRoutePoolModelMode,
   updateClaudeAccountSlotMappings,
@@ -226,6 +230,8 @@ describe("ClientSetupScreen", () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([]);
     vi.mocked(routeConfigWriteIsStale).mockResolvedValue(false);
     vi.mocked(writeRouteProxyConfigs).mockResolvedValue([]);
+    vi.mocked(rollbackConfigSnapshot).mockResolvedValue({} as never);
+    vi.mocked(restoreNativeConfig).mockResolvedValue({} as never);
     vi.mocked(getClaudeSlotPlan).mockResolvedValue(slotPlan);
     vi.mocked(listPlatformCapabilities).mockResolvedValue([
       capabilityOf("codex", "Codex"),
@@ -439,6 +445,22 @@ describe("ClientSetupScreen", () => {
     expect(await screen.findByText("配置写入结果")).toBeInTheDocument();
     expect(screen.getByText(/ZCode · codex/)).toBeInTheDocument();
     expect(screen.getAllByText(/写入后需重启 ZCode/).length).toBeGreaterThan(0);
+  });
+
+  it("offers snapshot rollback and pristine restore in the client setup page", async () => {
+    const user = userEvent.setup();
+    vi.mocked(writeRouteProxyConfigs).mockResolvedValue(writeOutcomes);
+    setup();
+
+    await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
+    await user.click(screen.getByRole("button", { name: "写入" }));
+    expect(await screen.findByRole("button", { name: /回滚此次写入/ })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /回滚此次写入/ }));
+    await waitFor(() => expect(vi.mocked(rollbackConfigSnapshot)).toHaveBeenCalled());
+
+    await user.click(screen.getAllByRole("button", { name: /还原 .* 的原生配置/ })[0]);
+    await waitFor(() => expect(vi.mocked(restoreNativeConfig)).toHaveBeenCalled());
   });
 
   it("marks direct-mode clients and scopes the restore warning to the checked ones", async () => {

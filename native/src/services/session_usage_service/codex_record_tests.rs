@@ -250,6 +250,9 @@ fn screenshot_pairs_merge_by_real_id_despite_exact_mode_prefix_and_keep_failure(
             price_currency: None,
             price_source: None,
             upstream_response_id: Some(id.into()),
+            success: Some(1),
+            duration_ms: None,
+            ttft_ms: None,
         });
     }
     let mut failure = proxies[0].clone();

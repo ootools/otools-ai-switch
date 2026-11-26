@@ -113,6 +113,8 @@ pub(crate) struct AdvertisedModel {
     /// resolved before the maximum is taken — see
     /// [`contribution_context_window`].
     pub(crate) context_window: Option<u32>,
+    /// Full upstream window, independent of the auto-compact threshold above.
+    pub(crate) max_context_window: Option<u32>,
     /// Efforts advertised for this alias: only the ones every source that
     /// contributed it offers. `None` keeps the baseline profile for the model id.
     pub(crate) reasoning_levels: Option<Vec<String>>,
@@ -493,7 +495,7 @@ pub(crate) fn codex_model_catalog_payload_with_baseline(
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
                 "input_modalities": input_modalities,
-                "max_context_window": context_window,
+                "max_context_window": model.max_context_window.unwrap_or(context_window),
                 "priority": index as i32 + 1,
                 "service_tiers": [],
                 "shell_type": "shell_command",
@@ -953,6 +955,7 @@ pub(crate) fn advertised_model_catalog_entries_with_baseline_and_capability(
                     // upstream.
                     upstream_model: fallback_target.unwrap_or(model),
                     context_window: None,
+                    max_context_window: None,
                     reasoning_levels: None,
                     supports_one_m: None,
                     supports_image_input: default_supports_image_input(
@@ -988,6 +991,7 @@ pub(crate) fn advertised_model_catalog_entries_with_baseline_and_capability(
                 description: &description,
                 upstream_model: to,
                 context_window: mapping.context_window,
+                max_context_window: mapping.max_context_window,
                 reasoning_levels: mapping.reasoning_levels.as_deref(),
                 supports_one_m: None,
                 supports_image_input: mapping
@@ -1071,6 +1075,7 @@ pub(crate) fn client_facing_model_catalog_entries(
                     description: &description,
                     upstream_model: to,
                     context_window: mapping.context_window,
+                max_context_window: mapping.max_context_window,
                     reasoning_levels: mapping.reasoning_levels.as_deref(),
                     supports_one_m: (platform == "claude")
                         .then_some(mapping.supports_1m == Some(true)),
@@ -1140,6 +1145,7 @@ struct ModelContribution<'a> {
     description: &'a str,
     upstream_model: &'a str,
     context_window: Option<u32>,
+    max_context_window: Option<u32>,
     reasoning_levels: Option<&'a [String]>,
     supports_image_input: bool,
     supports_one_m: Option<bool>,
@@ -1186,6 +1192,7 @@ fn push_unique_model(
         return;
     }
     let claimed_window = contribution_context_window(platform, &contribution);
+    let claimed_max = contribution.max_context_window.filter(|window| *window > 0);
     let key = trimmed.to_ascii_lowercase();
     if seen.insert(key) {
         models.push(AdvertisedModel {
@@ -1194,6 +1201,7 @@ fn push_unique_model(
             description: contribution.description.to_string(),
             upstream_model: contribution.upstream_model.trim().to_string(),
             context_window: claimed_window,
+            max_context_window: claimed_max,
             reasoning_levels: contribution.reasoning_levels.map(<[String]>::to_vec),
             supports_image_input: contribution.supports_image_input,
             supports_one_m: contribution.supports_one_m,
@@ -1241,6 +1249,10 @@ fn push_unique_model(
                 (Some(current), Some(incoming)) => Some(current.max(incoming)),
                 (current, incoming) => current.or(incoming),
             }
+        };
+        existing.max_context_window = match (existing.max_context_window, claimed_max) {
+            (Some(current), Some(incoming)) => Some(current.max(incoming)),
+            (current, incoming) => current.or(incoming),
         };
         existing.supports_image_input =
             existing.supports_image_input && contribution.supports_image_input;
@@ -1778,6 +1790,17 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_mapping_can_split_compact_threshold_from_full_window() {
+        let capability = parse_model_capability(
+            r#"{"model_mappings":[{"from":"gpt-5.6-sol","to":"upstream-sol","context_window":272000,"max_context_window":1000000}]}"#,
+        );
+        let catalog = codex_model_catalog_payload(&[capability]);
+        let models = catalog["models"].as_array().expect("catalog models");
+        assert_eq!(models[0]["context_window"], 272_000);
+        assert_eq!(models[0]["max_context_window"], 1_000_000);
+    }
+
     fn codex_catalog_honours_per_mapping_context_and_reasoning_overrides() {
         let capability = parse_model_capability(
             r#"{"model_mappings":[

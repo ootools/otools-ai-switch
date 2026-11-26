@@ -36,6 +36,10 @@ pub struct AppPaths {
     pub videogen_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub route_proxy_https_dir: PathBuf,
+    /// On-demand local PII model + dynamically loaded ONNX Runtime. Never packaged.
+    pub models_dir: PathBuf,
+    pub astrlink_model_dir: PathBuf,
+    pub onnxruntime_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -81,6 +85,9 @@ impl AppPaths {
             videogen_dir: data_dir.join("videogen"),
             logs_dir: data_dir.join("logs"),
             route_proxy_https_dir: data_dir.join("certs").join("route-proxy"),
+            models_dir: data_dir.join("models"),
+            astrlink_model_dir: data_dir.join("models").join("astrlink"),
+            onnxruntime_dir: data_dir.join("models").join("onnxruntime").join("1.22.0"),
             data_dir,
         }
     }
@@ -96,6 +103,11 @@ impl AppPaths {
         tokio::fs::create_dir_all(&self.videogen_dir).await?;
         set_private_directory_permissions(&self.videogen_dir).await?;
         tokio::fs::create_dir_all(&self.logs_dir).await?;
+        // Downloaded at runtime, never bundled into the .oplg package.
+        tokio::fs::create_dir_all(&self.astrlink_model_dir).await?;
+        set_private_directory_permissions(&self.astrlink_model_dir).await?;
+        tokio::fs::create_dir_all(&self.onnxruntime_dir).await?;
+        set_private_directory_permissions(&self.onnxruntime_dir).await?;
         Ok(())
     }
 }

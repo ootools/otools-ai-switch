@@ -13,6 +13,8 @@ import {
   getSettings,
   listConfigWriteClients,
   listRouteCredentials,
+  restoreNativeConfig,
+  rollbackConfigSnapshot,
   routeConfigWriteIsStale,
   saveSettings,
   setRoutePoolModelMode,
@@ -558,6 +560,31 @@ export function ClientSetupScreen({
     },
   });
 
+  const refreshClientState = () => {
+    void queryClient.invalidateQueries({ queryKey: ["route-config-stale"] });
+    void queryClient.invalidateQueries({ queryKey: ["config-write-clients-unified"] });
+  };
+
+  const rollbackMutation = useMutation({
+    mutationFn: rollbackConfigSnapshot,
+    onMutate: () => setWriteError(null),
+    onSuccess: (outcome) => {
+      setOutcomes((current) => [...current, outcome]);
+      refreshClientState();
+    },
+    onError: (error) => setWriteError(formatApiError(error, "回滚配置失败。")),
+  });
+
+  const restoreNativeMutation = useMutation({
+    mutationFn: restoreNativeConfig,
+    onMutate: () => setWriteError(null),
+    onSuccess: (outcome) => {
+      setOutcomes((current) => [...current, outcome]);
+      refreshClientState();
+    },
+    onError: (error) => setWriteError(formatApiError(error, "还原原生配置失败。")),
+  });
+
   const configWriteStaleQuery = useQuery({
     queryKey: [
       "route-config-stale",
@@ -791,8 +818,38 @@ export function ClientSetupScreen({
                     {outcome.error_code ? (
                       <p className="mt-1 font-mono text-[11px] text-red-600">{outcome.error_code}</p>
                     ) : null}
+                    {outcome.status === "succeeded" && outcome.snapshot_id ? (
+                      <button
+                        aria-label={`回滚此次写入 ${outcome.target_key}`}
+                        className="mt-2 rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
+                        disabled={rollbackMutation.isPending}
+                        onClick={() => rollbackMutation.mutate(outcome.snapshot_id as string)}
+                        type="button"
+                      >
+                        回滚此次写入
+                      </button>
+                    ) : null}
                   </div>
                 ))}
+                <div className="flex flex-wrap items-center gap-2 border-t border-stone-200 pt-2">
+                  <span className="text-[11px] font-semibold text-stone-500">还原原生配置：</span>
+                  {selected.map((clientKey) => {
+                    const targetKey = clientByTargetKey.get(clientKey)?.target_key;
+                    if (!targetKey) return null;
+                    return (
+                      <button
+                        aria-label={`还原 ${clientKey} 的原生配置`}
+                        className="rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
+                        disabled={restoreNativeMutation.isPending}
+                        key={clientKey}
+                        onClick={() => restoreNativeMutation.mutate(targetKey)}
+                        type="button"
+                      >
+                        {clientByTargetKey.get(clientKey)?.display_name ?? clientKey}
+                      </button>
+                    );
+                  })}
+                </div>
                 {outcomes.some(
                   (outcome) => clientByTargetKey.get(outcome.target_key)?.restart_required,
                 ) ? (

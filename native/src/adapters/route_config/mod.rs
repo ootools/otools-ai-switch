@@ -133,6 +133,8 @@ pub struct ClientTargetDescriptor {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeEnvPlan {
     pub subagent_model: Option<String>,
+    /// Global long-conversation threshold written as `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+    pub auto_compact_window: Option<u32>,
     /// Model for requests that don't land on one of the four `/model` roles.
     pub fallback_model: Option<String>,
     /// One entry per `CLAUDE_MODEL_SLOTS` slot, in that order. An empty vec (or
@@ -403,6 +405,25 @@ mod tests {
     }
 
     #[test]
+    fn claude_config_writes_and_clears_the_auto_compact_window() {
+        let mut plan = input();
+        plan.claude_env.auto_compact_window = Some(272_000);
+        let adapter = JsonAgentAdapter::claude();
+        let rendered = adapter
+            .render(Path::new("settings.json"), None, &plan)
+            .expect("render");
+        let value: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+        assert_eq!(value["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "272000");
+
+        // Turning the global switch off removes the managed key again.
+        let rendered = adapter
+            .render(Path::new("settings.json"), Some(&rendered), &input())
+            .expect("render");
+        let value: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+        assert!(value["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none());
+    }
+
+    #[test]
     fn registry_contains_only_verified_native_config_adapters() {
         let registry = TargetAdapterRegistry::new();
 
@@ -574,6 +595,7 @@ api_key = "legacy-key"
         let with_alias = RouteConfigInput {
             claude_env: ClaudeEnvPlan {
                 subagent_model: Some("claude-subagent".to_string()),
+                auto_compact_window: None,
                 fallback_model: None,
                 slots: Vec::new(),
                 client_config: None,
@@ -708,6 +730,7 @@ api_key = "legacy-key"
         let with_alias = RouteConfigInput {
             claude_env: ClaudeEnvPlan {
                 subagent_model: Some("claude-subagent".to_string()),
+                auto_compact_window: None,
                 fallback_model: None,
                 slots: Vec::new(),
                 client_config: None,

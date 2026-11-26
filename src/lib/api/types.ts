@@ -241,6 +241,8 @@ export type ModelMapping = {
   label?: string | null;
   supports_1m?: boolean | null;
   context_window?: number | null;
+  /** Codex-only full upstream window, independent of the compact threshold. */
+  max_context_window?: number | null;
   reasoning_levels?: string[] | null;
 };
 
@@ -834,6 +836,10 @@ export type UsageOverviewRow = {
   /** Only ever present on a row that has a proxy side. */
   status?: string | null;
   success: boolean;
+  /** Whole-request wall time; null on transcript-only rows. */
+  duration_ms?: number | null;
+  /** Time to first real output frame; null when unavailable. */
+  ttft_ms?: number | null;
   input_tokens: number;
   output_tokens: number;
   cache_write_tokens: number;
@@ -914,12 +920,26 @@ export type UsageOverviewIntegrity = {
 };
 
 /**
+ * Speed metrics over proxy-backed rows only. TPS is stored as tok/s × 1000,
+ * so divide by 1000 for tokens/sec. Sample counts are always shown.
+ */
+export type UsageOverviewSpeed = {
+  ttft_sample_count: number;
+  ttft_p50_ms?: number | null;
+  ttft_p95_ms?: number | null;
+  tps_sample_count: number;
+  tps_p50_milli?: number | null;
+  tps_p95_milli?: number | null;
+};
+
+/**
  * Local CLI transcript usage merged with proxied requests, deduplicated on the
  * upstream response id. `totals`, `groups` and `series` cover the whole window;
  * `rows` is one page.
  */
 export type UsageOverview = {
   totals: UsageOverviewTotals;
+  speed: UsageOverviewSpeed;
   rows: UsageOverviewRow[];
   groups: UsageOverviewGroups;
   series: UsageTrendSeries;
@@ -928,6 +948,42 @@ export type UsageOverview = {
   page_size: number;
   integrity: UsageOverviewIntegrity;
 };
+
+/** One official account's quota as last refreshed from its upstream. */
+export type QuotaOverviewRow = {
+  id: string;
+  display_name: string;
+  provider: string;
+  subscription_type?: string | null;
+  primary_remain?: number | null;
+  weekly_remain?: number | null;
+  reset_primary?: string | null;
+  reset_weekly?: string | null;
+  quota_limit?: number | null;
+  quota_used?: number | null;
+  quota_updated_at?: string | null;
+};
+
+/** A renewal warning: a window ends soon while quota is still unspent. */
+export type QuotaReminder = {
+  credential_id: string;
+  display_name: string;
+  window: "primary" | "weekly";
+  reset_at: string;
+  minutes_left: number;
+  remaining: number;
+  message: string;
+};
+
+export type QuotaOverview = {
+  rows: QuotaOverviewRow[];
+  reminders: QuotaReminder[];
+  official_account_count: number;
+  with_quota_count: number;
+};
+
+/** Vendors whose existing CLI login can be imported as an official account. */
+export type SubscriptionVendor = "claude" | "copilot" | "gemini" | "grok";
 
 export type ActiveProxyAttempt = {
   request_id: string;
@@ -1298,6 +1354,52 @@ export type AppSettings = {
    * provider entry.
    */
   codex_keep_login_state?: boolean;
+  /** Replace secrets in outbound prompts with deterministic placeholders. */
+  privacy_masking_enabled?: boolean;
+  /** `{"mask_secrets":true,"mask_emails":true,"custom_words":["…"]}`. */
+  privacy_mask_rules_json?: string | null;
+  /** Optional local PII model. Requires a one-time download. */
+  pii_model_enabled?: boolean;
+  /** Mirror base URL for model/runtime downloads; SHA-256 still applies. */
+  pii_model_mirror_base_url?: string | null;
+  /** Confidence threshold in percent (50-99). */
+  pii_model_threshold_percent?: number;
+  /** Global long-conversation mode: split compact threshold from full window. */
+  long_conversation_enabled?: boolean;
+  /** Codex/Claude auto-compact threshold in tokens. */
+  long_conversation_compact_window?: number;
+};
+
+export type PiiModelStatusView = {
+  supported: boolean;
+  file_state: "missing" | "partial" | "ready" | "corrupt";
+  runtime_state: "stopped" | "loading" | "ready" | "degraded";
+  downloaded_bytes: number;
+  total_bytes: number;
+  device: string;
+  load_ms: number;
+  model_size: number;
+  ort_size: number;
+  last_error?: string | null;
+};
+
+export type PiiDownloadProgress = {
+  state: "idle" | "downloading" | "verifying" | "extracting" | "ready" | "failed" | "cancelled";
+  artifact: string;
+  completed: number;
+  total: number;
+  percent: number;
+  error?: string | null;
+};
+
+export type PrivacyMaskAuditRow = {
+  occurred_at: string;
+  platform: string;
+  rule_kind: string;
+  placeholder: string;
+  direction: string;
+  char_length: number;
+  prefix: string;
 };
 
 export type AppSettingsView = AppSettings & {

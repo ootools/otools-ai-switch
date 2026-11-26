@@ -38,9 +38,15 @@ vi.mock("../src/lib/api/client", () => ({
   openRouteProxyHttpsCertificateDirectory: vi.fn(),
   getUsageHistoryStorage: vi.fn(),
   compactUsageHistory: vi.fn(),
+  getPiiModelStatus: vi.fn(),
+  startPiiModelDownload: vi.fn(),
+  cancelPiiModelDownload: vi.fn(),
+  deletePiiModel: vi.fn(),
+  warmPiiModel: vi.fn(),
 }));
 vi.mock("../src/lib/transport", () => ({
   isDesktop: vi.fn(() => true),
+  getTransport: vi.fn(() => ({ subscribe: vi.fn(() => Promise.resolve(vi.fn())) })),
 }));
 
 const httpsStatusFixture = {

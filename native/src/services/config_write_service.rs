@@ -344,6 +344,41 @@ impl ConfigWriteCoordinator {
         }
     }
 
+    /// Restore a client's pre-AI-Switch config in one step.
+    ///
+    /// Every successful write private-backups the exact bytes it replaced, so
+    /// the earliest successful write snapshot *is* the native file. Reusing the
+    /// snapshot rollback keeps the byte-for-byte original (including comments
+    /// and formatting) instead of trying to re-derive it per adapter.
+    pub async fn restore_native(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        target_key: &str,
+    ) -> Result<ConfigWriteOutcome, AppError> {
+        let home = resolve_home_dir()?;
+        Self::restore_native_for_home(paths, pool, runtime, &home, target_key).await
+    }
+
+    pub(crate) async fn restore_native_for_home(
+        paths: &AppPaths,
+        pool: &SqlitePool,
+        runtime: &ConfigWriteRuntimeState,
+        home: &Path,
+        target_key: &str,
+    ) -> Result<ConfigWriteOutcome, AppError> {
+        let target = TargetRepository::get_by_key(pool, target_key).await?;
+        let earliest = ConfigSnapshotRepository::earliest_successful_write(pool, &target.id)
+            .await?
+            .ok_or_else(|| {
+            rollback_unavailable(
+                target_key,
+                "AI Switch has never written this client's config; there is nothing to restore",
+            )
+        })?;
+        Self::rollback_for_home(paths, pool, runtime, home, &earliest.id).await
+    }
+
     pub async fn rollback(
         paths: &AppPaths,
         pool: &SqlitePool,

@@ -1,9 +1,9 @@
 import { fetchRouteProxyModels } from "../src/lib/routeProxyModels";
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getModelPriceConfigs, getRouteProxyKey, getRouteProxyStatus, getUsageOverview, saveModelPriceConfigs } from "../src/lib/api/client";
+import { exportUsageCsv, getQuotaOverview, getModelPriceConfigs, getRouteProxyKey, getRouteProxyStatus, getUsageOverview, refreshRouteCredentialsQuota, saveModelPriceConfigs } from "../src/lib/api/client";
 import { createQueryClient } from "../src/lib/query/queryClient";
 import { UsageOverviewPanel } from "../src/components/accounts/UsageOverviewPanel";
 import type { UsageOverview, UsageOverviewRow, UsageTrendSeries } from "../src/lib/api/types";
@@ -12,6 +12,9 @@ vi.mock("../src/lib/api/client", () => ({
   getModelPriceConfigs: vi.fn(),
   getRouteProxyKey: vi.fn(),
   getRouteProxyStatus: vi.fn(),
+  exportUsageCsv: vi.fn(),
+  getQuotaOverview: vi.fn(),
+  refreshRouteCredentialsQuota: vi.fn(),
   getUsageOverview: vi.fn(),
   saveModelPriceConfigs: vi.fn(),
 }));
@@ -91,6 +94,14 @@ function overviewFixture(overrides: Partial<UsageOverview> = {}): UsageOverview 
       cache_read_tokens: 19_115_772_272,
       cost_micros: 16_248_905_925,
     },
+    speed: {
+      ttft_sample_count: 0,
+      ttft_p50_ms: null,
+      ttft_p95_ms: null,
+      tps_sample_count: 0,
+      tps_p50_milli: null,
+      tps_p95_milli: null,
+    },
     rows: [rowFixture()],
     groups: {
       // Deliberately a different model id from rowFixture's `claude-opus-5`:
@@ -128,6 +139,44 @@ describe("UsageOverviewPanel", () => {
   beforeEach(() => {
     vi.mocked(getUsageOverview).mockReset();
     vi.mocked(getUsageOverview).mockResolvedValue(overviewFixture());
+    vi.mocked(getQuotaOverview).mockReset();
+    vi.mocked(getQuotaOverview).mockResolvedValue({
+      rows: [
+        {
+          id: "cred-1",
+          display_name: "Team",
+          provider: "openai",
+          primary_remain: 400,
+          weekly_remain: null,
+          reset_primary: "2026-11-26T12:00:00Z",
+          reset_weekly: null,
+          quota_limit: 1000,
+          quota_used: 600,
+          quota_updated_at: null,
+        },
+      ],
+      reminders: [
+        {
+          credential_id: "cred-1",
+          display_name: "Team",
+          window: "primary",
+          reset_at: "2026-11-26T12:00:00Z",
+          minutes_left: 120,
+          remaining: 400,
+          message: "5h 窗口约 120 分钟后续期，仍有 400 未使用，续期后可能清零",
+        },
+      ],
+      official_account_count: 1,
+      with_quota_count: 1,
+    });
+    vi.mocked(refreshRouteCredentialsQuota).mockReset();
+    vi.mocked(refreshRouteCredentialsQuota).mockResolvedValue([]);
+    vi.mocked(exportUsageCsv).mockReset();
+    vi.mocked(exportUsageCsv).mockResolvedValue({
+      content: "\u{feff}occurred_at,model\n2026-01-01T00:00:00Z,m\n",
+      row_count: 1,
+      truncated: false,
+    });
     vi.mocked(getModelPriceConfigs).mockResolvedValue({});
     vi.mocked(saveModelPriceConfigs).mockReset();
     vi.mocked(saveModelPriceConfigs).mockResolvedValue(1);
@@ -146,6 +195,44 @@ describe("UsageOverviewPanel", () => {
     expect(screen.getByTitle("5,584,802,591")).toBeInTheDocument();
     // Cost keeps a currency format rather than a 万/亿 unit.
     expect(screen.getByText("$16,248.91")).toBeInTheDocument();
+  });
+
+  it("speed view shows TTFT/TPS percentiles with sample counts and excludes transcript rows", async () => {
+    const proxied = rowFixture({
+      id: "proxy-1",
+      source: "matched",
+      duration_ms: 1_200,
+      ttft_ms: 200,
+      output_tokens: 200,
+    });
+    const transcript = rowFixture({
+      id: "session-1",
+      source: "session_only",
+      duration_ms: 5,
+      ttft_ms: 1,
+    });
+    vi.mocked(getUsageOverview).mockResolvedValue(
+      overviewFixture({
+        speed: {
+          ttft_sample_count: 1,
+          ttft_p50_ms: 200,
+          ttft_p95_ms: 200,
+          tps_sample_count: 1,
+          tps_p50_milli: 200_000,
+          tps_p95_milli: 200_000,
+        },
+        rows: [proxied, transcript],
+      }),
+    );
+    renderPanel();
+    await screen.findByText("1.1万");
+    await userEvent.click(screen.getByRole("button", { name: "速度" }));
+    expect(screen.getByText("TTFT 中位数")).toBeInTheDocument();
+    expect(screen.getAllByText("200 ms").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("200.0 tok/s").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByTitle("样本 1 条").length).toBeGreaterThanOrEqual(2);
+    // A CLI transcript has no HTTP timing and must not appear as a speed sample.
+    expect(screen.queryByText("session-1")).not.toBeInTheDocument();
   });
 
   it("totals every token bucket and rates the cache against prompt tokens only", async () => {
@@ -321,6 +408,41 @@ describe("UsageOverviewPanel", () => {
     expect(screen.getByText(/4 个请求没有时间戳/)).toBeInTheDocument();
   });
 
+  it("shows quota rows and renewal warnings in the quota tab", async () => {
+    renderPanel();
+    await screen.findByText("1.1万");
+    await userEvent.click(screen.getByRole("button", { name: "额度" }));
+    expect(await screen.findByText("续期提醒")).toBeInTheDocument();
+    expect(screen.getByText(/仍有 400 未使用/)).toBeInTheDocument();
+    expect(screen.getAllByText("Team").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("uses an explicit bounded window for the custom period", async () => {
+    renderPanel();
+    await screen.findByText("1.1万");
+    await userEvent.click(screen.getByRole("button", { name: "自定义" }));
+    fireEvent.change(screen.getByLabelText("自定义开始时间"), { target: { value: "2026-11-01T00:00" } });
+    fireEvent.change(screen.getByLabelText("自定义结束时间"), { target: { value: "2026-11-02T00:00" } });
+    await waitFor(() => {
+      const call = vi.mocked(getUsageOverview).mock.calls.at(-1);
+      const since = call?.[0];
+      const until = call?.[3];
+      expect(typeof since).toBe("string");
+      expect(typeof until).toBe("string");
+      expect(new Date(until as string).getTime()).toBeGreaterThan(new Date(since as string).getTime());
+    });
+  });
+
+  it("exports the whole window instead of the current page", async () => {
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:usage") });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    renderPanel();
+    await screen.findByText("1.1万");
+    await userEvent.click(screen.getByRole("button", { name: "导出 CSV" }));
+    await waitFor(() => expect(vi.mocked(exportUsageCsv)).toHaveBeenCalled());
+    expect(screen.getByText("已导出 1 条请求。")).toBeInTheDocument();
+  });
+
   it("requests a rolling window for the 7d preset", async () => {
     renderPanel();
     await screen.findByText("1.1万");
@@ -428,7 +550,7 @@ describe("UsageOverviewPanel", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "累计" }));
 
-    await waitFor(() => expect(getUsageOverview).toHaveBeenLastCalledWith(null, 1, 20));
+    await waitFor(() => expect(getUsageOverview).toHaveBeenLastCalledWith(null, 1, 20, null));
   });
 
   it("pages within the panel", async () => {
@@ -442,7 +564,7 @@ describe("UsageOverviewPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "下一页" }));
 
     await waitFor(() =>
-      expect(getUsageOverview).toHaveBeenLastCalledWith(expect.any(String), 2, 20),
+      expect(getUsageOverview).toHaveBeenLastCalledWith(expect.any(String), 2, 20, null),
     );
   });
 
