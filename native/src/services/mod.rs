@@ -24,6 +24,7 @@ pub mod model_pricing;
 pub mod notification_service;
 pub mod official_agent_identity_service;
 pub mod platform_capability_service;
+pub mod plugin_service;
 pub mod proxy_service;
 pub mod remote_probe;
 pub(crate) mod request_compression;

@@ -6,6 +6,7 @@ pub mod external_client_import;
 pub mod import_job;
 pub mod notification;
 pub mod platform;
+pub mod plugin;
 pub mod provider;
 pub mod route_credential;
 pub mod route_credential_model;

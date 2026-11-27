@@ -6,6 +6,7 @@ import {
   Database,
   Globe,
   Network,
+  Package,
   ScrollText,
   Settings2,
   ShieldCheck,
@@ -30,6 +31,7 @@ import { normalizeThemePreference, type ThemePreference } from "../lib/theme";
 import { MotionPresence } from "../components/motion/MotionPrimitives";
 import { CodexBaselineModelsDialog } from "../components/accounts/CodexBaselineModelsDialog";
 import { NotificationSettings } from "../components/settings/notification-settings";
+import { PluginsSettings } from "../components/settings/PluginsSettings";
 import { PiiModelSettings } from "../components/settings/PiiModelSettings";
 import { RouteProxyHttpsSettings } from "../components/settings/route-proxy-https-settings";
 import { UsageStorageSettings } from "../components/settings/usage-storage-settings";
@@ -43,7 +45,8 @@ type SettingsTab =
   | "notifications"
   | "proxy"
   | "data"
-  | "logs";
+  | "logs"
+  | "plugins";
 
 const tabs: Array<{ key: SettingsTab; labelKey: TranslationKey; icon: ComponentType<{ className?: string }> }> = [
   { key: "general", labelKey: "settings.tabs.general", icon: Settings2 },
@@ -54,6 +57,7 @@ const tabs: Array<{ key: SettingsTab; labelKey: TranslationKey; icon: ComponentT
   { key: "proxy", labelKey: "settings.tabs.proxy", icon: Network },
   { key: "data", labelKey: "settings.tabs.data", icon: Database },
   { key: "logs", labelKey: "settings.tabs.logs", icon: ScrollText },
+  { key: "plugins", labelKey: "settings.tabs.plugins", icon: Package },
 ];
 
 const themeOptions: {
@@ -497,6 +501,7 @@ export function SettingsScreen({
           )}
 
           {activeTab === "logs" && <OperationLogScreen />}
+          {activeTab === "plugins" && <PluginsSettings />}
         </motion.div>
       </MotionPresence>
 

@@ -635,6 +635,60 @@ pub async fn dispatch_command(
                     .map_err(to_error)?,
             )
         }
+        "plugin_pack_list" => to_value(
+            crate::services::plugin_service::PluginService::list(&state.paths)
+                .await
+                .map_err(to_error)?,
+        ),
+        "plugin_pack_get_detail" => {
+            let id = required_string_arg(&args, "id")?;
+            to_value(
+                crate::services::plugin_service::PluginService::get_detail(&state.paths, &id)
+                    .await
+                    .map_err(to_error)?,
+            )
+        }
+        "plugin_pack_install_folder" => {
+            let path = required_raw_string_arg(&args, "path")?;
+            to_value(
+                crate::services::plugin_service::PluginService::install_folder(&state.paths, &path)
+                    .await
+                    .map_err(to_error)?,
+            )
+        }
+        "plugin_pack_install_url" => {
+            let url = required_string_arg(&args, "url")?;
+            let sha256 = required_string_arg(&args, "sha256")?;
+            to_value(
+                crate::services::plugin_service::PluginService::install_url(
+                    &state.paths, &url, &sha256,
+                )
+                .await
+                .map_err(to_error)?,
+            )
+        }
+        "plugin_pack_uninstall" => {
+            let id = required_string_arg(&args, "id")?;
+            crate::services::plugin_service::PluginService::uninstall(&state.paths, &id)
+                .await
+                .map_err(to_error)?;
+            to_value(true)
+        }
+        "plugin_pack_set_enabled" => {
+            let id = required_string_arg(&args, "id")?;
+            let enabled: bool = parse_arg(&args, "enabled")?;
+            crate::services::plugin_service::PluginService::set_enabled(
+                &state.paths, &id, enabled,
+            )
+            .await
+            .map_err(to_error)?;
+            to_value(true)
+        }
+        "plugin_pack_list_presets" => to_value(
+            crate::services::plugin_service::PluginService::list_enabled_presets(&state.paths)
+                .await
+                .map_err(to_error)?,
+        ),
         "get_pii_model_status" => {
             configure_pii_model(&state);
             to_value(crate::services::pii_model::pii_model_runtime().status())
@@ -2011,6 +2065,24 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, "web.command_unknown", "{command}");
         }
+    }
+
+    #[tokio::test]
+    async fn plugin_pack_commands_are_dispatched_without_reusing_the_removed_name() {
+        let fixture = test_state().await;
+        let list = dispatch_command(fixture.state.clone(), "plugin_pack_list", json!({}))
+            .await
+            .expect("plugin_pack_list");
+        assert!(list.is_array());
+        let presets =
+            dispatch_command(fixture.state.clone(), "plugin_pack_list_presets", json!({}))
+                .await
+                .expect("plugin_pack_list_presets");
+        assert!(presets.is_array());
+        let error = dispatch_command(fixture.state.clone(), "list_plugins", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "web.command_unknown");
     }
 
     #[tokio::test]

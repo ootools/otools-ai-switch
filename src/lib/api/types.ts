@@ -1368,6 +1368,8 @@ export type AppSettings = {
   long_conversation_enabled?: boolean;
   /** Codex/Claude auto-compact threshold in tokens. */
   long_conversation_compact_window?: number;
+  /** Enabled declarative plugin pack ids as a JSON array string. */
+  plugins_enabled_json?: string | null;
 };
 
 export type PiiModelStatusView = {
@@ -1615,6 +1617,54 @@ export type SkillPackageDetail = {
   skills: SkillItem[];
   members: SkillPackageMember[];
 };
+
+/** Declarative plugin packs: a manifest is data only, never executed. */
+export type PluginMapping = { from: string; to: string };
+
+export type PluginProviderPreset = {
+  id: string;
+  platform: string;
+  label: string;
+  provider: string;
+  default_name: string;
+  base_url: string;
+  interface_format: string;
+  model_mappings: PluginMapping[];
+};
+
+export type PluginManifest = {
+  schema_version: number;
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  author: string;
+  license: string;
+  contributes: { provider_presets: PluginProviderPreset[] };
+};
+
+export type PluginSummary = {
+  id: string;
+  version: string;
+  name: string;
+  description: string;
+  author: string;
+  license: string;
+  enabled: boolean;
+  preset_count: number;
+  source: string;
+  warnings: string[];
+};
+
+export type PluginDetail = {
+  manifest: PluginManifest;
+  enabled: boolean;
+  source: string;
+  path: string;
+};
+
+/** Namespaced preset (`<plugin-id>:<preset-id>`) exposed to the account form. */
+export type PluginPreset = PluginProviderPreset & { plugin_id: string };
 
 export type CodexOAuthMethod = "browser" | "device_code";
 export type CodexOAuthPhase =

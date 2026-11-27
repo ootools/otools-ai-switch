@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ACCOUNT_PRESETS,
   matchPresetByBaseUrl,
+  mergePluginPresets,
   presetsForPlatform,
 } from "../src/lib/accountPresets";
 import { CLAUDE_ROLES } from "../src/lib/claude-roles";
@@ -200,5 +201,50 @@ describe("accountPresets", () => {
     );
     expect(matchPresetByBaseUrl("claude", "https://ps.air-outer.com/v1")).toBeNull();
     expect(matchPresetByBaseUrl("codex", "https://ps.air-outer.com")).toBeNull();
+  });
+
+  it("maps plugin presets into namespaced account presets", () => {
+    const merged = mergePluginPresets([
+      {
+        id: "example-relay:primary",
+        plugin_id: "example-relay",
+        platform: "codex",
+        label: "Example",
+        provider: "Example",
+        default_name: "Example Relay",
+        base_url: "https://example.com/v1",
+        interface_format: "openai",
+        model_mappings: [{ from: "m1", to: "m1" }],
+      },
+    ]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe("example-relay:primary");
+    expect(merged[0].label).toContain("插件");
+    expect(merged[0].defaultName).toBe("Example Relay");
+    expect(merged[0].modelMappings).toEqual([{ from: "m1", to: "m1" }]);
+    expect(new Set([...ACCOUNT_PRESETS.map((p) => p.id), ...merged.map((p) => p.id)]).size).toBe(
+      ACCOUNT_PRESETS.length + merged.length,
+    );
+  });
+
+  it("drops plugin presets with unknown platforms or dialects", () => {
+    const base = {
+      id: "pack:p",
+      plugin_id: "pack",
+      platform: "codex",
+      label: "X",
+      provider: "X",
+      default_name: "X",
+      base_url: "https://x.test/v1",
+      interface_format: "openai",
+      model_mappings: [],
+    };
+    const merged = mergePluginPresets([
+      { ...base, platform: "video" },
+      { ...base, interface_format: "runScript" },
+      base,
+    ]);
+    expect(merged.map((preset) => preset.id)).toEqual(["pack:p"]);
   });
 });

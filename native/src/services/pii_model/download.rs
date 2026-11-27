@@ -218,6 +218,22 @@ fn target_dir(paths: &AppPaths, artifact: &Artifact) -> PathBuf {
     }
 }
 
+/// Stream a file through SHA-256 and compare it with a pinned hex digest.
+/// Also returns the byte count so callers can check a size limit in the same
+/// pass (plugin manifests have no pre-pinned size).
+pub fn verify_sha256(path: &Path, expected: &str) -> Result<u64, String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let bytes = std::io::copy(&mut file, &mut hasher).map_err(|error| error.to_string())?;
+    let digest = format!("{:x}", hasher.finalize());
+    if digest != expected {
+        return Err(format!(
+            "SHA-256 mismatch (got {digest}, expected {expected})"
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Verify size and SHA-256 of an already-downloaded file.
 pub fn verify_file(path: &Path, artifact: &Artifact) -> Result<(), String> {
     let meta = std::fs::metadata(path).map_err(|error| error.to_string())?;
@@ -229,17 +245,9 @@ pub fn verify_file(path: &Path, artifact: &Artifact) -> Result<(), String> {
             artifact.size
         ));
     }
-    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher).map_err(|error| error.to_string())?;
-    let digest = format!("{:x}", hasher.finalize());
-    if digest != artifact.sha256 {
-        return Err(format!(
-            "{}: SHA-256 mismatch (got {digest}, expected {})",
-            artifact.name, artifact.sha256
-        ));
-    }
-    Ok(())
+    verify_sha256(path, &artifact.sha256)
+        .map(|_| ())
+        .map_err(|error| format!("{}: {error}", artifact.name))
 }
 
 /// Check whether every required artifact is present and valid.

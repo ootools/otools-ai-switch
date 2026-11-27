@@ -559,6 +559,7 @@ mod tests {
             long_conversation_compact_window: 272_000,
             pii_model_mirror_base_url: None,
             pii_model_threshold_percent: 80,
+            plugins_enabled_json: None,
         };
         settings.notification_config_json = Some(
             json!({

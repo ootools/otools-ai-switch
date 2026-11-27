@@ -40,6 +40,8 @@ pub struct AppPaths {
     pub models_dir: PathBuf,
     pub astrlink_model_dir: PathBuf,
     pub onnxruntime_dir: PathBuf,
+    /// Declarative plugin packs (`<id>/plugin.json`). Never executed.
+    pub plugins_dir: PathBuf,
 }
 
 impl AppPaths {
@@ -88,6 +90,7 @@ impl AppPaths {
             models_dir: data_dir.join("models"),
             astrlink_model_dir: data_dir.join("models").join("astrlink"),
             onnxruntime_dir: data_dir.join("models").join("onnxruntime").join("1.22.0"),
+            plugins_dir: data_dir.join("plugins"),
             data_dir,
         }
     }
@@ -108,6 +111,8 @@ impl AppPaths {
         set_private_directory_permissions(&self.astrlink_model_dir).await?;
         tokio::fs::create_dir_all(&self.onnxruntime_dir).await?;
         set_private_directory_permissions(&self.onnxruntime_dir).await?;
+        tokio::fs::create_dir_all(&self.plugins_dir).await?;
+        set_private_directory_permissions(&self.plugins_dir).await?;
         Ok(())
     }
 }

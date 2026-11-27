@@ -1,5 +1,10 @@
 import { CLAUDE_ROLES } from "./claude-roles";
-import type { InterfaceFormat, ModelMapping, PlatformId } from "./api/types";
+import type {
+  InterfaceFormat,
+  ModelMapping,
+  PlatformId,
+  PluginPreset,
+} from "./api/types";
 
 export type AccountPreset = {
   id: string;
@@ -130,4 +135,49 @@ export function matchPresetByBaseUrl(
       (preset) => normalizeBaseUrl(preset.baseUrl) === normalized,
     ) ?? null
   );
+}
+
+const PLATFORM_IDS: readonly PlatformId[] = [
+  "codex",
+  "claude",
+  "gemini",
+  "grok",
+  "opencode",
+  "openclaw",
+  "hermes",
+];
+
+const API_DIALECTS: readonly InterfaceFormat[] = [
+  "openai",
+  "openai-responses",
+  "anthropic",
+  "gemini",
+];
+
+/**
+ * Map native plugin contributions into the same shape as builtin presets.
+ * The native manifest validator already restricts platform and dialect; this
+ * second check keeps the UI safe when data comes from a cached query or an
+ * older host. Presets are labelled so users can tell who supplied them.
+ */
+export function mergePluginPresets(pluginPresets: PluginPreset[]): AccountPreset[] {
+  return pluginPresets
+    .filter(
+      (preset) =>
+        PLATFORM_IDS.includes(preset.platform as PlatformId) &&
+        API_DIALECTS.includes(preset.interface_format as InterfaceFormat),
+    )
+    .map((preset) => ({
+      id: preset.id,
+      platform: preset.platform as PlatformId,
+      label: `${preset.label}（插件）`,
+      provider: preset.provider,
+      defaultName: preset.default_name,
+      baseUrl: preset.base_url,
+      interfaceFormat: preset.interface_format as InterfaceFormat,
+      modelMappings: preset.model_mappings.map((mapping) => ({
+        from: mapping.from,
+        to: mapping.to,
+      })),
+    }));
 }

@@ -108,6 +108,10 @@ pub struct AppSettings {
     /// Minimum confidence for a model-detected span to be masked.
     #[serde(default = "default_pii_model_threshold_percent")]
     pub pii_model_threshold_percent: u32,
+    /// Enabled declarative plugin pack ids as a JSON array string. Stored as a
+    /// blob so installing a pack never needs a database migration.
+    #[serde(default)]
+    pub plugins_enabled_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +142,7 @@ pub struct AppSettingsView {
     pub pii_model_threshold_percent: u32,
     pub long_conversation_enabled: bool,
     pub long_conversation_compact_window: u32,
+    pub plugins_enabled_json: Option<String>,
 }
 
 impl AppSettingsView {
@@ -169,6 +174,7 @@ impl AppSettingsView {
             long_conversation_compact_window: settings.long_conversation_compact_window,
             pii_model_mirror_base_url: settings.pii_model_mirror_base_url,
             pii_model_threshold_percent: settings.pii_model_threshold_percent,
+            plugins_enabled_json: settings.plugins_enabled_json,
         }
     }
 }
@@ -201,6 +207,7 @@ impl AppSettings {
             long_conversation_compact_window: 272_000,
             pii_model_mirror_base_url: None,
             pii_model_threshold_percent: 80,
+            plugins_enabled_json: None,
         }
     }
 }

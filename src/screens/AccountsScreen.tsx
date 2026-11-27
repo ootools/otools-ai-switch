@@ -159,6 +159,7 @@ import {
   writeRouteProxyConfigs,
   getClientDirectModes,
   enableClientDirectMode,
+  pluginPackListPresets,
 } from "../lib/api/client";
 import type {
   AccountStatus,
@@ -213,6 +214,7 @@ import {
 import {
   type AccountPreset,
   presetsForPlatform,
+  mergePluginPresets,
 } from "../lib/accountPresets";
 import {
   readProxyUrlFromConfig,
@@ -3114,6 +3116,7 @@ function PresetFields({
   capabilityFilter,
   modelMappings = [],
   interfaceFormat,
+  extraPresets = [],
 }: {
   baseUrl: string;
   fieldClass: string;
@@ -3124,8 +3127,11 @@ function PresetFields({
   capabilityFilter?: string;
   modelMappings?: ModelMapping[];
   interfaceFormat?: InterfaceFormat;
+  extraPresets?: AccountPreset[];
 }) {
-  const presets = capabilityFilter === IMAGE_CAPABILITY ? IMAGE_ACCOUNT_PRESETS : isMediaCapability(capabilityFilter) ? [] : presetsForPlatform(platform);
+  const builtin = capabilityFilter === IMAGE_CAPABILITY ? IMAGE_ACCOUNT_PRESETS : isMediaCapability(capabilityFilter) ? [] : presetsForPlatform(platform);
+  const contributed = isMediaCapability(capabilityFilter) ? [] : extraPresets.filter((preset) => preset.platform === platform);
+  const presets = [...builtin, ...contributed];
   if (presets.length === 0) {
     return null;
   }
@@ -4098,6 +4104,15 @@ export function AccountsScreen({
   // state change made elsewhere — another view or a listener error —
   // then took up to 15s to show up even though the proxy had only just stopped.
   const stoppedPollsRef = useRef(0);
+  // Plugin-contributed provider presets; disabled packs contribute nothing.
+  const pluginPresetsQuery = useQuery({
+    queryKey: ["plugin-presets"],
+    queryFn: pluginPackListPresets,
+  });
+  const pluginPresets = useMemo(
+    () => mergePluginPresets(pluginPresetsQuery.data ?? []),
+    [pluginPresetsQuery.data],
+  );
   const routeProxyQuery = useQuery({
     queryKey: ["route-proxy-status"],
     queryFn: getRouteProxyStatus,
@@ -9070,6 +9085,7 @@ export function AccountsScreen({
                 {createTab === "basic" ? (
                   <>
                     <PresetFields
+                      extraPresets={pluginPresets}
                       capabilityFilter={capabilityFilter}
                       modelMappings={apiMappings}
                       interfaceFormat={apiInterfaceFormat}
@@ -10344,6 +10360,7 @@ export function AccountsScreen({
                     </select>
                   </label>
                   {capabilityFilter === IMAGE_CAPABILITY ? <PresetFields
+                      extraPresets={pluginPresets}
                     capabilityFilter={capabilityFilter}
                     modelMappings={editModelMappings}
                     interfaceFormat={editApiInterfaceFormat}

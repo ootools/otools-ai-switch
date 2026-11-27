@@ -94,6 +94,9 @@ import type {
   SkillScope,
   SkillsListResult,
   SkillsPackageListResult,
+  PluginDetail,
+  PluginPreset,
+  PluginSummary,
 } from "./types";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -861,6 +864,35 @@ export function skillsReadPackage(input: {
     scope: input.scope ?? null,
     workspacePath: input.workspacePath ?? null,
   });
+}
+
+/** Declarative plugin packs — list / install / enable. No code is executed. */
+export function pluginPackList(): Promise<PluginSummary[]> {
+  return invoke("plugin_pack_list");
+}
+
+export function pluginPackGetDetail(id: string): Promise<PluginDetail> {
+  return invoke("plugin_pack_get_detail", { id });
+}
+
+export function pluginPackInstallFolder(path: string): Promise<PluginSummary> {
+  return invoke("plugin_pack_install_folder", { path });
+}
+
+export function pluginPackInstallUrl(url: string, sha256: string): Promise<PluginSummary> {
+  return invoke("plugin_pack_install_url", { url, sha256 });
+}
+
+export function pluginPackUninstall(id: string): Promise<void> {
+  return invoke("plugin_pack_uninstall", { id });
+}
+
+export function pluginPackSetEnabled(id: string, enabled: boolean): Promise<void> {
+  return invoke("plugin_pack_set_enabled", { id, enabled });
+}
+
+export function pluginPackListPresets(): Promise<PluginPreset[]> {
+  return invoke("plugin_pack_list_presets");
 }
 
 /// `skillIds` null installs every missing member; pass ids to install just those.

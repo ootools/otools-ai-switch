@@ -55,6 +55,7 @@ import {
   routeConfigWriteIsStale,
   writeRouteProxyConfigs,
   previewExternalClientImport,
+  pluginPackListPresets,
 } from "../src/lib/api/client";
 import { recognizeApiKeysFromImageBlob } from "../src/lib/ocr/apiKeyOcr";
 import type { FetchedRouteModel } from "../src/lib/api/types";
@@ -147,6 +148,7 @@ vi.mock("../src/lib/api/client", () => ({
   routeConfigWriteIsStale: vi.fn(),
   writeRouteProxyConfigs: vi.fn(),
   previewExternalClientImport: vi.fn(),
+  pluginPackListPresets: vi.fn(),
 }));
 
 const transportTestState = vi.hoisted(() => ({
@@ -664,6 +666,8 @@ describe("AccountsScreen", () => {
     vi.mocked(importOfficialRouteCredentialsFromFiles).mockReset();
     vi.mocked(importOfficialRouteCredentialsFromText).mockReset();
     vi.mocked(previewExternalClientImport).mockReset();
+    vi.mocked(pluginPackListPresets).mockReset();
+    vi.mocked(pluginPackListPresets).mockResolvedValue([]);
     // The panel only reads another app's config when its tab is open, so the
     // default is an empty preview rather than a rejection.
     vi.mocked(previewExternalClientImport).mockResolvedValue(externalPreviewFixture([]));

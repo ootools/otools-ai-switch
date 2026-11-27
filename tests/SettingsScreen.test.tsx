@@ -20,6 +20,12 @@ import {
   saveSettings,
   testNotification,
   uninstallRouteProxyRootCa,
+  pluginPackList,
+  pluginPackGetDetail,
+  pluginPackInstallFolder,
+  pluginPackInstallUrl,
+  pluginPackSetEnabled,
+  pluginPackUninstall,
 } from "../src/lib/api/client";
 import { I18nProvider } from "../src/lib/i18n";
 import { createQueryClient } from "../src/lib/query/queryClient";
@@ -50,6 +56,12 @@ vi.mock("../src/lib/api/client", () => ({
   cancelPiiModelDownload: vi.fn(),
   deletePiiModel: vi.fn(),
   warmPiiModel: vi.fn(),
+  pluginPackList: vi.fn(),
+  pluginPackGetDetail: vi.fn(),
+  pluginPackInstallFolder: vi.fn(),
+  pluginPackInstallUrl: vi.fn(),
+  pluginPackSetEnabled: vi.fn(),
+  pluginPackUninstall: vi.fn(),
 }));
 vi.mock("../src/lib/transport", () => ({
   isDesktop: vi.fn(() => true),
@@ -149,6 +161,13 @@ describe("SettingsScreen", () => {
     vi.mocked(listConfigSnapshots).mockReset();
     vi.mocked(listConfigSnapshots).mockResolvedValue([]);
     vi.mocked(testNotification).mockReset();
+    vi.mocked(pluginPackList).mockReset();
+    vi.mocked(pluginPackList).mockResolvedValue([]);
+    vi.mocked(pluginPackGetDetail).mockReset();
+    vi.mocked(pluginPackInstallFolder).mockReset();
+    vi.mocked(pluginPackInstallUrl).mockReset();
+    vi.mocked(pluginPackSetEnabled).mockReset();
+    vi.mocked(pluginPackUninstall).mockReset();
   });
 
   it("shows only the active tab content", async () => {
@@ -157,6 +176,17 @@ describe("SettingsScreen", () => {
     expect(screen.queryByRole("textbox", { name: "代理地址" })).not.toBeInTheDocument();
     await openTab("代理");
     expect(await screen.findByRole("textbox", { name: "代理地址" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("combobox", { name: "主题外观" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("opens the plugins tab and shows the pack manager", async () => {
+    renderSettings();
+    await openTab("插件");
+    expect(await screen.findByRole("button", { name: "从文件夹安装" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "从 URL 安装" })).toBeInTheDocument();
+    expect(screen.getByText("尚未安装插件包。")).toBeInTheDocument();
     await waitFor(() =>
       expect(screen.queryByRole("combobox", { name: "主题外观" })).not.toBeInTheDocument(),
     );
