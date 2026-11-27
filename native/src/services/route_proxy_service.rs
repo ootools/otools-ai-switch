@@ -1355,7 +1355,7 @@ async fn forward_request_in_generation(
     } else {
         None
     };
-    let (candidates, requested_model, body_bytes) = resolve_account_scoped_model(
+    let (candidates, requested_model, mut body_bytes) = resolve_account_scoped_model(
         &platform,
         candidates,
         requested_model,
@@ -1438,21 +1438,6 @@ async fn forward_request_in_generation(
     let custom_tool_names = collect_custom_tool_names(&body_bytes);
     let upstream_query = strip_route_proxy_auth_query(query.as_deref());
     let default_client = build_outbound_http_client_with_timeouts(state.upstream_timeouts)?;
-    // Fallback for upstreams that fetch remote image URLs and reject non-image
-    // Content-Types (e.g. OSS objects served as text/plain): when a routed
-    // credential opts in, inline remote images as base64 data URLs up front.
-    // Mutable because a rejected reasoning signature is recovered by rewriting
-    // the body and re-asking the same account; see the retry loop below.
-    let mut body_bytes = if let Some(image_credential) = credentials
-        .iter()
-        .find(|credential| selected_credential_inlines_images(credential))
-    {
-        let image_client =
-            state.outbound_client_for_config(&default_client, &image_credential.config_json)?;
-        axum::body::Bytes::from(inline_remote_image_urls_in_body(&body_bytes, &image_client).await)
-    } else {
-        body_bytes
-    };
     let request_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|err| format!("Unsupported method: {err}"))?;
     let retry_indexes = credential_indexes_by_priority(&credentials, cursor);
@@ -1461,6 +1446,7 @@ async fn forward_request_in_generation(
         .map(|credential_index| (credential_index, 0usize))
         .collect::<VecDeque<_>>();
     let mut retry_errors = Vec::new();
+    let mut last_pipeline = crate::models::pipeline::PipelineConfig::default();
     let mut rejected_indexes = Vec::new();
     let request_start = Instant::now();
     let mut acquired_any = false;
@@ -1489,11 +1475,18 @@ async fn forward_request_in_generation(
             if retry_indexes.is_empty() {
                 break;
             }
-            let Some(next_body) = request_content_rejection::elide_old_tool_outputs(&body_bytes)
-            else {
-                break;
-            };
-            body_bytes = axum::body::Bytes::from(next_body);
+            let recovery_pipeline = credentials
+                .iter()
+                .map(|credential| crate::models::pipeline::resolve_pipeline(&credential.config_json))
+                .find(|candidate| candidate.has("builtin.request.contentRejection", true))
+                .unwrap_or_else(|| last_pipeline.clone());
+            let recovery_ctx = crate::services::plugin_middleware::hook_context(
+                &platform, &path, "retryRecovery", None, None, None, None, None,
+            );
+            let recovered = crate::services::plugin_middleware::apply_chain(
+                &recovery_pipeline, &body_bytes, "retryRecovery", &recovery_ctx,
+            ).bytes;
+            body_bytes = axum::body::Bytes::from(recovered);
             trimmed_content_rejection_retry = true;
             retry_queue = retry_indexes
                 .into_iter()
@@ -1587,18 +1580,21 @@ async fn forward_request_in_generation(
                 }
             };
         let pipeline = crate::models::pipeline::resolve_pipeline(&credential.config_json);
-        let effective_config =
-            crate::services::builtin_plugins::effective_config(&pipeline, &credential.config_json);
-        let effective_config_json = effective_config.to_string();
+        last_pipeline = pipeline.clone();
         let failure_policy =
             crate::services::builtin_plugins::failure_policy_from_pipeline(&pipeline, &credential.config_json);
-        body_bytes = axum::body::Bytes::from(crate::services::builtin_plugins::apply_pack_chain(
-            &pipeline,
-            &body_bytes,
-            true,
-            &platform,
-            &path,
-        ));
+        let effective_config_json = crate::services::builtin_plugins::effective_config_with_policy(
+            &pipeline, &credential.config_json, Some(&failure_policy),
+        ).to_string();
+        let base_url = parse_json_object(&credential.config_json, "config")
+            .ok()
+            .and_then(|config| string_value(&config, "base_url").map(str::to_string));
+        let inline_ctx = crate::services::plugin_middleware::hook_context(
+            &platform, &path, "inlineRemote", base_url.as_deref(), None, None, None, Some(attempt),
+        );
+        body_bytes = axum::body::Bytes::from(crate::services::plugin_middleware::apply_chain(
+            &pipeline, &body_bytes, "inlineRemote", &inline_ctx,
+        ).bytes);
         let client =
             match state.outbound_client_for_config(&default_client, &credential.config_json) {
                 Ok(client) => client,
@@ -1646,11 +1642,13 @@ async fn forward_request_in_generation(
         // the switch is per account, and computed from `body_bytes` rather than
         // replacing it, so the client's own request still appears untrimmed in the
         // logs and in every other candidate's attempt.
-        let proactive_image_trim = if image_limit_trim_enabled(&effective_config_json) {
-            request_image_limit::trim_old_images(&body_bytes)
-        } else {
-            None
-        };
+        let image_ctx = crate::services::plugin_middleware::hook_context(
+            &platform, &path, "imageLimit", base_url.as_deref(), None, None, None, Some(attempt),
+        );
+        let image_outcome = crate::services::plugin_middleware::apply_chain(
+            &pipeline, &body_bytes, "imageLimit", &image_ctx,
+        );
+        let proactive_image_trim = (image_outcome.bytes != body_bytes.as_ref()).then_some(image_outcome.bytes);
         if proactive_image_trim.is_some() {
             images_trimmed = true;
         }
@@ -1760,27 +1758,45 @@ async fn forward_request_in_generation(
             bridge_kind,
             None | Some(ProtocolBridgeKind::ResponsesToChat) | Some(ProtocolBridgeKind::ClaudeToChat)
         );
-        if chat_bridge
-            && (reasoning_forced
-                || force_reasoning_content_enabled(
-                    &parse_json_object(&effective_config_json, "config").unwrap_or(Value::Null),
-                ))
-        {
-            if let Some(forced) = force_reasoning_content_on_chat_body(&outbound_body) {
-                outbound_body = forced;
-            }
+        let force_pipeline = if reasoning_forced && !pipeline.has("builtin.request.forceReasoning", true) {
+            let mut forced = pipeline.clone();
+            forced.request.chain.push(crate::models::pipeline::PluginInstance {
+                id: "builtin.request.forceReasoning".into(), enabled: true, config: json!({}),
+            });
+            std::borrow::Cow::Owned(forced)
+        } else {
+            std::borrow::Cow::Borrowed(&pipeline)
+        };
+        if chat_bridge && (reasoning_forced || pipeline.has("builtin.request.forceReasoning", true)) {
+            let force_ctx = crate::services::plugin_middleware::hook_context(
+                &platform, &path, "forceReasoning", base_url.as_deref(), None, None, None, Some(attempt),
+            );
+            outbound_body = crate::services::plugin_middleware::apply_chain(
+                &force_pipeline, &outbound_body, "forceReasoning", &force_ctx,
+            ).bytes;
         }
         // Diagnostics and model accounting keep decoded JSON. Only the wire
         // body and its transport headers receive provider-specific encoding.
         let upstream_request_bytes = outbound_body.clone();
         let upstream_model = requested_model_from_body(&outbound_body);
-        let outbound_body = request_compression::encode_request_body(
-            &target_url,
-            &mut request_headers,
-            &outbound_body,
-            &parse_json_object(&effective_config_json, "config").unwrap_or(Value::Null),
-        )
-        .unwrap_or(outbound_body);
+        let mut header_map = std::collections::HashMap::new();
+        for (key, value) in request_headers.iter() {
+            if let Ok(text) = value.to_str() { header_map.insert(key.as_str().to_string(), text.to_string()); }
+        }
+        let wire_ctx = crate::services::plugin_middleware::hook_context(
+            &platform, &path, "wire", Some(&target_url), None, Some(&header_map),
+            Some(&base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &outbound_body)), Some(attempt),
+        );
+        let wire = crate::services::plugin_middleware::apply_chain(&pipeline, &outbound_body, "wire", &wire_ctx);
+        let mut outbound_body = wire.bytes;
+        for (key, value) in wire.headers {
+            if let Ok(name) = axum::http::header::HeaderName::from_bytes(key.as_bytes()) {
+                match value {
+                    Some(text) => { if let Ok(header_value) = axum::http::HeaderValue::from_str(&text) { request_headers.insert(name, header_value); } }
+                    None => { request_headers.remove(name); }
+                }
+            }
+        }
         let mut active_attempt = activity_request_id.as_deref().and_then(|request_id| {
             state.active_attempts.begin_in_generation(generation, request_id, &platform, client_key, &credential.id, &credential.display_name)
         });
@@ -2576,13 +2592,12 @@ async fn forward_request_in_generation(
             );
             response_bytes = axum::body::Bytes::from(restored.into_bytes());
         }
-        response_bytes = axum::body::Bytes::from(crate::services::builtin_plugins::apply_pack_chain(
-            &pipeline,
-            &response_bytes,
-            false,
-            &platform,
-            &path,
-        ));
+        let response_ctx = crate::services::plugin_middleware::hook_context(
+            &platform, &path, "response", None, None, None, None, Some(attempt),
+        );
+        response_bytes = axum::body::Bytes::from(crate::services::plugin_middleware::apply_chain(
+            &pipeline, &response_bytes, "response", &response_ctx,
+        ).bytes);
         // Capture official subscription/quota signals (e.g. Grok free-usage-exhausted).
         let quota_exhausted = if credential.kind == "official" {
             if let Ok(body_text) = std::str::from_utf8(&response_bytes) {
@@ -5104,16 +5119,25 @@ impl StreamPump {
             };
             // 与原请求同一条编码路径，别让压缩设置上的差异暴露出来。
             let resume_pipeline = crate::models::pipeline::resolve_pipeline(&credential.config_json);
-            let resume_effective =
-                crate::services::builtin_plugins::effective_config(&resume_pipeline, &credential.config_json);
             let mut request_headers = built.headers;
-            let outbound_body = request_compression::encode_request_body(
-                &built.target_url,
-                &mut request_headers,
-                &built.body,
-                &resume_effective,
-            )
-            .unwrap_or(built.body);
+            let mut resume_header_map = std::collections::HashMap::new();
+            for (key, value) in request_headers.iter() {
+                if let Ok(text) = value.to_str() { resume_header_map.insert(key.as_str().to_string(), text.to_string()); }
+            }
+            let resume_ctx = crate::services::plugin_middleware::hook_context(
+                &platform, "", "wire", Some(&built.target_url), None, Some(&resume_header_map),
+                Some(&base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &built.body)), None,
+            );
+            let wire = crate::services::plugin_middleware::apply_chain(&resume_pipeline, &built.body, "wire", &resume_ctx);
+            let mut outbound_body = wire.bytes;
+            for (key, value) in wire.headers {
+                if let Ok(name) = axum::http::header::HeaderName::from_bytes(key.as_bytes()) {
+                    match value {
+                        Some(text) => { if let Ok(header_value) = axum::http::HeaderValue::from_str(&text) { request_headers.insert(name, header_value); } }
+                        None => { request_headers.remove(name); }
+                    }
+                }
+            }
             let active_attempt = self.guard.completion.as_ref().and_then(|completion| {
                 completion.activity_request_id.as_deref().and_then(|request_id| {
                     state.active_attempts.begin_in_generation(completion.activity_generation, request_id, &platform, completion.client_key.as_deref(), &credential.id, &credential.display_name)
@@ -7387,10 +7411,26 @@ fn build_api_upstream_request(
             ApiDialect::OpenAi | ApiDialect::Anthropic | ApiDialect::Gemini
         )
         && is_responses_path(&upstream_path);
-    if (responses_custom_tool_compat_enabled(config) || bridge_requires_custom_tool_compat)
+    let pipeline = crate::models::pipeline::resolve_pipeline(&credential.config_json);
+    let pre_ctx = crate::services::plugin_middleware::hook_context(
+        platform.as_str(), path, "preBridge", Some(&base_url), Some(dialect.as_str()),
+        None, None, None,
+    );
+    let custom_pipeline = if bridge_requires_custom_tool_compat && !pipeline.has("builtin.request.customToolCompat", true) {
+        let mut forced = pipeline.clone();
+        forced.request.chain.push(crate::models::pipeline::PluginInstance {
+            id: "builtin.request.customToolCompat".into(), enabled: true, config: json!({}),
+        });
+        std::borrow::Cow::Owned(forced)
+    } else {
+        std::borrow::Cow::Borrowed(&pipeline)
+    };
+    if (pipeline.has("builtin.request.customToolCompat", true) || bridge_requires_custom_tool_compat)
         && should_rewrite_custom_tools_for_api(&upstream_path)
     {
-        rewritten_body = apply_responses_custom_tool_compat(&rewritten_body);
+        rewritten_body = crate::services::plugin_middleware::apply_chain(
+            &custom_pipeline, &rewritten_body, "preBridge", &pre_ctx,
+        ).bytes;
         // Third-party Responses gateways (Xiaomi MiMo, …) reject OpenAI-hosted
         // tool types with `responses_feature_not_supported`; drop them so the
         // rest of the request still goes through.
@@ -7431,46 +7471,30 @@ fn build_api_upstream_request(
     if dialect == ApiDialect::OpenAi && matches!(upstream_path.as_str(), "/images/generations" | "/v1/images/generations") {
         rewritten_body = crate::imagegen::protocol::normalize_images_request_for_upstream(base_url, &rewritten_body)?;
     }
-    // 跨资源剥离：Azure 多资源中转会把同一会话的相邻请求轮转到不同资源，
-    // 而 Codex 每轮原样回传服务端 item id、加密思维链和 previous_response_id，
-    // 非原资源一律 400（"created under a different Azure OpenAI resource"）。
-    // 先于密文清理由此执行：密文清理是形状感知的，会保留外形合法的外来密文，
-    // 而这里恰恰要把它们全部去掉，让请求变成任何资源都能接受的无状态形态。
-    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
-        && crate::services::responses_cross_resource_strip::enabled(config)
-    {
-        if let Some(stripped) = crate::services::responses_cross_resource_strip::strip(&rewritten_body)
-        {
-            rewritten_body = stripped;
-        }
-    }
-    // 目标账号专属的出站适配：切到 Chat/Anthropic/Gemini 不经过此分支，
-    // 客户端传入的历史字节从未修改，密文清理由下方独立开关控制。
-    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
-        && crate::services::responses_plaintext_reasoning::enabled(config)
-    {
-        if let Some(normalized) =
-            crate::services::responses_plaintext_reasoning::normalize(&rewritten_body)
-        {
-            rewritten_body = normalized;
-        }
-    }
+    // Plugin-owned Responses replay transforms. Order is fixed by the distinct
+    // stages below; within each stage the account chain order wins.
+    let post_ctx = crate::services::plugin_middleware::hook_context(
+        platform.as_str(), path, "postBridge", Some(&base_url), Some(dialect.as_str()),
+        None, None, None,
+    );
     let mut reasoning_sanitized = false;
-    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses)
-        && responses_encrypted_content_cleanup_enabled(config)
-    {
-        if let Some(cleaned) =
-            sanitize_reasoning_from_bytes(&rewritten_body, responses_cleanup_mode(config))
-        {
-            rewritten_body = cleaned;
-            reasoning_sanitized = true;
-        }
+    if bridge_kind == Some(ProtocolBridgeKind::ResponsesToResponses) {
+        rewritten_body = crate::services::plugin_middleware::apply_chain(
+            &pipeline, &rewritten_body, "postBridgeCross", &post_ctx,
+        ).bytes;
+        rewritten_body = crate::services::plugin_middleware::apply_chain(
+            &pipeline, &rewritten_body, "postBridgePlaintext", &post_ctx,
+        ).bytes;
+        let before_encrypted = rewritten_body.clone();
+        rewritten_body = crate::services::plugin_middleware::apply_chain(
+            &pipeline, &rewritten_body, "postBridgeEncrypted", &post_ctx,
+        ).bytes;
+        reasoning_sanitized = rewritten_body != before_encrypted;
     }
     if turn_reminder == TurnReminderMode::Apply {
-        if let Some(reminder) = turn_reminder_text(config) {
-            rewritten_body =
-                turn_reminder::append_turn_reminder(dialect, &rewritten_body, &reminder);
-        }
+        rewritten_body = crate::services::plugin_middleware::apply_chain(
+            &pipeline, &rewritten_body, "postBridgeReminder", &post_ctx,
+        ).bytes;
     }
     // A bridged body carries the *client's* system prompt, and no client except
     // Claude Code sends Claude Code's. Relays gating on the Claude Code signature
@@ -24150,4 +24174,5 @@ data: [DONE]\n\n";
         );
     }
 }
+
 

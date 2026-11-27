@@ -1,0 +1,21 @@
+[
+  { "id": "builtin.request.compression", "name": "请求压缩", "description": "按账号策略对出站请求体做 Brotli 压缩。", "lane": "request", "kind": "transform", "stage": "wire", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
+  { "id": "builtin.request.contentRejection", "name": "内容过滤兼容", "description": "裁剪旧工具输出以避开上游内容审核。", "lane": "request", "kind": "transform", "stage": "retryRecovery", "config_fields": [] },
+  { "id": "builtin.request.imageLimit", "name": "图片超限兼容", "description": "裁剪旧图片以避开上游图片数量限制。", "lane": "request", "kind": "transform", "stage": "imageLimit", "config_fields": [] },
+  { "id": "builtin.request.forceReasoning", "name": "强制回传推理", "description": "要求上游回传推理内容。", "lane": "request", "kind": "transform", "stage": "forceReasoning", "config_fields": [] },
+  { "id": "builtin.request.inlineRemoteImages", "name": "内联远程图片", "description": "把远程图片内联后发送。", "lane": "request", "kind": "transform", "stage": "inlineRemote", "config_fields": [] },
+  { "id": "builtin.request.turnReminder", "name": "每轮纠偏提醒", "description": "每轮请求追加一段自定义提醒。", "lane": "request", "kind": "transform", "stage": "postBridgeReminder", "config_fields": [{ "key": "text", "label": "提醒内容", "kind": "textarea" }] },
+  { "id": "builtin.request.customToolCompat", "name": "自定义工具兼容", "description": "为 Responses 客户端补齐自定义工具字段。", "lane": "request", "kind": "transform", "stage": "preBridge", "config_fields": [] },
+  { "id": "builtin.schedule.retry", "name": "重试策略", "description": "失败后的重试次数、间隔与按错误类型的上限。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "retry_count", "label": "重试次数", "kind": "number" }, { "key": "retry_interval_ms", "label": "重试间隔(ms)", "kind": "number" }, { "key": "max_retry_elapsed_seconds", "label": "总时长上限(秒)", "kind": "number" }] },
+  { "id": "builtin.schedule.semanticThreshold", "name": "语义失败阈值", "description": "判定语义失败的阈值。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "value", "label": "阈值", "kind": "number" }] },
+  { "id": "builtin.schedule.cooldown", "name": "失败冷却", "description": "失败后临时冷却该账号。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "seconds", "label": "冷却秒数", "kind": "number" }] },
+  { "id": "builtin.schedule.errorStatus", "name": "错误状态标记", "description": "把失败写回账号状态标签。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
+  { "id": "builtin.schedule.streamPrelude", "name": "建流等待", "description": "等待上游建流帧的时长。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "ms", "label": "等待(ms)", "kind": "number" }] },
+  { "id": "builtin.schedule.streamSalvage", "name": "流内失败挽救", "description": "流内失败时续写完成本轮。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
+  { "id": "builtin.schedule.streamContinue", "name": "断流续写", "description": "断流后继续请求补全答案。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "max", "label": "最多轮次", "kind": "number" }] },
+  { "id": "builtin.schedule.failover", "name": "故障转移", "description": "失败后切换到池内其它账号。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
+  { "id": "builtin.response.plaintextReasoning", "name": "明文推理兼容", "description": "把上游推理字段规范化为明文。", "lane": "response", "kind": "transform", "stage": "postBridgePlaintext", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
+  { "id": "builtin.response.crossResourceStrip", "name": "跨资源状态剥离", "description": "剥离上游返回的跨资源状态字段。", "lane": "response", "kind": "transform", "stage": "postBridgeCross", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
+  { "id": "builtin.response.encryptedContentCleanup", "name": "推理内容清理", "description": "清理响应中的加密推理内容。", "lane": "response", "kind": "transform", "stage": "postBridgeEncrypted", "config_fields": [{ "key": "aggressive_strip", "label": "激进剥离", "kind": "bool" }] }
+]
+

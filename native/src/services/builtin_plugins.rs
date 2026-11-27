@@ -1,17 +1,16 @@
 //! Built-in plugins exposed through the same plugin architecture as user packs.
 //!
-//! Unlike user packs (QuickJS, global, credential-free), built-ins are native
-//! descriptors selected and ordered per account in `config_json.pipeline`. They
-//! are applied by translating the chain into the flat config keys the existing
-//! transform helpers already read, so no request logic is duplicated here.
+//! Every built-in ships as an embedded `middleware.js` script plus a descriptor
+//! in `scripts/manifest.json`. The catalog, the QuickJS runtime and the account
+//! chain all consume that manifest, so a built-in can be exported as a normal
+//! third-party pack without changing the host.
 
 use crate::error::AppError;
-use crate::models::pipeline::{
-    PipelineConfig, REQUEST_SCHEDULE_PLUGINS, REQUEST_TRANSFORM_PLUGINS, RESPONSE_PLUGINS,
-};
+use crate::models::pipeline::PipelineConfig;
+use std::sync::OnceLock;
 use crate::models::route_credential::RouteCredentialFailurePolicy;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -41,246 +40,222 @@ pub struct BuiltinPluginDescriptor {
     pub description: String,
     pub lane: PluginLane,
     pub kind: PluginKind,
+    /// Where in the proxy pipeline this plugin runs. Not sent to the UI in a
+    /// meaningful way, but kept on the wire shape for simplicity.
+    #[serde(default = "default_stage")]
+    pub stage: String,
     #[serde(default)]
     pub config_fields: Vec<PluginConfigField>,
 }
 
-fn field(key: &str, label: &str, kind: &str) -> PluginConfigField {
-    PluginConfigField {
-        key: key.to_string(),
-        label: label.to_string(),
-        kind: kind.to_string(),
-    }
+fn default_stage() -> String {
+    "perAttempt".into()
 }
 
-fn descriptor(
-    id: &str,
-    name: &str,
-    description: &str,
-    lane: PluginLane,
-    kind: PluginKind,
-    fields: Vec<PluginConfigField>,
-) -> BuiltinPluginDescriptor {
-    BuiltinPluginDescriptor {
-        id: id.to_string(),
-        name: name.to_string(),
-        description: description.to_string(),
-        lane,
-        kind,
-        config_fields: fields,
-    }
+const MANIFEST: &str = include_str!("builtin_plugins/scripts/manifest.json");
+
+/// Embedded scripts, keyed by the same ids used in account chains.
+pub fn embedded_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("builtin.request.compression", include_str!("builtin_plugins/scripts/builtin.request.compression.js")),
+        ("builtin.request.contentRejection", include_str!("builtin_plugins/scripts/builtin.request.contentRejection.js")),
+        ("builtin.request.imageLimit", include_str!("builtin_plugins/scripts/builtin.request.imageLimit.js")),
+        ("builtin.request.forceReasoning", include_str!("builtin_plugins/scripts/builtin.request.forceReasoning.js")),
+        ("builtin.request.inlineRemoteImages", include_str!("builtin_plugins/scripts/builtin.request.inlineRemoteImages.js")),
+        ("builtin.request.turnReminder", include_str!("builtin_plugins/scripts/builtin.request.turnReminder.js")),
+        ("builtin.request.customToolCompat", include_str!("builtin_plugins/scripts/builtin.request.customToolCompat.js")),
+        ("builtin.schedule.retry", include_str!("builtin_plugins/scripts/builtin.schedule.retry.js")),
+        ("builtin.schedule.semanticThreshold", include_str!("builtin_plugins/scripts/builtin.schedule.semanticThreshold.js")),
+        ("builtin.schedule.cooldown", include_str!("builtin_plugins/scripts/builtin.schedule.cooldown.js")),
+        ("builtin.schedule.errorStatus", include_str!("builtin_plugins/scripts/builtin.schedule.errorStatus.js")),
+        ("builtin.schedule.streamPrelude", include_str!("builtin_plugins/scripts/builtin.schedule.streamPrelude.js")),
+        ("builtin.schedule.streamSalvage", include_str!("builtin_plugins/scripts/builtin.schedule.streamSalvage.js")),
+        ("builtin.schedule.streamContinue", include_str!("builtin_plugins/scripts/builtin.schedule.streamContinue.js")),
+        ("builtin.schedule.failover", include_str!("builtin_plugins/scripts/builtin.schedule.failover.js")),
+        ("builtin.response.plaintextReasoning", include_str!("builtin_plugins/scripts/builtin.response.plaintextReasoning.js")),
+        ("builtin.response.crossResourceStrip", include_str!("builtin_plugins/scripts/builtin.response.crossResourceStrip.js")),
+        ("builtin.response.encryptedContentCleanup", include_str!("builtin_plugins/scripts/builtin.response.encryptedContentCleanup.js")),
+    ]
 }
 
 /// The catalog shown by the visual flow editor.
 pub fn list() -> Vec<BuiltinPluginDescriptor> {
-    let request = PluginLane::Request;
-    let response = PluginLane::Response;
-    let transform = PluginKind::Transform;
-    let schedule = PluginKind::Schedule;
-    vec![
-        descriptor("builtin.request.compression", "请求压缩", "按账号策略对出站请求体做 Brotli 压缩。", request.clone(), transform.clone(), vec![field("mode", "模式", "select")]),
-        descriptor("builtin.request.contentRejection", "内容过滤兼容", "裁剪旧工具输出以避开上游内容审核。", request.clone(), transform.clone(), vec![]),
-        descriptor("builtin.request.imageLimit", "图片超限兼容", "裁剪旧图片以避开上游图片数量限制。", request.clone(), transform.clone(), vec![]),
-        descriptor("builtin.request.forceReasoning", "强制回传推理", "要求上游回传推理内容。", request.clone(), transform.clone(), vec![]),
-        descriptor("builtin.request.inlineRemoteImages", "内联远程图片", "把远程图片内联后发送。", request.clone(), transform.clone(), vec![]),
-        descriptor("builtin.request.turnReminder", "每轮纠偏提醒", "每轮请求追加一段自定义提醒。", request.clone(), transform.clone(), vec![field("text", "提醒内容", "textarea")]),
-        descriptor("builtin.request.customToolCompat", "自定义工具兼容", "为 Responses 客户端补齐自定义工具字段。", request.clone(), transform.clone(), vec![]),
-        descriptor("builtin.schedule.retry", "重试策略", "失败后的重试次数、间隔与按错误类型的上限。", request.clone(), schedule.clone(), vec![field("retry_count", "重试次数", "number"), field("retry_interval_ms", "重试间隔(ms)", "number"), field("max_retry_elapsed_seconds", "总时长上限(秒)", "number")]),
-        descriptor("builtin.schedule.semanticThreshold", "语义失败阈值", "判定语义失败的阈值。", request.clone(), schedule.clone(), vec![field("value", "阈值", "number")]),
-        descriptor("builtin.schedule.cooldown", "失败冷却", "失败后临时冷却该账号。", request.clone(), schedule.clone(), vec![field("seconds", "冷却秒数", "number")]),
-        descriptor("builtin.schedule.errorStatus", "错误状态标记", "把失败写回账号状态标签。", request.clone(), schedule.clone(), vec![]),
-        descriptor("builtin.schedule.streamPrelude", "建流等待", "等待上游建流帧的时长。", request.clone(), schedule.clone(), vec![field("ms", "等待(ms)", "number")]),
-        descriptor("builtin.schedule.streamSalvage", "流内失败挽救", "流内失败时续写完成本轮。", request.clone(), schedule.clone(), vec![]),
-        descriptor("builtin.schedule.streamContinue", "断流续写", "断流后继续请求补全答案。", request.clone(), schedule.clone(), vec![field("max", "最多轮次", "number")]),
-        descriptor("builtin.schedule.failover", "故障转移", "失败后切换到池内其它账号。", request, schedule, vec![]),
-        descriptor("builtin.response.plaintextReasoning", "明文推理兼容", "把上游推理字段规范化为明文。", response.clone(), transform.clone(), vec![field("mode", "模式", "select")]),
-        descriptor("builtin.response.crossResourceStrip", "跨资源状态剥离", "剥离上游返回的跨资源状态字段。", response.clone(), transform.clone(), vec![field("mode", "模式", "select")]),
-        descriptor("builtin.response.encryptedContentCleanup", "推理内容清理", "清理响应中的加密推理内容。", response, transform, vec![field("aggressive_strip", "激进剥离", "bool")]),
-    ]
+    serde_json::from_str::<Vec<BuiltinPluginDescriptor>>(MANIFEST)
+        .expect("valid builtin plugin manifest")
 }
 
 pub fn get(id: &str) -> Option<BuiltinPluginDescriptor> {
     list().into_iter().find(|plugin| plugin.id == id)
 }
 
+pub fn is_known_builtin(id: &str) -> bool {
+    get(id).is_some()
+}
+
+/// Stage declared by an embedded plugin, or `perAttempt` for unknown ids.
+pub fn stage_for(id: &str) -> String {
+    get(id).map(|descriptor| descriptor.stage).unwrap_or_else(|| "perAttempt".into())
+}
+
 pub fn validate(pipeline: &PipelineConfig) -> Result<(), AppError> {
     crate::models::pipeline::validate_pipeline(pipeline)
 }
 
-fn plugin_config(pipeline: &PipelineConfig, id: &str, request: bool) -> Value {
-    let Some(config) = pipeline.config_for(id, request) else {
-        return json!({});
-    };
-    match config {
-        Value::Object(map) => Value::Object(map.clone()),
-        _ => json!({}),
-    }
-}
-
-fn str_cfg(config: &Map<String, Value>, key: &str, fallback: &str) -> String {
-    config
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string()
-}
-
-fn bool_cfg(config: &Map<String, Value>, key: &str, fallback: bool) -> bool {
-    config
-        .get(key)
-        .and_then(Value::as_bool)
-        .unwrap_or(fallback)
-}
-
-fn u32_cfg(config: &Map<String, Value>, key: &str, fallback: u32) -> u32 {
-    config
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(fallback)
-}
-
-/// Translate the pipeline into the flat config keys read by the existing
-/// transform helpers. Passthrough explicitly disables every transform key.
-pub fn effective_config(pipeline: &PipelineConfig, config_json: &str) -> Value {
-    let mut config: Value = serde_json::from_str(config_json).unwrap_or_else(|_| json!({}));
-    if !config.is_object() {
-        config = json!({});
-    }
-    let map = config.as_object_mut().expect("object");
-
-    if pipeline.is_passthrough(true) {
-        map.insert("request_brotli_compression".into(), json!("off"));
-        map.insert("content_rejection_compat".into(), json!(""));
-        map.insert("image_limit_compat".into(), json!(""));
-        map.insert("force_reasoning_content".into(), json!(false));
-        map.insert("inline_remote_images".into(), json!(false));
-        map.insert("turn_reminder".into(), json!(false));
-        map.insert("responses_custom_tool_compat".into(), json!(false));
-    } else {
-        for plugin in pipeline.enabled_chain(true) {
-            let cfg = plugin_config(pipeline, &plugin.id, true);
-            let fields = cfg.as_object().cloned().unwrap_or_default();
-            match plugin.id.as_str() {
-                "builtin.request.compression" => {
-                    let mode = str_cfg(&fields, "mode", "");
-                    if !mode.is_empty() {
-                        map.insert("request_brotli_compression".into(), json!(mode));
-                    }
-                }
-                "builtin.request.contentRejection" => {
-                    map.insert("content_rejection_compat".into(), json!("trim_old_tool_outputs"));
-                }
-                "builtin.request.imageLimit" => {
-                    map.insert("image_limit_compat".into(), json!("trim_old_images"));
-                }
-                "builtin.request.forceReasoning" => {
-                    map.insert("force_reasoning_content".into(), json!(true));
-                }
-                "builtin.request.inlineRemoteImages" => {
-                    map.insert("inline_remote_images".into(), json!(true));
-                }
-                "builtin.request.turnReminder" => {
-                    map.insert("turn_reminder".into(), json!(true));
-                    map.insert("turn_reminder_text".into(), json!(str_cfg(&fields, "text", "")));
-                }
-                "builtin.request.customToolCompat" => {
-                    map.insert("responses_custom_tool_compat".into(), json!(true));
-                }
-                _ => {}
-            }
+fn merge_policy(policy: &mut RouteCredentialFailurePolicy, patch: &Value) {
+    let Ok(serialized) = serde_json::to_value(*policy) else { return };
+    let mut map = serialized.as_object().cloned().unwrap_or_default();
+    let Some(patch) = patch.as_object() else { return };
+    for (key, value) in patch {
+        if map.contains_key(key) && !value.is_null() {
+            map.insert(key.clone(), value.clone());
         }
     }
-
-    if pipeline.is_passthrough(false) {
-        map.insert("responses_plaintext_reasoning_compat".into(), json!("off"));
-        map.insert("responses_cross_resource_strip".into(), json!("off"));
-        map.insert("responses_encrypted_content_cleanup".into(), json!(false));
-    } else {
-        for plugin in pipeline.enabled_chain(false) {
-            let cfg = plugin_config(pipeline, &plugin.id, false);
-            let fields = cfg.as_object().cloned().unwrap_or_default();
-            match plugin.id.as_str() {
-                "builtin.response.plaintextReasoning" => {
-                    let mode = str_cfg(&fields, "mode", "");
-                    if !mode.is_empty() {
-                        map.insert("responses_plaintext_reasoning_compat".into(), json!(mode));
-                    }
-                }
-                "builtin.response.crossResourceStrip" => {
-                    let mode = str_cfg(&fields, "mode", "");
-                    if !mode.is_empty() {
-                        map.insert("responses_cross_resource_strip".into(), json!(mode));
-                    }
-                }
-                "builtin.response.encryptedContentCleanup" => {
-                    map.insert("responses_encrypted_content_cleanup".into(), json!(true));
-                    map.insert("responses_encrypted_content_aggressive_strip".into(), json!(bool_cfg(&fields, "aggressive_strip", false)));
-                }
-                _ => {}
-            }
-        }
+    if let Ok(merged) = serde_json::from_value::<RouteCredentialFailurePolicy>(Value::Object(map)) {
+        *policy = merged;
     }
-    config
+}
+
+/// Failure policy cache. The same account config is resolved on every retry
+/// attempt, so cache by config_json and invalidate when plugins change.
+static POLICY_CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, RouteCredentialFailurePolicy)>>> = OnceLock::new();
+static POLICY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const POLICY_CACHE_MAX: usize = 512;
+
+/// Invalidate cached policies after a plugin install/uninstall/enable change.
+pub fn mark_policy_dirty() {
+    POLICY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Build the failure policy from the request lane. Passthrough means one
 /// attempt with no retry, no failover and no cooldown — raw forwarding.
-pub fn failure_policy_from_pipeline(
-    pipeline: &PipelineConfig,
-    config_json: &str,
-) -> RouteCredentialFailurePolicy {
+/// Schedule plugins declare their policy through the precompiled JS runner;
+/// the Rust match is a fallback if the runtime could not be configured.
+pub fn failure_policy_from_pipeline(pipeline: &PipelineConfig, config_json: &str) -> RouteCredentialFailurePolicy {
+    let generation = POLICY_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+    let cache = POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((cached_generation, policy)) = map.get(config_json) {
+            if *cached_generation == generation {
+                return *policy;
+            }
+        }
+    }
+    let policy = compute_policy(pipeline, config_json);
+    if let Ok(mut map) = cache.lock() {
+        if map.len() >= POLICY_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(config_json.to_string(), (generation, policy));
+    }
+    policy
+}
+
+fn compute_policy(pipeline: &PipelineConfig, config_json: &str) -> RouteCredentialFailurePolicy {
     let mut policy = RouteCredentialFailurePolicy::from_config_json(config_json);
     if pipeline.is_passthrough(true) {
-        policy.retry_count = 0;
-        policy.retry_class_limits = Default::default();
-        policy.capacity_retry_interval_ms = 0;
-        policy.max_retry_elapsed_seconds = 0;
-        policy.semantic_error_threshold = 0;
-        policy.cooldown_enabled = false;
-        policy.error_status_enabled = false;
-        policy.stream_continue_enabled = false;
-        policy.stream_salvage_enabled = false;
-        policy.failover_enabled = false;
-        policy.stream_prelude_wait_ms = 0;
-        return policy;
+        return zero_policy(policy);
     }
-    for plugin in pipeline.enabled_chain(true) {
-        let cfg = plugin_config(pipeline, &plugin.id, true);
-        let fields = cfg.as_object().cloned().unwrap_or_default();
-        match plugin.id.as_str() {
-            "builtin.schedule.retry" => {
-                policy.retry_count = u32_cfg(&fields, "retry_count", policy.retry_count);
-                policy.retry_interval_ms = u32_cfg(&fields, "retry_interval_ms", policy.retry_interval_ms);
-                policy.max_retry_elapsed_seconds = u32_cfg(&fields, "max_retry_elapsed_seconds", policy.max_retry_elapsed_seconds);
-                policy.capacity_retry_interval_ms = u32_cfg(&fields, "capacity_retry_interval_ms", policy.capacity_retry_interval_ms);
-                if let Some(limits) = fields.get("retry_class_limits") {
-                    if let Ok(parsed) = serde_json::from_value(limits.clone()) {
-                        policy.retry_class_limits = parsed;
-                    }
+    let ctx = json!({ "platform": "", "path": "", "phase": "policy", "stage": "policy" });
+    let entries: Vec<(String, Value)> = pipeline
+        .enabled_chain(true)
+        .iter()
+        .map(|plugin| {
+            (
+                plugin.id.clone(),
+                pipeline.config_for(&plugin.id, true).cloned().unwrap_or_else(|| json!({})),
+            )
+        })
+        .collect();
+    match crate::services::plugin_middleware::policy_chain(&entries, &ctx) {
+        Some(patch) if patch.as_object().is_some_and(|object| !object.is_empty()) => {
+            merge_policy(&mut policy, &patch);
+        }
+        _ => {
+            for plugin in pipeline.enabled_chain(true) {
+                if plugin.id.starts_with("pack:") {
+                    continue;
                 }
+                let config = plugin.config.clone();
+                apply_schedule_fallback(&mut policy, &plugin.id, config.as_object());
             }
-            "builtin.schedule.semanticThreshold" => {
-                policy.semantic_error_threshold = u32_cfg(&fields, "value", policy.semantic_error_threshold);
-            }
-            "builtin.schedule.cooldown" => {
-                policy.cooldown_enabled = true;
-                policy.cooldown_seconds = u32_cfg(&fields, "seconds", policy.cooldown_seconds);
-            }
-            "builtin.schedule.errorStatus" => policy.error_status_enabled = true,
-            "builtin.schedule.streamPrelude" => {
-                policy.stream_prelude_wait_ms = u32_cfg(&fields, "ms", policy.stream_prelude_wait_ms);
-            }
-            "builtin.schedule.streamSalvage" => policy.stream_salvage_enabled = true,
-            "builtin.schedule.streamContinue" => {
-                policy.stream_continue_enabled = true;
-                policy.stream_continue_max = u32_cfg(&fields, "max", policy.stream_continue_max);
-            }
-            "builtin.schedule.failover" => policy.failover_enabled = true,
-            _ => {}
         }
     }
     policy
+}
+
+fn zero_policy(mut policy: RouteCredentialFailurePolicy) -> RouteCredentialFailurePolicy {
+    policy.retry_count = 0;
+    policy.retry_class_limits = Default::default();
+    policy.capacity_retry_interval_ms = 0;
+    policy.max_retry_elapsed_seconds = 0;
+    policy.semantic_error_threshold = 0;
+    policy.cooldown_enabled = false;
+    policy.error_status_enabled = false;
+    policy.stream_continue_enabled = false;
+    policy.stream_salvage_enabled = false;
+    policy.failover_enabled = false;
+    policy.stream_prelude_wait_ms = 0;
+    policy
+}
+
+fn apply_schedule_fallback(policy: &mut RouteCredentialFailurePolicy, id: &str, fields: Option<&serde_json::Map<String, Value>>) {
+    let empty = serde_json::Map::new();
+    let fields = fields.unwrap_or(&empty);
+    let u32_cfg = |key: &str, fallback: u32| -> u32 {
+        fields.get(key).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(fallback)
+    };
+    match id {
+        "builtin.schedule.retry" => {
+            policy.retry_count = u32_cfg("retry_count", policy.retry_count);
+            policy.retry_interval_ms = u32_cfg("retry_interval_ms", policy.retry_interval_ms);
+            policy.max_retry_elapsed_seconds = u32_cfg("max_retry_elapsed_seconds", policy.max_retry_elapsed_seconds);
+            policy.capacity_retry_interval_ms = u32_cfg("capacity_retry_interval_ms", policy.capacity_retry_interval_ms);
+            if let Some(limits) = fields.get("retry_class_limits") {
+                if let Ok(parsed) = serde_json::from_value(limits.clone()) {
+                    policy.retry_class_limits = parsed;
+                }
+            }
+        }
+        "builtin.schedule.semanticThreshold" => policy.semantic_error_threshold = u32_cfg("value", policy.semantic_error_threshold),
+        "builtin.schedule.cooldown" => {
+            policy.cooldown_enabled = true;
+            policy.cooldown_seconds = u32_cfg("seconds", policy.cooldown_seconds);
+        }
+        "builtin.schedule.errorStatus" => policy.error_status_enabled = true,
+        "builtin.schedule.streamPrelude" => policy.stream_prelude_wait_ms = u32_cfg("ms", policy.stream_prelude_wait_ms),
+        "builtin.schedule.streamSalvage" => policy.stream_salvage_enabled = true,
+        "builtin.schedule.streamContinue" => {
+            policy.stream_continue_enabled = true;
+            policy.stream_continue_max = u32_cfg("max", policy.stream_continue_max);
+        }
+        "builtin.schedule.failover" => policy.failover_enabled = true,
+        _ => {}
+    }
+}
+
+/// Legacy config keys are no longer used to drive transforms, but keeping them
+/// in sync lets other services (import/export, repository failure accounting)
+/// observe the same settings. The derived policy is written to `failure_policy`
+/// so cooldown / semantic threshold / error status take effect.
+pub fn effective_config(pipeline: &PipelineConfig, config_json: &str) -> Value {
+    effective_config_with_policy(pipeline, config_json, None)
+}
+
+pub fn effective_config_with_policy(
+    pipeline: &PipelineConfig,
+    config_json: &str,
+    policy: Option<&RouteCredentialFailurePolicy>,
+) -> Value {
+    let mut config: Value = serde_json::from_str(config_json).unwrap_or_else(|_| json!({}));
+    if !config.is_object() {
+        config = json!({});
+    }
+    if let Some(policy) = policy {
+        if let Ok(value) = serde_json::to_value(policy) {
+            config.as_object_mut().expect("object").insert("failure_policy".into(), value);
+        }
+    }
+    config
 }
 
 #[cfg(test)]
@@ -294,75 +269,53 @@ mod tests {
         assert!(catalog.iter().any(|p| p.id == "builtin.request.compression"));
         assert!(catalog.iter().any(|p| p.id == "builtin.schedule.retry"));
         assert!(catalog.iter().any(|p| p.id == "builtin.response.plaintextReasoning"));
-        assert_eq!(catalog.len(), (REQUEST_TRANSFORM_PLUGINS.len() + REQUEST_SCHEDULE_PLUGINS.len() + RESPONSE_PLUGINS.len()));
+        assert_eq!(catalog.len(), embedded_sources().len());
     }
 
     #[test]
-    fn effective_config_applies_chain() {
-        let config = json!({ "request_brotli_compression": "off" });
-        let pipeline = PipelineConfig {
-            version: PIPELINE_VERSION,
-            request: DirectionConfig {
-                mode: PipelineMode::Process,
-                chain: vec![crate::models::pipeline::PluginInstance {
-                    id: "builtin.request.compression".into(),
-                    enabled: true,
-                    config: json!({ "mode": "on" }),
-                }],
-            },
-            response: DirectionConfig::default(),
-        };
-        let effective = effective_config(&pipeline, &config.to_string());
-        assert_eq!(effective["request_brotli_compression"], "on");
+    fn every_descriptor_has_an_embedded_script() {
+        for descriptor in list() {
+            assert!(embedded_sources().iter().any(|(id, _)| *id == descriptor.id), "{}", descriptor.id);
+            assert!(!stage_for(&descriptor.id).is_empty());
+        }
     }
 
     #[test]
-    fn passthrough_disables_transforms_and_scheduling() {
+    fn passthrough_zeroes_policy() {
         let pipeline = PipelineConfig {
             version: PIPELINE_VERSION,
-            request: DirectionConfig {
-                mode: PipelineMode::Passthrough,
-                chain: Vec::new(),
-            },
+            request: DirectionConfig { mode: PipelineMode::Passthrough, chain: Vec::new() },
             response: DirectionConfig::default(),
         };
-        let effective = effective_config(&pipeline, r#"{"request_brotli_compression":"on"}"#);
-        assert_eq!(effective["request_brotli_compression"], "off");
         let policy = failure_policy_from_pipeline(&pipeline, "{}");
         assert_eq!(policy.retry_count, 0);
         assert!(!policy.failover_enabled);
     }
-
     #[test]
-    fn legacy_pipeline_keeps_policy_equivalent() {
-        let config = json!({ "failure_policy": { "retry_count": 7, "failover_enabled": false } });
-        let pipeline = resolve_pipeline(&config.to_string());
-        let policy = failure_policy_from_pipeline(&pipeline, &config.to_string());
-        assert_eq!(policy.retry_count, 7);
-        assert!(!policy.failover_enabled);
+    fn policy_cache_returns_consistent_values_and_generation_advances() {
+        let config = json!({
+            "base_url": "https://relay.example.com/v1",
+            "interface_format": "openai",
+            "pipeline": {
+                "version": 1,
+                "request": {
+                    "mode": "process",
+                    "chain": [{ "id": "builtin.schedule.retry", "enabled": true, "config": { "retry_count": 9 } }]
+                },
+                "response": { "mode": "process", "chain": [] }
+            }
+        })
+        .to_string();
+        let pipeline = resolve_pipeline(&config);
+        let first = failure_policy_from_pipeline(&pipeline, &config);
+        let second = failure_policy_from_pipeline(&pipeline, &config);
+        assert_eq!(first, second);
+        assert_eq!(second.retry_count, 9);
+        mark_policy_dirty();
+        let third = failure_policy_from_pipeline(&pipeline, &config);
+        assert_eq!(third.retry_count, 9);
     }
 }
 
-/// Apply third-party pack hooks selected in the account chain, in order.
-/// Built-in transforms are applied by the existing native helpers; packs run
-/// here so they are no longer global or implicit.
-pub fn apply_pack_chain(
-    pipeline: &PipelineConfig,
-    body: &[u8],
-    request: bool,
-    platform: &str,
-    path: &str,
-) -> Vec<u8> {
-    if pipeline.is_passthrough(request) {
-        return body.to_vec();
-    }
-    let hook = if request { "onRequest" } else { "onResponse" };
-    let mut current = body.to_vec();
-    for plugin in pipeline.enabled_chain(request) {
-        if let Some(id) = plugin.id.strip_prefix("pack:") {
-            current =
-                crate::services::plugin_middleware::apply_pack_hook(id, hook, &current, platform, path);
-        }
-    }
-    current
-}
+
+
