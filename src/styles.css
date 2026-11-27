@@ -961,3 +961,21 @@ html.dark :is([class~="focus:border-blue-400"]:focus, [class~="focus:border-blue
 html.dark :is([class~="focus:border-stone-400"]:focus, [class~="focus:border-stone-500"]:focus) {
   border-color: #a8a29e;
 }
+
+/* Account request pipeline flow connectors */
+.pipeline-flow-line {
+  fill: none;
+  stroke: #a8a29e;
+  stroke-width: 1.6;
+  stroke-dasharray: 6 5;
+  animation: pipeline-flow-dash 1.2s linear infinite;
+}
+.pipeline-flow-line[data-direction="response"] {
+  stroke: #64748b;
+}
+@keyframes pipeline-flow-dash {
+  to { stroke-dashoffset: -22; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pipeline-flow-line { animation: none; }
+}

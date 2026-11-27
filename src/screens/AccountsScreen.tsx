@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { motion } from "motion/react";
+import { AnimatePresence, motion } from "motion/react";
 import { AccountSourceFilterBar } from "../components/accounts/AccountSourceFilterBar";
 import { ModalityAccessPanel, type MediaModality } from "../components/accounts/ModalityAccessPanel";
 import { NativeErrorNotice, formatApiError } from "../components/accounts/NativeErrorNotice";
@@ -74,6 +74,10 @@ import { RouteCredentialExportDialog } from "../components/accounts/RouteCredent
 import { CopyRouteCredentialDialog } from "../components/accounts/CopyRouteCredentialDialog";
 import { RequestCompressionOption } from "../components/accounts/RequestCompressionOption";
 import { requestCompressionModeFromConfig, writeRequestCompressionMode, type RequestCompressionMode } from "../lib/requestCompression";
+import { PipelineFlowEditor } from "../components/PipelineFlowEditor";
+import type { PipelineConfig } from "../lib/api/types";
+import type { BuiltinPluginDescriptor } from "../lib/api/types";
+import { createDefaultPipeline, failurePolicyFromPipeline, resolvePipeline, writePipelineToConfig } from "../lib/pipeline";
 import { ResponsesPlaintextReasoningOption } from "../components/accounts/ResponsesPlaintextReasoningOption";
 import { ResponsesCrossResourceStripOption } from "../components/accounts/ResponsesCrossResourceStripOption";
 import { plaintextReasoningModeFromConfig, writePlaintextReasoningMode, type ResponsesPlaintextReasoningMode } from "../lib/responsesPlaintextReasoning";
@@ -160,6 +164,8 @@ import {
   getClientDirectModes,
   enableClientDirectMode,
   pluginPackListPresets,
+  builtinPluginList,
+  pluginPackList,
 } from "../lib/api/client";
 import type {
   AccountStatus,
@@ -269,7 +275,7 @@ type PlatformKey = PlatformId;
 type CreateMode = "api" | "official" | "external";
 type AccountView = "in_pool" | "out_of_pool" | "archived";
 type CreateTab = "basic" | "advanced";
-type EditTab = "basic" | "advanced" | "proxy" | "failure" | "other";
+type EditTab = "basic" | "advanced" | "proxy" | "requestProcessing" | "other";
 type RowAction = {
   key: string;
   ariaLabel: string;
@@ -446,7 +452,7 @@ const editTabs: Array<FormTab<EditTab>> = [
   { value: "basic", label: "基础" },
   { value: "advanced", label: "高级" },
   { value: "proxy", label: "代理" },
-  { value: "failure", label: "故障处理" },
+  { value: "requestProcessing", label: "请求处理" },
   { value: "other", label: "其他" },
 ];
 
@@ -718,6 +724,8 @@ type AccountsScreenProps = {
   capabilityFilter?: string;
   /** Vector uses the same shell but does not query or advertise unsupported accounts. */
   modality?: AccountModality;
+  /** Optional leading content in the toolbar (e.g. modality tabs). */
+  toolbarLeading?: ReactNode;
 };
 
 const platformLabels: Record<PlatformKey, string> = {
@@ -845,7 +853,6 @@ function credentialBatchFilterLabel(key: string): string {
  * text would run under the action buttons with no way to reach it. 599/600px is
  * the same seam the 成功/失败 breakdown hides at.
  */
-const STATS_LINE_WIDTH = "min-[600px]:min-w-64";
 
 function kindLabel(kind: RouteCredential["kind"]) {
   return kind === "api" ? "API" : "官方";
@@ -2130,6 +2137,101 @@ function credentialRequestStats(credential: RouteCredential) {
   const rateLabel = Number.isFinite(successRate) ? `${successRate.toFixed(1).replace(/\.0$/, "")}%` : "-";
   return { requestCount, successCount, failureCount, rateLabel };
 }
+function AccountStatsStrip({
+  credential,
+  modelMappings,
+  onEditConcurrency,
+}: {
+  credential: RouteCredential;
+  modelMappings: ModelMapping[];
+  onEditConcurrency: () => void;
+}) {
+  const [detailOpen, setDetailOpen] = useState(false);
+  const stats = credentialRequestStats(credential);
+  const modelCount = new Set(
+    modelMappings.map((mapping) => mapping.to.trim()).filter(Boolean),
+  ).size;
+  const active = credential.active_request_count ?? 0;
+  const max = credential.max_concurrency;
+  const tps = credential.recent_tps_milli == null ? null : credential.recent_tps_milli / 1000;
+  return (
+    <div
+      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-stone-500"
+      data-testid={`account-stats-strip-${credential.id}`}
+    >
+      <span title={`已声明 ${modelCount} 个上游模型`}>{modelCount}个模型</span>
+      <span
+        className="relative"
+        onMouseEnter={() => setDetailOpen(true)}
+        onMouseLeave={() => setDetailOpen(false)}
+      >
+        <button
+          aria-label={`成功率 ${stats.rateLabel} 详情`}
+          className="rounded font-semibold text-stone-700 motion-control hover:text-stone-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+          onClick={() => setDetailOpen((current) => !current)}
+          type="button"
+        >
+          成功率 {stats.rateLabel}
+        </button>
+        <AnimatePresence>
+          {detailOpen ? (
+            <motion.div
+              aria-label="请求统计详情"
+              className="absolute right-0 top-1/2 z-40 w-64 -translate-y-1/2 rounded-xl border border-stone-200 bg-white/95 p-2.5 shadow-xl backdrop-blur"
+              exit={{ opacity: 0, scale: 0.97, y: -4 }}
+              initial={{ opacity: 0, scale: 0.97, y: -4 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              transition={{ duration: 0.15 }}
+            >
+              <p className="mb-1.5 text-[11px] font-semibold text-stone-950">请求统计</p>
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+                <dt className="text-stone-400">请求</dt>
+                <dd className="text-right font-mono text-stone-800">{stats.requestCount}</dd>
+                <dt className="text-stone-400">成功 / 失败</dt>
+                <dd className="text-right font-mono text-stone-800">
+                  {stats.successCount} / {stats.failureCount}
+                </dd>
+                <dt className="text-stone-400">成功率</dt>
+                <dd className="text-right font-mono text-stone-800">{stats.rateLabel}</dd>
+                <dt className="text-stone-400">最近耗时</dt>
+                <dd className="text-right font-mono text-stone-800">
+                  {credential.last_duration_ms == null ? "—" : formatRequestDuration(credential.last_duration_ms)}
+                </dd>
+                <dt className="text-stone-400">平均耗时</dt>
+                <dd className="text-right font-mono text-stone-800">
+                  {credential.avg_recent_duration_ms == null
+                    ? "—"
+                    : formatRequestDuration(credential.avg_recent_duration_ms)}
+                </dd>
+                <dt className="text-stone-400">输出速度</dt>
+                <dd className="text-right font-mono text-stone-800">
+                  {tps == null ? "—" : `${tps.toFixed(1)} tok/s`}
+                </dd>
+                <dt className="text-stone-400">并发</dt>
+                <dd className="text-right font-mono text-stone-800">
+                  {active}/{max}
+                </dd>
+              </dl>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </span>
+      <button
+        aria-label={`当前并发 ${active}/${max}，点击修改`}
+        className="rounded font-semibold text-stone-700 motion-control hover:text-stone-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+        onClick={onEditConcurrency}
+        title="点击修改最大并发数"
+        type="button"
+      >
+        {active}/{max}并发
+      </button>
+      <span title="最近 10 次成功请求的输出速度">
+        {tps == null ? "—" : `${tps.toFixed(1)}tok/s`}
+      </span>
+    </div>
+  );
+}
+
 
 function apiPreviewJsonFromPayloads(platform: PlatformKey, secretJson: string, configJson: string) {
   const secret = parseJsonObject(secretJson);
@@ -3453,8 +3555,24 @@ export function AccountsScreen({
   poolScopeFocus = null,
   capabilityFilter,
   modality,
+  toolbarLeading,
 }: AccountsScreenProps) {
   const queryClient = useQueryClient();
+  const builtinCatalogQuery = useQuery({ queryKey: ["builtin-plugins"], queryFn: builtinPluginList });
+  const packCatalogQuery = useQuery({ queryKey: ["plugin-packs"], queryFn: pluginPackList });
+  const flowCatalog: BuiltinPluginDescriptor[] = [
+    ...(builtinCatalogQuery.data ?? []),
+    ...(packCatalogQuery.data ?? [])
+      .filter((pack) => pack.enabled && pack.has_middleware)
+      .map((pack) => ({
+        id: `pack:${pack.id}`,
+        name: pack.name,
+        description: pack.description,
+        lane: "both" as const,
+        kind: "transform" as const,
+        config_fields: [],
+      })),
+  ];
   const activePlatform = platform;
   const mediaModality: MediaModality | null = modality && modality !== "general"
     ? modality
@@ -3557,7 +3675,6 @@ export function AccountsScreen({
   // the request numbers. One flag for the whole list rather than a set of row ids:
   // it is a view mode for the column, and a list where some rows show models and
   // others show counts is not readable as either.
-  const [statsLineShowsModels, setStatsLineShowsModels] = useState(false);
   const [compactRowActions, setCompactRowActions] = useState(false);
   const [accountLayout, setAccountLayout] = useState<AccountListLayout>(() =>
     loadAccountListLayout(),
@@ -3696,6 +3813,7 @@ export function AccountsScreen({
   );
   const [editStreamSalvageEnabled, setEditStreamSalvageEnabled] = useState(false);
   const [editFailurePolicyError, setEditFailurePolicyError] = useState<string | null>(null);
+  const [editPipeline, setEditPipeline] = useState<PipelineConfig>(() => createDefaultPipeline());
   const [editRecoveryMode, setEditRecoveryMode] = useState<RecoveryMode>("off");
   const [editRecoveryTimes, setEditRecoveryTimes] = useState<string[]>([]);
   const [editRecoveryProbeInterval, setEditRecoveryProbeInterval] = useState("30");
@@ -4380,6 +4498,7 @@ export function AccountsScreen({
     const config = parseJsonObject(editingCredential.config_json);
     const recovery = recoveryRuleFromConfig(config);
     const failurePolicy = failurePolicyFromConfig(config);
+    setEditPipeline(resolvePipeline(editingCredential.config_json, stringFromRecord(parseJsonObject(editingCredential.config_json), "base_url")));
     setEditRecoveryMode(recovery.mode);
     setEditRecoveryTimes(recovery.times.length ? recovery.times : ["00:00"]);
     setEditRecoveryProbeInterval(String(recovery.probe_interval_minutes ?? 30));
@@ -5494,7 +5613,7 @@ export function AccountsScreen({
       }
       if (failurePolicyError) {
         setEditFailurePolicyError(failurePolicyError);
-        setEditTab("failure");
+        setEditTab("requestProcessing");
         throw new Error(failurePolicyError);
       }
       const failurePolicy: RouteCredentialFailurePolicy = {
@@ -5588,11 +5707,9 @@ export function AccountsScreen({
               editRelayBalanceSnapshot,
             )
           : configWithFetchedModels;
-      const nextConfigJson = JSON.stringify(
-        writeFailurePolicyToConfig(configWithRelayBalance, failurePolicy),
-        null,
-        2,
-      );
+      const configWithPipeline = { ...configWithRelayBalance };
+      writePipelineToConfig(configWithPipeline, editPipeline);
+      const nextConfigJson = JSON.stringify(configWithPipeline, null, 2);
       const nextPreviewJson =
         editingCredential.kind === "api"
           ? apiPreviewJsonFromPayloads(activePlatform, nextSecretJson, nextConfigJson)
@@ -6602,8 +6719,9 @@ export function AccountsScreen({
             }
           }}
         >
+          {toolbarLeading}
           <div
-            className="flex w-full min-w-0 items-center justify-end gap-1.5 rounded-lg border border-stone-300/80 bg-stone-100/75 px-2.5 py-1.5 shadow-[inset_0_1px_2px_rgba(28,25,23,0.08),inset_0_-1px_0_rgba(255,255,255,0.82)]"
+            className="flex min-w-0 flex-1 items-center justify-end gap-1.5 rounded-lg border border-stone-300/80 bg-stone-100/75 px-2.5 py-1.5 shadow-[inset_0_1px_2px_rgba(28,25,23,0.08),inset_0_-1px_0_rgba(255,255,255,0.82)]"
           >
             {!vectorView ? <div aria-label="账号列表操作" role="group" className="flex shrink-0 items-center gap-1.5 sm:gap-2">
             <button
@@ -6725,9 +6843,6 @@ export function AccountsScreen({
                       [
                         ["showProvider", "账号来源"],
                         ["showAccountType", "账号类型（API/Token）"],
-                        ["showModelList", "模型列表"],
-                        ["showRequestStats", "请求统计"],
-                        ["showLatencyStats", "请求耗时"],
                         ["showResetTime", "重置时间"],
                         ["showRelayGroupName", "API Key 用户组名"],
                       ] as const
@@ -7621,60 +7736,15 @@ export function AccountsScreen({
                         </button>
                       </CredentialFailureTooltip>
                     ) : null;
-                  // The model list gets a line of its own in both layouts: it can carry
-                  // four tags on its own, and inline it pushed the status badges past a
-                  // wrap where they were easy to miss.
-                  const modelListBlock = accountDisplayPreferences.showModelList ? (
-                    <ModelMappingSummary
-                      baselineModels={activePlatform === "codex" ? routePoolQuery.data?.baseline_models : undefined}
-                      platform={activePlatform}
-                      mappings={modelMappings}
+                  const statsStrip = (
+                    <AccountStatsStrip
+                      credential={credential}
+                      modelMappings={modelMappings}
+                      onEditConcurrency={() => openQuickEditConcurrency(credential)}
                     />
-                  ) : null;
-                  // Switch 显示模型列表 off and the models have nowhere left to go, so the
-                  // stats line doubles as their slot: click it to swap the numbers for a
-                  // dot-separated model list in the very same type, click again to swap
-                  // back. The swap is list-wide, so one click never leaves half the rows
-                  // showing models and half showing counts. Null while the tag row is on
-                  // — there is nothing to reveal.
-                  const modelLineToggle = accountDisplayPreferences.showModelList
-                    ? null
-                    : (() => {
-                        const summary = statsLineShowsModels
-                          ? modelSummaryLine(
-                              activePlatform,
-                              modelMappings,
-                              activePlatform === "codex" ? routePoolQuery.data?.baseline_models : undefined,
-                            )
-                          : null;
-                        return {
-                          showsModels: statsLineShowsModels,
-                          text: summary?.text ?? "",
-                          title: summary?.title ?? "点击把所有账号的这一行换成模型列表",
-                        };
-                      })();
-                  // 请求耗时 is off by default and lives at the right end of the stats
-                  // line. Only wall-clock duration is recorded (`duration_ms` in the
-                  // proxy's usage-event metadata), so this is the whole request, and
-                  // nothing here claims to be a time-to-first-token — that number does
-                  // not exist anywhere in the pipeline yet.
-                  const latencyTag =
-                    accountDisplayPreferences.showLatencyStats &&
-                    credential.last_duration_ms != null ? (
-                      <span
-                        data-testid={`account-latency-${credential.id}`}
-                        title={
-                          credential.avg_recent_duration_ms != null
-                            ? `最近 10 次成功请求平均 ${formatRequestDuration(credential.avg_recent_duration_ms)}（最近一次 ${formatRequestDuration(credential.last_duration_ms)}）`
-                            : `最近一次请求 ${formatRequestDuration(credential.last_duration_ms)}；还没有成功的请求可以求平均`
-                        }
-                      >
-                        耗时 {formatRequestDuration(credential.last_duration_ms)}
-                      </span>
-                    ) : null;
+                  );
                   const resetTimeTag = accountDisplayPreferences.showResetTime && latestReset ? (
                     <span
-                      className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700"
                       data-testid={`account-reset-time-${credential.id}`}
                       title="最近重置时间"
                     >
@@ -7826,35 +7896,6 @@ export function AccountsScreen({
                         {cardLayout ? null : concurrencyBadge}
                     </>
                   );
-                  const statsLine = (() => {
-                          const requestStats = credentialRequestStats(credential);
-                          return (
-                            <>
-                              {requestStats.requestCount <= 0 ? (
-                                <span>暂无请求</span>
-                              ) : (
-                                <>
-                                  <span>请求 {requestStats.requestCount}</span>
-                                  {/* A card is too narrow for the breakdown, same as a
-                                      list squeezed against the sidebar. */}
-                                  <span
-                                    className={
-                                      cardLayout || sidebarCollapsed ? "hidden" : "max-[599px]:hidden"
-                                    }
-                                  >
-                                    {` · 成功 ${requestStats.successCount} · 失败 ${requestStats.failureCount}`}
-                                  </span>
-                                  <span>{` · 成功率 ${requestStats.rateLabel}`}</span>
-                                </>
-                              )}
-                              {credential.batch_id && (
-                                <span title={credential.batch_name?.trim() || credential.batch_id}>
-                                  {` · 批量 ${credential.batch_name?.trim() || shortId(credential.batch_id)}`}
-                                </span>
-                              )}
-                            </>
-                          );
-                  })();
                   const actionsBlock = (
                     <div className="flex shrink-0 flex-nowrap items-center justify-end gap-1">
                       {rowActionsInMenu ? (
@@ -7928,14 +7969,7 @@ export function AccountsScreen({
                     </div>
                   );
                   // Without stats the footer still has to render when a counter is
-                  // live, otherwise turning off 请求统计 would also hide 并发/冷却.
-                  const cardFooterVisible = Boolean(
-                    accountDisplayPreferences.showRequestStats ||
-                      latencyTag ||
-                      resetTimeTag ||
-                      concurrencyBadge ||
-                      cooldownBadge,
-                  );
+                  const cardFooterVisible = true;
                   if (cardLayout) {
                     return (
                       <Fragment key={credential.id}>
@@ -7963,40 +7997,18 @@ export function AccountsScreen({
                             {actionsBlock}
                           </div>
                           <div className="flex flex-wrap items-center gap-1.5">{badges}</div>
-                          {modelListBlock ? (
-                            <div
-                              className="flex min-w-0 flex-wrap items-center gap-1.5"
-                              data-testid={`account-model-list-${credential.id}`}
-                            >
-                              {modelListBlock}
-                            </div>
-                          ) : null}
-                          {/* mt-auto keeps the footer pinned to the bottom so the
-                              footers of a grid row stay on one baseline. The live
-                              counters sit at its right end, away from the stats. */}
-                          {cardFooterVisible ? (
-                            <div
-                              className="mt-auto flex items-center gap-2 border-t border-stone-200/70 pt-1.5"
-                              data-testid={`account-card-footer-${credential.id}`}
-                            >
-                              {accountDisplayPreferences.showRequestStats ? (
-                                <p className="min-w-0 flex-1 truncate text-[11px] text-stone-500">
-                                  {statsLine}
-                                </p>
-                              ) : null}
-                              {latencyTag}
-                              {resetTimeTag}
-                              {concurrencyBadge || cooldownBadge ? (
-                                // ml-auto rather than justify-between: with the stats
-                                // line hidden the counters are the only child, and
-                                // justify-between would leave them at the left edge.
-                                <span className="ml-auto flex shrink-0 items-center gap-1.5">
-                                  {concurrencyBadge}
-                                  {cooldownBadge}
-                                </span>
-                              ) : null}
-                            </div>
-                          ) : null}
+                          <div
+                            className="mt-auto flex items-center gap-2 border-t border-stone-200/70 pt-1.5"
+                            data-testid={`account-card-footer-${credential.id}`}
+                          >
+                            {statsStrip}
+                            {resetTimeTag || cooldownBadge ? (
+                              <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                                {resetTimeTag}
+                                {cooldownBadge}
+                              </span>
+                            ) : null}
+                          </div>
                         </article>
                       </Fragment>
                     );
@@ -8022,48 +8034,10 @@ export function AccountsScreen({
                         {nameBlock}
                         {badges}
                       </div>
-                      {modelListBlock ? (
-                        <div
-                          className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5"
-                          data-testid={`account-model-list-${credential.id}`}
-                        >
-                          {modelListBlock}
-                        </div>
-                      ) : null}
-                      {accountDisplayPreferences.showRequestStats || latencyTag || resetTimeTag ? (
                         <div className="mt-0.5 flex min-w-0 shrink-0 items-center gap-2 text-[11px] text-stone-500">
-                          {accountDisplayPreferences.showRequestStats ? (
-                            modelLineToggle ? (
-                              <button
-                                aria-label={
-                                  modelLineToggle.showsModels
-                                    ? "全部账号改显示请求统计"
-                                    : "全部账号改显示模型列表"
-                                }
-                                aria-pressed={modelLineToggle.showsModels}
-                                // It is a line of text that happens to be clickable, so
-                                // the global button chrome — a 1px hover lift and a press
-                                // scale from styles.css, plus the radius and shadow that
-                                // drew a ghost border around the sentence — is cancelled
-                                // here. Only the colour shifts; `data-plain-text` leaves
-                                // box-shadow free for the focus ring.
-                                className={`min-w-0 ${STATS_LINE_WIDTH} truncate rounded text-left motion-control hover:translate-y-0 hover:text-stone-700 active:translate-y-0 active:scale-100`}
-                                data-plain-text=""
-                                data-testid={`account-stats-line-${credential.id}`}
-                                onClick={() => setStatsLineShowsModels((current) => !current)}
-                                title={modelLineToggle.title}
-                                type="button"
-                              >
-                                {modelLineToggle.showsModels ? modelLineToggle.text : statsLine}
-                              </button>
-                            ) : (
-                              <p className={`min-w-0 ${STATS_LINE_WIDTH} truncate`}>{statsLine}</p>
-                            )
-                          ) : null}
-                          {latencyTag}
+                          {statsStrip}
                           {resetTimeTag}
                         </div>
-                      ) : null}
                     </div>
                     {actionsBlock}
                   </div>
@@ -9743,383 +9717,13 @@ export function AccountsScreen({
                   </p>
                 </section>
               ) : null}
-              {editTab === "failure" ? (
+              {editTab === "requestProcessing" ? (
                 <>
-                  <section
-                    aria-label="账号失败处理策略"
-                    className="rounded-xl border border-blue-100 bg-blue-50/60 p-3"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-[13px] font-semibold text-stone-900">① 通用重试</p>
-                        <p className="mt-0.5 text-[11px] font-medium text-stone-500">
-                          所有可重试错误默认共用这个次数与等待节奏。想让某一类错误重试更多次，到「② 按错误类型」单独设置。
-                        </p>
-                      </div>
-                      <span className="shrink-0 rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-blue-700">
-                        按账号生效
-                      </span>
-                    </div>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                      <label className={labelClass}>
-                        额外重试次数
-                        <input
-                          aria-label="额外重试次数"
-                          className={fieldClass}
-                          max={10}
-                          min={0}
-                          onChange={(event) => {
-                            setEditRetryCount(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editRetryCount}
-                        />
-                      </label>
-                      <label className={labelClass}>
-                        重试间隔（毫秒）
-                        <input
-                          aria-label="重试间隔（毫秒）"
-                          className={fieldClass}
-                          max={60_000}
-                          min={0}
-                          onChange={(event) => {
-                            setEditRetryIntervalMs(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editRetryIntervalMs}
-                        />
-                      </label>
-                      <label className={labelClass}>
-                        重试总时长上限（秒）
-                        <input
-                          aria-label="重试总时长上限（秒）"
-                          className={fieldClass}
-                          max={MAX_ROUTE_CREDENTIAL_MAX_RETRY_ELAPSED_SECONDS}
-                          min={0}
-                          onChange={(event) => {
-                            setEditMaxRetryElapsedSeconds(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editMaxRetryElapsedSeconds}
-                        />
-                      </label>
-                    </div>
-                    <p className="mt-2 text-[11px] leading-5 text-stone-600">
-                      通用次数上限 10 次，只适合普通抖动。总时长上限填 0 表示只按次数收手；填了秒数后，无论哪一类重试，整次请求累计耗时超过它就会停止重试。
-                    </p>
-                    {editFailurePolicyError && (
-                      <p className="mt-2 text-[12px] font-semibold text-red-700">
-                        {editFailurePolicyError}
-                      </p>
-                    )}
-                  </section>
-
-                  <section
-                    aria-label="按错误类型设置重试次数"
-                    className="rounded-xl border border-indigo-100 bg-indigo-50/50 p-3"
-                  >
-                    <div>
-                      <p className="text-[13px] font-semibold text-stone-900">
-                        ② 按错误类型单独设置
-                      </p>
-                      <p className="mt-0.5 text-[11px] font-medium text-stone-500">
-                        留空 = 跟随「① 通用重试」；填数字则单独覆盖这一类，范围 0-1000 次。
-                      </p>
-                    </div>
-                    <div className="mt-3 grid gap-2">
-                      {RETRY_CLASS_ROWS.map((row) => (
-                        <div
-                          key={row.key}
-                          className={
-                            row.key === "capacity"
-                              ? "rounded-lg border border-amber-200 bg-amber-50/80 p-2.5"
-                              : "rounded-lg border border-stone-200 bg-white/80 p-2.5"
-                          }
-                        >
-                          <div className="flex items-center gap-3">
-                            <div className="min-w-0 flex-1">
-                              <p className="text-[12px] font-semibold text-stone-900">
-                                {row.label}
-                              </p>
-                              <p className="mt-0.5 text-[11px] leading-4 text-stone-600">
-                                {row.description}
-                              </p>
-                            </div>
-                            <div className="flex shrink-0 items-center gap-1.5">
-                              <input
-                                aria-label={`${row.label}的额外重试次数`}
-                                className={`${fieldClass} w-24`}
-                                max={MAX_ROUTE_CREDENTIAL_CLASS_RETRY_COUNT}
-                                min={0}
-                                onChange={(event) => {
-                                  setEditClassRetryLimits((previous) => ({
-                                    ...previous,
-                                    [row.key]: event.target.value,
-                                  }));
-                                  setEditFailurePolicyError(null);
-                                }}
-                                placeholder="跟随"
-                                step={1}
-                                type="number"
-                                value={editClassRetryLimits[row.key]}
-                              />
-                              <span className="text-[11px] text-stone-500">次</span>
-                            </div>
-                          </div>
-                          {row.key === "capacity" ? (
-                            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-amber-200 pt-2">
-                              <button
-                                aria-label="一键设为容量类重试100次、间隔500毫秒"
-                                className="rounded-md border border-amber-300 bg-white px-2 py-1 text-[11px] font-semibold text-amber-800 hover:bg-amber-100"
-                                onClick={() => {
-                                  setEditClassRetryLimits((previous) => ({
-                                    ...previous,
-                                    capacity: "100",
-                                  }));
-                                  setEditCapacityRetryIntervalMs("500");
-                                  setEditFailurePolicyError(null);
-                                }}
-                                type="button"
-                              >
-                                一键设为 100 次 / 500 毫秒
-                              </button>
-                              <label className="flex items-center gap-1.5 text-[11px] font-medium text-stone-700">
-                                容量类重试间隔（毫秒）
-                                <input
-                                  aria-label="容量类重试间隔（毫秒）"
-                                  className={`${fieldClass} w-28`}
-                                  max={MAX_ROUTE_CREDENTIAL_CAPACITY_RETRY_INTERVAL_MS}
-                                  min={0}
-                                  onChange={(event) => {
-                                    setEditCapacityRetryIntervalMs(event.target.value);
-                                    setEditFailurePolicyError(null);
-                                  }}
-                                  step={1}
-                                  type="number"
-                                  value={editCapacityRetryIntervalMs}
-                                />
-                              </label>
-                            </div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                    <p className="mt-2.5 text-[11px] leading-5 text-stone-600">
-                      「容量不足 / 高负载」包括 no_capacity、high demand、服务器过载类提示，以及区域级吞吐限流（code 是 rate_limit_exceeded 但消息写的是「exceeded token rate limit」这类上游区域/部署的 token 预算，不是账号配额），也覆盖 HTTP 200 流里先 response.created 再 response.failed 的情况。这类失败是上游暂时没余量，不是账号坏了，所以给再多次重试也不会让账号进入冷却或异常状态。容量类间隔填 0 表示沿用「① 通用重试」的间隔；要等 100 次时建议单独调大，别用 200 毫秒连续打爆上游。注意：开启「④ 失败后切换到池内其它账号」时，换号后次数会从 0 重新算，想给整次请求封顶请同时设置「重试总时长上限（秒）」。容量与限流类失败会按本类间隔等待，不再套用流式断流的固定 500 毫秒。
-                    </p>
-                  </section>
-
-                  <section
-                    aria-label="账号状态与冷却"
-                    className="rounded-xl border border-stone-200 bg-white p-3"
-                  >
-                    <p className="text-[13px] font-semibold text-stone-900">③ 账号状态与冷却</p>
-                    <p className="mt-0.5 text-[11px] font-medium text-stone-500">
-                      只有看起来是账号本身的问题才动状态。手动「模型测试」只使用「① 通用重试」的次数，不受 ② 的分类上限影响。
-                    </p>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                      <label className={labelClass}>
-                        异常触发次数
-                        <input
-                          aria-label="异常触发次数"
-                          className={fieldClass}
-                          max={1_000}
-                          min={1}
-                          onChange={(event) => {
-                            setEditSemanticErrorThreshold(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editSemanticErrorThreshold}
-                        />
-                      </label>
-                      <label className={labelClass}>
-                        失败冷却（秒）
-                        <input
-                          aria-label="失败冷却（秒）"
-                          className={fieldClass}
-                          max={MAX_ROUTE_CREDENTIAL_COOLDOWN_SECONDS}
-                          min={1}
-                          onChange={(event) => {
-                            setEditCooldownSeconds(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editCooldownSeconds}
-                        />
-                      </label>
-                    </div>
-                    <div className="mt-3 grid gap-2">
-                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
-                        <input
-                          aria-label="启用失败冷却"
-                          checked={editCooldownEnabled}
-                          className="mt-0.5"
-                          onChange={(event) => setEditCooldownEnabled(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>
-                          <span className="font-semibold">启用失败冷却</span>
-                          <span className="block text-[11px] text-stone-600">
-                            开启后每次临时失败都会让账号冷却「失败冷却（秒）」设定的时长（默认 10
-                            秒）暂不参与路由，冷却结束后自动恢复。默认关闭，即失败后立刻仍可被选中。
-                          </span>
-                        </span>
-                      </label>
-                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
-                        <input
-                          aria-label="启用异常状态标记"
-                          checked={editErrorStatusEnabled}
-                          className="mt-0.5"
-                          onChange={(event) => setEditErrorStatusEnabled(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>
-                          <span className="font-semibold">启用异常状态标记</span>
-                          <span className="block text-[11px] text-stone-600">
-                            开启后连续同类语义错误达到上面的次数时，账号会被标记为异常并停止参与路由。默认开启，因为触发条件严格，通常意味着账号确实不可用。
-                          </span>
-                        </span>
-                      </label>
-                    </div>
-                  </section>
-
-                  <section
-                    aria-label="流式断流与账号切换"
-                    className="rounded-xl border border-stone-200 bg-white p-3"
-                  >
-                    <p className="text-[12px] font-semibold text-stone-900">
-                      ④ 流式断流与账号切换
-                    </p>
-                    <p className="mt-0.5 text-[11px] text-stone-500">
-                      分三个阶段：响应开头只有建流帧、失败帧迟到时的等待窗口；正文已经发出但上游在流内报错时是否救回；以及上游吐出内容却没发收尾标记时的断流续写。
-                    </p>
-                    <label className={`${labelClass} mt-2.5`}>
-                      建流等待窗口（毫秒）
-                      <input
-                        aria-label="建流等待窗口（毫秒）"
-                        className={fieldClass}
-                        max={MAX_ROUTE_CREDENTIAL_STREAM_PRELUDE_WAIT_MS}
-                        min={0}
-                        onChange={(event) => {
-                          setEditStreamPreludeWaitMs(event.target.value);
-                          setEditFailurePolicyError(null);
-                        }}
-                        step={1000}
-                        type="number"
-                        value={editStreamPreludeWaitMs}
-                      />
-                    </label>
-                    <p className="text-[11px] leading-5 text-stone-600">
-                      Responses 上游常先发 <code>response.created</code>（没有任何输出），隔十几秒才发{" "}
-                      <code>error</code> / <code>response.failed</code>。在这段窗口内网关会扣住建流帧，
-                      等到真正的输出或失败帧：失败帧仍在窗口内就能自动重试，超过窗口才把 200 提交给客户端、失败帧只能透传。
-                      默认 60000（60 秒），覆盖已观测到的 14 秒迟到拒绝；最大 600000。填 0
-                      表示收到建流帧立刻提交，适合上游确实会长时间停在 <code>response.created</code> 上思考的情况——代价是迟到的失败不会再重试。
-                      窗口从第一条建流帧开始计时，不受上游持续发心跳帧影响。
-                    </p>
-                    <div className="mt-2.5 grid gap-2">
-                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
-                        <input
-                          aria-label="流内失败时自动救回"
-                          checked={editStreamSalvageEnabled}
-                          className="mt-0.5"
-                          onChange={(event) => {
-                            setEditStreamSalvageEnabled(event.target.checked);
-                            setEditFailurePolicyError(null);
-                          }}
-                          type="checkbox"
-                        />
-                        <span>
-                          <span className="font-semibold">流内失败时自动救回</span>
-                          <span className="block text-[11px] text-stone-600">
-                            正文已经发给客户端后，上游才在 SSE 流里报「容量不足 / 区域级 token rate
-                            limit / 限流 / 5xx」时，网关扣住这条失败帧，用「原会话 + 已写出的半截回答」再问一次，把答案接回同一条响应，客户端看不到中断。重试次数取第 ② 组里该错误类别的上限，间隔也走该类别的专用间隔。默认关闭：每轮救回都是一次完整计费请求。额度耗尽、内容审核、上下文超长、图片过多、权限不足这类硬判决永不救回，照常把错误透传给客户端。仅对 Responses 协议生效。
-                          </span>
-                        </span>
-                      </label>
-                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
-                        <input
-                          aria-label="断流后自动续写"
-                          checked={editStreamContinueEnabled}
-                          className="mt-0.5"
-                          onChange={(event) => {
-                            setEditStreamContinueEnabled(event.target.checked);
-                            setEditFailurePolicyError(null);
-                          }}
-                          type="checkbox"
-                        />
-                        <span>
-                          <span className="font-semibold">断流后自动续写</span>
-                          <span className="block text-[11px] text-stone-600">
-                            字节已经发给客户端、无法回滚重试，所以由网关拿着「原会话 + 半截回答 +
-                            继续指令」再问一次，把结果接回同一条响应，客户端只看到一轮正常完成的回答。默认关闭：续写是一次完整的计费请求，且交给客户端的是模型并非一次写成的答案，是否值得按渠道自己定。
-                          </span>
-                        </span>
-                      </label>
-                      <label className={labelClass}>
-                        最多续写轮次
-                        <input
-                          aria-label="最多续写轮次"
-                          className={fieldClass}
-                          disabled={!editStreamContinueEnabled}
-                          max={MAX_ROUTE_CREDENTIAL_STREAM_CONTINUE_MAX}
-                          min={0}
-                          onChange={(event) => {
-                            setEditStreamContinueMax(event.target.value);
-                            setEditFailurePolicyError(null);
-                          }}
-                          step={1}
-                          type="number"
-                          value={editStreamContinueMax}
-                        />
-                      </label>
-                      <label className="flex items-start gap-2 text-[12px] leading-5 text-stone-700">
-                        <input
-                          aria-label="失败后切换到池内其它账号"
-                          checked={editFailoverEnabled}
-                          className="mt-0.5"
-                          onChange={(event) => setEditFailoverEnabled(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span>
-                          <span className="font-semibold">失败后切换到池内其它账号</span>
-                          <span className="block text-[11px] text-stone-600">
-                            重试次数用尽、或续写仍然断流时，是否换池里的下一个账号继续。默认开启——这正是池的价值。关闭后客户端拿到的是本账号自己的错误，而不是一句聚合的「所有凭据都失败」。仅聚合模式有效；精确模式下请求本来就钉在这个账号上。
-                          </span>
-                        </span>
-                      </label>
-                    </div>
-                  </section>
-
-                  <section
-                    aria-label="失败判定规则"
-                    className="rounded-xl border border-stone-200 bg-stone-50 p-3"
-                  >
-                    <p className="text-[12px] font-semibold text-stone-900">⑤ 判定规则</p>
-                    <div className="mt-2 grid gap-2 text-[11px] leading-5 text-stone-600">
-                      <p>
-                        <span className="font-semibold text-emerald-700">会自动重试：</span>
-                        网络连接失败、请求超时、响应读取失败、HTTP 408 / 429 / 5xx，以及 Codex“服务器当前过载”。“容量不足 / 高负载”单独归为第 ② 类，可按自己的次数上限一直重试，直到次数或总时长用尽。HTTP 200 流内的 response.failed：输出尚未发出且在「④ 建流等待窗口」内 → 直接回滚重试；正文已发出且开启「流内失败时自动救回」→ 扣住失败帧并续写接完；两者都不满足 → 只能透传。
-                      </p>
-                      <p>
-                        <span className="font-semibold text-amber-700">会累计为异常：</span>
-                        不可重试的永久语义错误，在 HTTP 状态和规范化错误消息相同且连续达到设定次数后，账号才会标记为异常；成功、临时错误或错误变化会清零。关闭「启用异常状态标记」后仍会累计次数，但不再改变账号状态。
-                      </p>
-                      <p>
-                        <span className="font-semibold text-red-700">不会同账号重试：</span>
-                        HTTP 401 / 403；它们继续按现有鉴权失效和切换账号逻辑处理。
-                      </p>
-                    </div>
-                  </section>
+                  <PipelineFlowEditor
+                    catalog={flowCatalog}
+                    onChange={setEditPipeline}
+                    pipeline={editPipeline}
+                  />
                   <section
                     aria-label="模型状态"
                     className="rounded-xl border border-orange-100 bg-orange-50/50 p-3"
@@ -10489,114 +10093,6 @@ export function AccountsScreen({
               ) : null}
               {editTab === "advanced" && editingCredential.kind === "api" ? (
                 <>
-                  {!mediaView ? <>
-                  <RequestCompressionOption mode={editRequestCompressionMode} baseUrl={editApiBaseUrl} onChange={setEditRequestCompressionMode} />
-                  <ContentRejectionCompatOption
-                    checked={editContentRejectionCompat}
-                    onChange={setEditContentRejectionCompat}
-                  />
-                  <ImageLimitCompatOption
-                    checked={editImageLimitCompat}
-                    onChange={setEditImageLimitCompat}
-                  />
-                  {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
-                    <label className="flex items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] font-medium text-stone-700">
-                      <input
-                        aria-label="兼容 custom 工具（Responses 中转）"
-                        checked={editResponsesCustomToolCompat}
-                        className="mt-0.5"
-                        onChange={(event) => setEditResponsesCustomToolCompat(event.target.checked)}
-                        type="checkbox"
-                      />
-                      <span className="grid gap-1">
-                        <span>兼容 custom 工具（Responses 中转）</span>
-                        <span className="text-[11px] font-medium text-stone-500">
-                          仅当上游为 Responses 中转且不支持 custom 工具时勾选，把 custom 改写成 function。Chat/Anthropic/Gemini 上游会自动处理，无需勾选。
-                        </span>
-                      </span>
-                    </label>
-                  ) : null}
-                  {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
-                    <ResponsesPlaintextReasoningOption mode={editPlaintextReasoningMode} baseUrl={editApiBaseUrl} onChange={setEditPlaintextReasoningMode} />
-                  ) : null}
-                  {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
-                    <ResponsesCrossResourceStripOption mode={editCrossResourceStripMode} baseUrl={editApiBaseUrl} onChange={setEditCrossResourceStripMode} />
-                  ) : null}
-                  {shouldShowResponsesCustomToolCompatForFormat(activePlatform, editApiInterfaceFormat) ? (
-                    <ResponsesEncryptedContentCleanupOption
-                      aggressiveStrip={editResponsesEncryptedContentAggressiveStrip}
-                      checked={editResponsesEncryptedContentCleanup}
-                      onAggressiveStripChange={setEditResponsesEncryptedContentAggressiveStrip}
-                      onChange={setEditResponsesEncryptedContentCleanup}
-                    />
-                  ) : null}
-                  {shouldShowForceReasoningContentForFormat(activePlatform, editApiInterfaceFormat) ? (
-                    <label className="flex items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] font-medium text-stone-700">
-                      <input
-                        aria-label="强制回传推理内容（Chat 中转）"
-                        checked={editForceReasoningContent}
-                        className="mt-0.5"
-                        onChange={(event) => setEditForceReasoningContent(event.target.checked)}
-                        type="checkbox"
-                      />
-                      <span className="grid gap-1">
-                        <span>强制回传推理内容（Chat 中转）</span>
-                        <span className="text-[11px] font-medium text-stone-500">
-                          仅当上游为思考模型（DeepSeek/MiMo 等）且报 reasoning_content 缺失（如 11155）时勾选，会在每次请求主动回传 reasoning_content。默认不勾选：第一次碰到该报错会自动补齐并重试一次，并直接帮本账号打开此开关，之后不再走报错重试。
-                        </span>
-                      </span>
-                    </label>
-                  ) : null}
-                  <label className="flex items-start gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2 text-[12px] font-medium text-stone-700">
-                    <input
-                      aria-label="内联远程图片"
-                      checked={editInlineRemoteImages}
-                      className="mt-0.5"
-                      onChange={(event) => setEditInlineRemoteImages(event.target.checked)}
-                      type="checkbox"
-                    />
-                    <span className="grid gap-1">
-                      <span>内联远程图片</span>
-                      <span className="text-[11px] font-medium text-stone-500">
-                        转发前把请求里的 http(s) 图片链接抓取并转成 base64 data URL。用于上游会抓取图片链接、且因图床返回非 image/* 类型而报错的情况（如 OSS 对象被当作 text/plain）。会增加延迟，仅在需要时勾选。
-                      </span>
-                    </span>
-                  </label>
-                  {shouldShowTurnReminder(activePlatform) ? (
-                    <div className="grid gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2">
-                      <label className="flex items-start gap-2 text-[12px] font-medium text-stone-700">
-                        <input
-                          aria-label="每轮追加纠偏提醒"
-                          checked={editTurnReminder}
-                          className="mt-0.5"
-                          onChange={(event) => setEditTurnReminder(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span className="grid gap-1">
-                          <span>每轮追加纠偏提醒</span>
-                          <span className="text-[11px] font-medium text-stone-500">
-                            在每次请求的最后一条用户消息后追加一句要求。紧凑模型在长会话里会逐渐忘掉系统提示里的约束（比如开始用英文回复），而追加在末尾的这句离生成最近、最有效。写在末尾也不会打断 prompt 缓存前缀，不增加重复上下文的费用。
-                          </span>
-                        </span>
-                      </label>
-                      {editTurnReminder ? (
-                        <label className={labelClass}>
-                          提醒内容
-                          <input
-                            aria-label="纠偏提醒内容"
-                            className={fieldClass}
-                            onChange={(event) => setEditTurnReminderText(event.target.value)}
-                            placeholder={DEFAULT_TURN_REMINDER_PLACEHOLDER}
-                            value={editTurnReminderText}
-                          />
-                          <span className="text-[11px] font-medium text-stone-500">
-                            留空则使用默认：{DEFAULT_TURN_REMINDER_PLACEHOLDER}
-                          </span>
-                        </label>
-                      ) : null}
-                    </div>
-                  ) : null}
-                  </> : null}
                   <div className="grid gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2">
                     <RelayBalanceFields
                       fieldClass={fieldClass}

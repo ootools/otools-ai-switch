@@ -60,10 +60,10 @@ describe("SessionsScreen", () => {
     expect(layout).toHaveClass("md:grid-cols-[minmax(360px,0.9fr)_minmax(0,1.35fr)]");
     expect(await screen.findByText("已调整为左右双栏")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "按智能体筛选" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "分组" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "平铺" })).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByRole("button", { name: /D:\/repo\/ai-switch/ })).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("button", { name: /布局修复会话/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "分组" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "平铺" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /D:\/repo\/ai-switch/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /布局修复会话/ })).toBeInTheDocument();
     expect(screen.queryByText("D:/repo/ai-switch/session.jsonl")).not.toBeInTheDocument();
     expect(screen.queryByText("codex resume session-1")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "快速导航" })).not.toBeInTheDocument();
@@ -75,7 +75,6 @@ describe("SessionsScreen", () => {
     const layout = (await screen.findByRole("heading", { name: "会话管理" })).closest("section");
     const listPane = layout?.children[0];
     const detailPane = layout?.children[1];
-    await userEvent.click(await screen.findByRole("button", { name: /D:\/repo\/ai-switch/ }));
     const sessionItem = await screen.findByRole("button", { name: /布局修复会话/ });
 
     expect(sessionItem).not.toHaveTextContent("D:/repo/ai-switch/session.jsonl");

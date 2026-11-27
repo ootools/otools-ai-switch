@@ -112,6 +112,7 @@ async fn install_bytes(
     paths: &AppPaths,
     bytes: &[u8],
     source: &str,
+    middleware_js: Option<&[u8]>,
 ) -> Result<PluginSummary, AppError> {
     let manifest = plugin::parse_manifest(bytes)?;
     let dir = pack_dir(paths, &manifest.id)?;
@@ -121,6 +122,14 @@ async fn install_bytes(
     tokio::fs::write(dir.join(PLUGIN_FILE), bytes)
         .await
         .map_err(|error| filesystem("plugin.write_failed", error.to_string()))?;
+    if let Some(js) = middleware_js {
+        if js.len() > 256 * 1024 {
+            return Err(validation("plugin.script_too_large", "中间件脚本不能超过 256 KiB。".into()));
+        }
+        tokio::fs::write(dir.join("middleware.js"), js)
+            .await
+            .map_err(|error| filesystem("plugin.write_failed", error.to_string()))?;
+    }
     let info = InstallInfo {
         source: source.to_string(),
     };
@@ -133,6 +142,7 @@ async fn install_bytes(
         ids.insert(manifest.id.clone());
     })
     .await?;
+    crate::services::plugin_middleware::mark_dirty();
     Ok(manifest.summary(true, source))
 }
 
@@ -201,7 +211,16 @@ impl PluginService {
                 format!("目录中找不到 {PLUGIN_FILE}：{error}"),
             )
         })?;
-        install_bytes(paths, &bytes, "local").await
+        let manifest = plugin::parse_manifest(&bytes)?;
+        let middleware_js = match &manifest.contributes.middleware {
+            Some(contribution) => Some(
+                tokio::fs::read(canonical.join(&contribution.file))
+                    .await
+                    .map_err(|error| filesystem("plugin.script_not_found", format!("找不到中间件脚本：{error}")))?,
+            ),
+            None => None,
+        };
+        install_bytes(paths, &bytes, "local", middleware_js.as_deref()).await
     }
 
     /// Install from a URL. The caller supplies the SHA-256 digest (published
@@ -288,10 +307,18 @@ impl PluginService {
                 format!("插件清单超过 {MANIFEST_MAX_BYTES} 字节上限。"),
             ));
         }
-        install_bytes(paths, &bytes, "url").await
+        let manifest = plugin::parse_manifest(&bytes)?;
+        if manifest.contributes.middleware.is_some() {
+            return Err(validation(
+                "plugin.middleware_url_unsupported",
+                "含中间件脚本的插件请用本地文件夹安装。".into(),
+            ));
+        }
+        install_bytes(paths, &bytes, "url", None).await
     }
 
     pub async fn uninstall(paths: &AppPaths, id: &str) -> Result<(), AppError> {
+        crate::services::plugin_middleware::mark_dirty();
         let dir = pack_dir(paths, id)?;
         if !dir.is_dir() {
             return Err(filesystem(
@@ -309,6 +336,7 @@ impl PluginService {
     }
 
     pub async fn set_enabled(paths: &AppPaths, id: &str, enabled: bool) -> Result<(), AppError> {
+        crate::services::plugin_middleware::mark_dirty();
         // Validate the id and confirm the pack exists before touching settings.
         let _ = read_pack(paths, id).await?;
         mutate_enabled(paths, |ids| {
@@ -379,6 +407,26 @@ mod tests {
             .await
             .unwrap();
         (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn folder_install_copies_middleware_script() {
+        let (_dir, paths) = pack_fixture("mw-pack").await;
+        let source = paths.data_dir.join("source");
+        let json = manifest_json("mw-pack").replace(
+            "\"contributes\": {",
+            "\"contributes\": {\"middleware\": {\"file\": \"middleware.js\"},",
+        );
+        tokio::fs::write(source.join(PLUGIN_FILE), json).await.unwrap();
+        tokio::fs::write(source.join("middleware.js"), "function onRequest(body) { return body; }")
+            .await
+            .unwrap();
+
+        PluginService::install_folder(&paths, source.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(paths.plugins_dir.join("mw-pack").join("middleware.js").is_file());
     }
 
     #[tokio::test]

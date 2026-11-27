@@ -635,6 +635,21 @@ pub async fn dispatch_command(
                     .map_err(to_error)?,
             )
         }
+        "builtin_plugin_list" => to_value(crate::services::builtin_plugins::list()),
+        "builtin_plugin_get" => {
+            let id = required_string_arg(&args, "id")?;
+            to_value(crate::services::builtin_plugins::get(&id))
+        }
+        "builtin_plugin_chain_validate" => {
+            let pipeline: crate::models::pipeline::PipelineConfig = parse_arg(&args, "pipeline")?;
+            match crate::services::builtin_plugins::validate(&pipeline) {
+                Ok(()) => to_value(json!({ "ok": true, "errors": [] })),
+                Err(error) => to_value(json!({
+                    "ok": false,
+                    "errors": [{ "code": error.code(), "message": error.to_string() }],
+                })),
+            }
+        }
         "plugin_pack_list" => to_value(
             crate::services::plugin_service::PluginService::list(&state.paths)
                 .await

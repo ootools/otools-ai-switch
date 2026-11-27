@@ -766,6 +766,7 @@ mod tests {
             success_rate: None,
             last_duration_ms: None,
             avg_recent_duration_ms: None,
+            recent_tps_milli: None,
             quota_remaining: None,
             quota_limit: None,
             quota_used: None,

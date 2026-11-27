@@ -348,6 +348,15 @@ describe("UsageOverviewPanel", () => {
     expect(vi.mocked(getUsageOverview).mock.calls.length).toBe(callsBefore);
   });
 
+  it("shows the trend chart on the first screen without selecting a dimension", async () => {
+    renderPanel();
+
+    await screen.findByText("1.1万");
+    expect(screen.getByText("Token 趋势")).toBeInTheDocument();
+    expect(screen.getByText("Token 趋势总览")).toBeInTheDocument();
+    expect(screen.getByText("输入+输出 Token，按全部堆叠")).toBeInTheDocument();
+  });
+
   it("offers the list/chart switch only once a dimension is open", async () => {
     renderPanel();
     await screen.findByText("1.1万");

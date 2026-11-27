@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import { I18nProvider } from "../src/lib/i18n";
 import {
   CODEX_SEGMENT_STORAGE_KEY,
@@ -13,13 +14,16 @@ vi.mock("../src/screens/AccountsScreen", () => ({
   AccountsScreen: ({
     platform,
     capabilityFilter,
+    toolbarLeading,
     modality,
   }: {
     platform?: string;
     capabilityFilter?: string;
     modality?: string;
+    toolbarLeading?: ReactNode;
   }) => (
     <div>
+      {toolbarLeading}
       {modality === "vector" ? "向量接口尚未开放" : <>accounts:{platform}{capabilityFilter ? `:${capabilityFilter}` : ""}</>}
     </div>
   ),

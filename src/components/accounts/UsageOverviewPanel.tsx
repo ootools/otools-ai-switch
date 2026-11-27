@@ -752,6 +752,17 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
   const activeGroup = groupDimensions.find((item) => item.key === dimension);
   const groupRows = !overview || !activeGroup ? [] : overview.groups[activeGroup.field];
   const activeSeries = !overview || !activeGroup ? [] : overview.series[activeGroup.field];
+  // First-screen trend: one "全部" series summing every dimension row.
+  const totalSeries = overview
+    ? [{
+        key: "全部",
+        tokens: overview.series.buckets.map((_, index) =>
+          overview.series.by_model.reduce((sum, row) => sum + (row.tokens[index] ?? 0), 0),
+        ),
+      }]
+    : [];
+  const chartRows = totalSeries;
+  const chartLabel = "全部";
 
   const integrityNotes = (() => {
     if (!overview) {
@@ -784,14 +795,14 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
     <div
       className={`space-y-3 px-3 py-3 ${standalone ? "" : "border-t border-stone-200/80"}`}
     >
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-[13px] font-semibold text-stone-950">用量总览</p>
-          <p className="text-[12px] text-stone-500">
+          <p className="text-[15px] font-semibold tracking-tight text-stone-950">用量总览</p>
+          <p className="mt-0.5 text-[12px] text-stone-500">
             合并本机 CLI 会话记录与代理请求，同一请求只计一次
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex gap-1 rounded-xl bg-stone-100 p-1">
             {([["usage", "用量"], ["speed", "速度"], ["quota", "额度"]] as const).map(([key, label]) => (
               <button
@@ -826,13 +837,18 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
           >
             <Settings2 aria-hidden="true" className="h-4 w-4" />
           </button>
-          <div className="grid grid-cols-8 gap-1 rounded-xl bg-stone-100 p-1">
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2">
+        <span className="shrink-0 text-[11px] font-semibold text-stone-500">时间范围</span>
+        <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
           {periods.map((item) => (
             <button
-              className={`rounded-lg px-2 py-1 text-[11px] font-semibold motion-control ${
+              className={`shrink-0 rounded-lg px-2 py-1 text-[11px] font-semibold motion-control ${
                 period === item.key
-                  ? "bg-white text-stone-950 shadow-sm"
-                  : "text-stone-500 hover:text-stone-900"
+                  ? "bg-stone-900 text-white shadow-sm"
+                  : "text-stone-500 hover:bg-stone-100 hover:text-stone-900"
               }`}
               key={item.key}
               onClick={() => selectPeriod(item.key)}
@@ -841,7 +857,6 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
               {item.label}
             </button>
           ))}
-          </div>
         </div>
       </div>
 
@@ -900,11 +915,16 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
         <SpeedView overview={overview} />
       ) : (
         <>
-          <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
             <SummaryCard
               label="请求"
               title={formatExactCount(totals?.request_count ?? 0)}
               value={formatCompactCount(totals?.request_count ?? 0)}
+            />
+            <SummaryCard
+              label="Token 总计"
+              title={`${formatExactCount(tokenTotal)}（输入 + 输出 + 缓存写入 + 缓存读取）`}
+              value={formatCompactCount(tokenTotal)}
             />
             <SummaryCard
               label="输入 Token"
@@ -912,14 +932,9 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
               value={formatCompactCount(totals?.input_tokens ?? 0)}
             />
             <SummaryCard
-              label="输出 Token"
-              title={formatExactCount(totals?.output_tokens ?? 0)}
-              value={formatCompactCount(totals?.output_tokens ?? 0)}
-            />
-            <SummaryCard
-              label="缓存 Token"
-              title={`写入 ${formatExactCount(totals?.cache_write_tokens ?? 0)}；读取 ${formatExactCount(totals?.cache_read_tokens ?? 0)}`}
-              value={formatCompactCount(cacheTotal)}
+              label="费用（USD）"
+              title={`${((totals?.cost_micros ?? 0) / 1_000_000).toFixed(6)} USD`}
+              value={formatCostMicros(totals?.cost_micros ?? 0)}
             />
             <SummaryCard
               label="缓存命中率"
@@ -930,16 +945,29 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
               }
               value={cacheHitRate === null ? "—" : `${(cacheHitRate * 100).toFixed(1)}%`}
             />
-            <SummaryCard
-              label="总计 Token"
-              title={`${formatExactCount(tokenTotal)}（输入 + 输出 + 缓存写入 + 缓存读取）`}
-              value={formatCompactCount(tokenTotal)}
-            />
-            <SummaryCard
-              label="费用（USD）"
-              title={`${((totals?.cost_micros ?? 0) / 1_000_000).toFixed(6)} USD`}
-              value={formatCostMicros(totals?.cost_micros ?? 0)}
-            />
+          </div>
+
+
+          <div className="rounded-2xl border border-stone-200 bg-white p-3 shadow-sm">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-[14px] font-semibold text-stone-950">Token 趋势</h2>
+                <p className="mt-0.5 text-[11px] text-stone-500">
+                  当前时间窗的 Token 总量走势
+                </p>
+              </div>
+            </div>
+            {overview && !(activeGroup && groupView === "chart") ? (
+              <UsageTrendChart
+                buckets={overview.series.buckets}
+                dimensionLabel={chartLabel}
+                rows={chartRows}
+                stale={query.isFetching}
+                title="Token 趋势总览"
+                undatedRequestCount={overview.series.undated_request_count}
+                unit={overview.series.unit}
+              />
+            ) : null}
           </div>
 
           {integrityNotes.length > 0 ? (
@@ -949,11 +977,11 @@ export function UsageOverviewPanel({ standalone = false }: { standalone?: boolea
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-[12px] font-semibold text-stone-600">分组统计</span>
-              <div className="flex gap-1 rounded-xl bg-stone-100 p-1">
+              <div className="flex flex-wrap gap-1 rounded-xl bg-stone-100 p-1">
                 {groupDimensions.map((item) => (
                   <button
                     aria-pressed={dimension === item.key}
-                    className={`rounded-lg px-2.5 py-1 text-[12px] font-semibold motion-control ${
+                    className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold motion-control ${
                       dimension === item.key
                         ? "bg-white text-stone-950 shadow-sm"
                         : "text-stone-500 hover:text-stone-900"

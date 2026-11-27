@@ -269,6 +269,11 @@ export function PluginsSettings() {
         <div className={cardClass}>
           <h3 className="text-[13px] font-semibold text-stone-950">
             {t("settings.plugins.detail")} · {detail.manifest.name}
+            {detail.manifest.contributes.middleware ? (
+              <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-800">
+                中间件
+              </span>
+            ) : null}
           </h3>
           <p className="mt-1 break-all font-mono text-[11px] text-stone-500">{detail.path}</p>
           <p className="mt-2 text-[11px] text-stone-500">

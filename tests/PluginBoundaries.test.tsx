@@ -15,6 +15,7 @@ beforeEach(() => window.localStorage.clear());
 it("opens image generation without a plugin toggle and omits excluded navigation", async () => {
   const navigate = vi.fn();
   render(<I18nProvider initialLanguage="en"><AppLayout activeScreen="PoolGeneral" onNavigate={navigate} onToggleSidebar={() => {}} sidebarCollapsed={false}><p>Accounts</p></AppLayout></I18nProvider>);
+  await userEvent.click(screen.getByRole("button", { name: "Other" }));
   await userEvent.click(screen.getByRole("button", { name: "Image Studio" }));
   expect(navigate).toHaveBeenCalledWith("ImageGen");
   expect(screen.queryByRole("button", { name: /Vibe|SaaS|Updates/i })).not.toBeInTheDocument();

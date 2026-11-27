@@ -97,6 +97,20 @@ const PAGE_SELECT: &str = "SELECT
               ORDER BY created_at DESC
               LIMIT 10)
     ) AS avg_recent_duration_ms,
+    (SELECT CASE WHEN SUM(duration_ms) > 0
+                 THEN CAST(SUM(output_tokens) AS REAL) * 1000.0 / SUM(duration_ms)
+                 ELSE NULL END
+       FROM (SELECT output_tokens, duration_ms
+               FROM usage_events
+              WHERE route_credential_id = rc.id
+                AND source_label IN ('route_proxy', 'route_pool_model_test')
+                AND metric_type = 'request'
+                AND success = 1
+                AND duration_ms IS NOT NULL
+                AND output_tokens IS NOT NULL
+              ORDER BY created_at DESC
+              LIMIT 10)
+    ) AS recent_tps_milli,
     rc.quota_remaining, rc.quota_limit, rc.quota_used, rc.quota_updated_at, rc.archived_at,
     rc.created_at, rc.updated_at
  FROM route_credentials rc
@@ -113,6 +127,20 @@ const SINGLE_SELECT: &str = "SELECT
     rc.subscription_type, rc.primary_remain, rc.weekly_remain, rc.reset_primary, rc.reset_weekly,
     rc.transient_failure_count, rc.next_retry_at, rc.cooldown_until, rc.last_failure_kind,
     rc.last_failure_message, rc.last_failure_response_json,
+    (SELECT CASE WHEN SUM(duration_ms) > 0
+                 THEN CAST(SUM(output_tokens) AS REAL) * 1000.0 / SUM(duration_ms)
+                 ELSE NULL END
+       FROM (SELECT output_tokens, duration_ms
+               FROM usage_events
+              WHERE route_credential_id = rc.id
+                AND source_label IN ('route_proxy', 'route_pool_model_test')
+                AND metric_type = 'request'
+                AND success = 1
+                AND duration_ms IS NOT NULL
+                AND output_tokens IS NOT NULL
+              ORDER BY created_at DESC
+              LIMIT 10)
+    ) AS recent_tps_milli,
     rc.quota_remaining, rc.quota_limit, rc.quota_used, rc.quota_updated_at, rc.archived_at,
     rc.created_at, rc.updated_at
  FROM route_credentials rc
@@ -1142,6 +1170,20 @@ impl RouteCredentialRepository {
                           ORDER BY created_at DESC
                           LIMIT 10)
                 ) AS avg_recent_duration_ms,
+    (SELECT CASE WHEN SUM(duration_ms) > 0
+                 THEN CAST(SUM(output_tokens) AS REAL) * 1000.0 / SUM(duration_ms)
+                 ELSE NULL END
+       FROM (SELECT output_tokens, duration_ms
+               FROM usage_events
+              WHERE route_credential_id = rc.id
+                AND source_label IN ('route_proxy', 'route_pool_model_test')
+                AND metric_type = 'request'
+                AND success = 1
+                AND duration_ms IS NOT NULL
+                AND output_tokens IS NOT NULL
+              ORDER BY created_at DESC
+              LIMIT 10)
+    ) AS recent_tps_milli,
                 rc.quota_remaining,
                 rc.quota_limit,
                 rc.quota_used,

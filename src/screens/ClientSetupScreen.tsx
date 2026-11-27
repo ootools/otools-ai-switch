@@ -749,18 +749,29 @@ export function ClientSetupScreen({
           className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
           data-testid="client-setup-scroll-region"
         >
-          <div className="mx-auto w-full max-w-4xl px-4 py-5">
-            <header className="flex items-start gap-3">
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-stone-900 text-white">
-                <Plug aria-hidden="true" className="h-5 w-5" />
-              </span>
-              <div className="min-w-0">
-                <h1 className="text-lg font-semibold leading-tight tracking-tight text-stone-950">
-                  智能体
-                </h1>
-                <p className="mt-1 text-[13px] leading-5 text-stone-600">
-                  把同一个算力池接入常用 Agent：勾选要写入的客户端一键写入；其他工具手动复制端点参数。
-                </p>
+          <div className="mx-auto w-full max-w-5xl px-5 py-6">
+            <header className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-stone-200 bg-gradient-to-br from-white to-stone-50 px-5 py-4 shadow-sm">
+              <div className="flex items-center gap-3">
+                <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-stone-900 text-white shadow-sm">
+                  <Plug aria-hidden="true" className="h-5 w-5" />
+                </span>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="text-lg font-semibold tracking-tight text-stone-950">智能体</h1>
+                    <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-semibold text-stone-600">
+                      {clients.length} 个可接入
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-[12px] text-stone-500">
+                    选择目标，一键把当前算力池写入它们的配置。
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 rounded-full border border-stone-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-stone-600">
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${routeServiceReady ? "bg-emerald-500" : "bg-stone-400"}`}
+                />
+                {routeServiceReady ? "网关就绪" : "网关未启动"}
               </div>
             </header>
 
@@ -771,69 +782,6 @@ export function ClientSetupScreen({
               >
                 配置已变更，需重新写入才会生效。
               </p>
-            ) : null}
-
-            {outcomes.length > 0 ? (
-              <div className="mt-4 space-y-1 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-[12px] text-stone-600">
-                <div className="flex items-start justify-between gap-3">
-                  <p className="font-semibold text-stone-950">配置写入结果</p>
-                  <button
-                    aria-label="关闭配置写入结果"
-                    className="text-stone-400 motion-control hover:text-stone-700"
-                    onClick={() => setOutcomes([])}
-                    type="button"
-                  >
-                    ✕
-                  </button>
-                </div>
-                {outcomes.map((outcome) => (
-                  <div
-                    className="rounded-lg border border-stone-200 bg-white px-2.5 py-2"
-                    key={`${outcome.operation_id}:${outcome.target_key}:${outcome.snapshot_id ?? "none"}`}
-                  >
-                    <p>
-                      {clientByTargetKey.get(outcome.target_key)?.display_name ?? outcome.target_key} ·{" "}
-                      {outcome.platform}: {outcome.path || "未解析路径"} ({outcome.status})
-                    </p>
-                    <p className="mt-1 font-mono text-[11px] text-stone-500">
-                      operation {outcome.operation_id} · snapshot {outcome.snapshot_id ?? "none"}
-                    </p>
-                    {outcome.error_code ? (
-                      <p className="mt-1 font-mono text-[11px] text-red-600">{outcome.error_code}</p>
-                    ) : null}
-                    {outcome.status === "succeeded" && outcome.snapshot_id ? (
-                      <button
-                        aria-label={`回滚此次写入 ${outcome.target_key}`}
-                        className="mt-2 rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
-                        disabled={rollbackMutation.isPending}
-                        onClick={() => rollbackMutation.mutate(outcome.snapshot_id as string)}
-                        type="button"
-                      >
-                        回滚此次写入
-                      </button>
-                    ) : null}
-                  </div>
-                ))}
-                <div className="flex flex-wrap items-center gap-2 border-t border-stone-200 pt-2">
-                  <span className="text-[11px] font-semibold text-stone-500">还原原生配置：</span>
-                  {selected.map((clientKey) => {
-                    const targetKey = clientByTargetKey.get(clientKey)?.target_key;
-                    if (!targetKey) return null;
-                    return (
-                      <button
-                        aria-label={`还原 ${clientKey} 的原生配置`}
-                        className="rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
-                        disabled={restoreNativeMutation.isPending}
-                        key={clientKey}
-                        onClick={() => restoreNativeMutation.mutate(targetKey)}
-                        type="button"
-                      >
-                        {clientByTargetKey.get(clientKey)?.display_name ?? clientKey}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
             ) : null}
 
             {writeError ? (
@@ -853,109 +801,183 @@ export function ClientSetupScreen({
               </div>
             ) : null}
 
-            <div className="mt-4 grid gap-4">
-              <ModelModePicker
-                disabled={writing || setModelModeMutation.isPending}
-                mode={routePoolQuery.data?.model_mode ?? "precise"}
-                onChange={(mode) => setModelModeMutation.mutate(mode)}
-              />
-
-              <div className="grid gap-1.5">
-                <span className="text-[11px] font-semibold text-stone-600">智能体接入目标</span>
-                <p className="text-[11px] leading-5 text-stone-500">
-                  账号池始终只有同一个。卡片上的接口格式决定写入时走哪组适配器与哪把接入 Key；
-                  Claude Code 只有固定的 /model 槽位，需要单独设置。
-                </p>
-              </div>
-
-              {capabilityDisabledReason ? (
-                <p
-                  className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-950"
-                  role="alert"
-                >
-                  {capabilityDisabledReason}
-                </p>
-              ) : null}
-
-              {clientsQuery.isLoading ? (
-                <p className="text-[12px] text-stone-500">读取客户端列表中...</p>
-              ) : clients.length === 0 ? (
-                <p className="rounded-xl bg-stone-50 px-3.5 py-3 text-xs leading-5 text-stone-600">
-                  暂无可写入的客户端。
-                </p>
-              ) : (
-                <ul className="list-none divide-y divide-stone-100 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-sm">
-                  {clients.map(renderClientCard)}
-                </ul>
-              )}
-
-              {deepSeekHarnessSelected ? (
-                <label className="grid gap-1.5 rounded-xl bg-stone-50 px-3.5 py-3 text-xs text-stone-700">
-                  <span className="text-[11px] font-semibold text-stone-600">DSH 配置文件路径</span>
-                  <input
-                    aria-label="DSH 配置文件路径"
-                    className="h-8 rounded-md border border-stone-200 bg-white px-2.5 font-mono text-[11px] text-stone-800 outline-none placeholder:font-sans placeholder:text-stone-400 focus:border-blue-400"
-                    disabled={Boolean(capabilityDisabledReason) || writing}
-                    onChange={(event) => setDeepSeekHarnessPathOverride(event.target.value)}
-                    placeholder={
-                      selected.includes("deepseek_harness_desktop")
-                        ? "留空使用 ~/.dsh/profiles/desktop/cordis.patch.yml"
-                        : "留空使用 ~/.dsh/settings.yaml"
-                    }
-                    type="text"
-                    value={deepSeekHarnessPath}
-                  />
-                  <span className="text-[11px] leading-5 text-stone-500">
-                    需要绝对路径；留空时写回 DeepSeek Harness 默认位置。
-                  </span>
-                </label>
-              ) : null}
-
-              {directSelectedClients.length > 0 ? (
-                <p
-                  className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-950"
-                  role="note"
-                >
-                  本次写入成功后将结束{" "}
-                  {directSelectedClients.map((client) => client.display_name).join("、")}
-                  {" "}的直连模式，切回算力池。未勾选的客户端配置与认证保持不变。
-                </p>
-              ) : null}
-
-              <details className="rounded-xl border border-stone-200 bg-white px-3.5 py-3">
-                <summary className="cursor-pointer text-[12px] font-semibold text-stone-700">
-                  手动配置参数（内置支持之外的 Agent）
+            {outcomes.length > 0 ? (
+              <details className="mt-4 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2">
+                <summary className="flex cursor-pointer items-center justify-between gap-3 text-[12px] font-semibold text-stone-700">
+                  <span>配置写入结果</span>
+                  <button
+                    aria-label="关闭配置写入结果"
+                    className="text-stone-400 motion-control hover:text-stone-700"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setOutcomes([]);
+                    }}
+                    type="button"
+                  >
+                    ✕
+                  </button>
                 </summary>
-                <div className="mt-3 grid gap-2.5">
-                  <p className="text-xs leading-5 text-stone-500">
-                    把下面的参数手动填进它自己的设置里，一样走当前算力池。
+                <div className="mt-2 space-y-1 text-[12px] text-stone-600">
+                  {outcomes.map((outcome) => (
+                    <div
+                      className="rounded-lg border border-stone-200 bg-white px-2.5 py-2"
+                      key={`${outcome.operation_id}:${outcome.target_key}:${outcome.snapshot_id ?? "none"}`}
+                    >
+                      <p>
+                        {clientByTargetKey.get(outcome.target_key)?.display_name ?? outcome.target_key} ·{" "}
+                        {outcome.platform}: {outcome.path || "未解析路径"} ({outcome.status})
+                      </p>
+                      <p className="mt-1 font-mono text-[11px] text-stone-500">
+                        operation {outcome.operation_id} · snapshot {outcome.snapshot_id ?? "none"}
+                      </p>
+                      {outcome.error_code ? (
+                        <p className="mt-1 font-mono text-[11px] text-red-600">{outcome.error_code}</p>
+                      ) : null}
+                      {outcome.status === "succeeded" && outcome.snapshot_id ? (
+                        <button
+                          aria-label={`回滚此次写入 ${outcome.target_key}`}
+                          className="mt-2 rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
+                          disabled={rollbackMutation.isPending}
+                          onClick={() => rollbackMutation.mutate(outcome.snapshot_id as string)}
+                          type="button"
+                        >
+                          回滚此次写入
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                  <div className="flex flex-wrap items-center gap-2 border-t border-stone-200 pt-2">
+                    <span className="text-[11px] font-semibold text-stone-500">还原原生配置：</span>
+                    {selected.map((clientKey) => {
+                      const targetKey = clientByTargetKey.get(clientKey)?.target_key;
+                      if (!targetKey) return null;
+                      return (
+                        <button
+                          aria-label={`还原 ${clientKey} 的原生配置`}
+                          className="rounded-lg border border-stone-300 bg-white px-2 py-1 text-[11px] font-semibold text-stone-700 motion-control hover:bg-stone-50 disabled:opacity-40"
+                          disabled={restoreNativeMutation.isPending}
+                          key={clientKey}
+                          onClick={() => restoreNativeMutation.mutate(targetKey)}
+                          type="button"
+                        >
+                          {clientByTargetKey.get(clientKey)?.display_name ?? clientKey}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </details>
+            ) : null}
+
+            <div className="mt-5 grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
+              <section className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-[15px] font-semibold text-stone-950">接入目标</h2>
+                    <p className="mt-0.5 text-[11px] text-stone-500">
+                      已选 {selected.length} 个 · 接口格式决定写入适配器与接入 Key
+                    </p>
+                  </div>
+                  <span className="rounded-full bg-stone-900 px-2.5 py-1 text-[10px] font-semibold text-white">
+                    {selected.length} / {clients.length}
+                  </span>
+                </div>
+
+                {capabilityDisabledReason ? (
+                  <p
+                    className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-950"
+                    role="alert"
+                  >
+                    {capabilityDisabledReason}
                   </p>
-                  <div className="grid gap-2.5 rounded-md bg-stone-50 px-3.5 py-3">
+                ) : null}
+
+                {clientsQuery.isLoading ? (
+                  <p className="text-[12px] text-stone-500">读取客户端列表中...</p>
+                ) : clients.length === 0 ? (
+                  <p className="rounded-xl bg-stone-50 px-3.5 py-3 text-xs leading-5 text-stone-600">
+                    暂无可写入的客户端。
+                  </p>
+                ) : (
+                  <ul className="list-none divide-y divide-stone-100 overflow-hidden rounded-xl border border-stone-200 bg-white">
+                    {clients.map(renderClientCard)}
+                  </ul>
+                )}
+
+                {directSelectedClients.length > 0 ? (
+                  <p
+                    className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-950"
+                    role="note"
+                  >
+                    写入后将结束{" "}
+                    {directSelectedClients.map((client) => client.display_name).join("、")}
+                    {" "}的直连模式，切回算力池。
+                  </p>
+                ) : null}
+
+                {deepSeekHarnessSelected ? (
+                  <details className="mt-3 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2">
+                    <summary className="cursor-pointer text-[11px] font-semibold text-stone-600">
+                      高级：DeepSeek Harness 配置路径
+                    </summary>
+                    <input
+                      aria-label="DSH 配置文件路径"
+                      className="mt-2 h-8 w-full rounded-md border border-stone-200 bg-white px-2.5 font-mono text-[11px] text-stone-800 outline-none placeholder:font-sans placeholder:text-stone-400 focus:border-blue-400"
+                      disabled={Boolean(capabilityDisabledReason) || writing}
+                      onChange={(event) => setDeepSeekHarnessPathOverride(event.target.value)}
+                      placeholder={
+                        selected.includes("deepseek_harness_desktop")
+                          ? "留空使用 ~/.dsh/profiles/desktop/cordis.patch.yml"
+                          : "留空使用 ~/.dsh/settings.yaml"
+                      }
+                      type="text"
+                      value={deepSeekHarnessPath}
+                    />
+                  </details>
+                ) : null}
+              </section>
+
+              <aside className="grid gap-4">
+                <section className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+                  <h2 className="mb-3 text-[13px] font-semibold text-stone-950">路由模式</h2>
+                  <ModelModePicker
+                    disabled={writing || setModelModeMutation.isPending}
+                    mode={routePoolQuery.data?.model_mode ?? "precise"}
+                    onChange={(mode) => setModelModeMutation.mutate(mode)}
+                  />
+                </section>
+
+                <details className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+                  <summary className="cursor-pointer text-[13px] font-semibold text-stone-950">
+                    手动接入参数
+                  </summary>
+                  <div className="mt-3 grid gap-2.5">
                     <EndpointRow label="Base URL" value={httpEndpoint} />
                     {httpsEndpoint ? <EndpointRow label="HTTPS Base URL" value={httpsEndpoint} /> : null}
                     <EndpointRow label="API Key" secret value={routeServiceReady ? routeProxyKeyQuery.data ?? null : null} />
                     {imageEndpoint ? <EndpointRow label="图片端点" value={imageEndpoint} /> : null}
-                  </div>
-                  {imageEndpoint ? (
                     <p className="text-[11px] leading-5 text-stone-500">
-                      图片端点走同一个池、同一张 key。可用的生图模型：
-                      {poolImageModels.join("、")}。图片编辑（/v1/images/edits）目前只支持
-                      interface_format 为 openai 的账号。
+                    {httpsEndpoint ? (
+                      <p className="text-[11px] leading-5 text-stone-500">
+                        HTTPS 端点仅在需要 TLS 时使用，客户端必须信任本地根证书。
+                      </p>
+                    ) : null}
+                    {imageEndpoint ? (
+                      <details className="rounded-lg border border-stone-100 bg-stone-50 px-2.5 py-2">
+                        <summary className="cursor-pointer text-[11px] font-semibold text-stone-600">
+                          可用生图模型
+                        </summary>
+                        <p className="mt-1 text-[11px] leading-5 text-stone-500">
+                          图片端点走同一个池、同一张 key。可用的生图模型：{poolImageModels.join("、")}。
+                        </p>
+                      </details>
+                    ) : null}
+                      内置支持之外的 Agent 可手动填写这些参数；主 Key 覆盖 Codex / Chat 协议族。
                     </p>
-                  ) : null}
-                  <p className="text-[11px] leading-5 text-stone-500">
-                    {httpsEndpoint
-                      ? "正常情况用上面的 Base URL（HTTP）即可。HTTPS 端点只给确实需要 TLS 的特殊场景，且客户端必须信任本地根证书。"
-                      : routeProxyQuery.data?.https_error
-                        ? "正常情况用上面的 Base URL（HTTP）即可。HTTPS 端点本次未能启动，原因见设置里的 HTTPS 面板。"
-                        : "正常情况用上面的 Base URL（HTTP）即可。需要 TLS 的特殊场景可在设置里开启 HTTPS，它会另占一个端口。"}
-                  </p>
-                  <p className="text-[11px] leading-5 text-amber-800">
-                    这里给出的是主接入 Key（Codex / Chat 协议族）。勾选写入时，网关会按每个客户端的接口格式自动填入对应的
-                    Key；Anthropic Messages 客户端使用另一把 Key，已随配置一并写入，无需手工复制。
-                  </p>
-                </div>
-              </details>
+                  </div>
+                </details>
+              </aside>
             </div>
           </div>
         </div>
@@ -963,18 +985,23 @@ export function ClientSetupScreen({
         <footer className="shrink-0 border-t border-stone-200 bg-stone-100">
           <div
             aria-label="配置写入操作"
-            className="mx-auto flex w-full max-w-4xl shrink-0 items-center justify-end gap-3 px-4 py-3"
+            className="mx-auto flex w-full max-w-5xl shrink-0 items-center justify-between gap-3 px-5 py-3"
             role="group"
           >
-            <span className="mr-auto min-w-0 text-[11px] leading-5 text-stone-500">
-              只写入勾选的客户端，其他客户端的配置文件不会被改动。
-            </span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-stone-900 text-[10px] font-semibold text-white">
+                {selected.length}
+              </span>
+              <span className="truncate text-[11px] text-stone-500">
+                只写入勾选的客户端，其他客户端的配置文件不会被改动。
+              </span>
+            </div>
             <button
-              className="h-9 shrink-0 rounded-md bg-stone-900 px-4 text-sm font-semibold text-white motion-control hover:bg-stone-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+              className="h-10 shrink-0 rounded-xl bg-stone-900 px-5 text-sm font-semibold text-white shadow-sm motion-control hover:bg-stone-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
               disabled={Boolean(capabilityDisabledReason) || writing || saveCodexLoginMutation.isPending || selected.length === 0}
               type="submit"
             >
-              {writing ? "写入中..." : "写入"}
+              {writing ? "写入中..." : "一键写入"}
             </button>
           </div>
         </footer>

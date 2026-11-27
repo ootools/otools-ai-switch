@@ -97,6 +97,9 @@ import type {
   PluginDetail,
   PluginPreset,
   PluginSummary,
+  BuiltinPluginDescriptor,
+  ChainValidation,
+  PipelineConfig,
 } from "./types";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -893,6 +896,18 @@ export function pluginPackSetEnabled(id: string, enabled: boolean): Promise<void
 
 export function pluginPackListPresets(): Promise<PluginPreset[]> {
   return invoke("plugin_pack_list_presets");
+}
+
+export function builtinPluginList(): Promise<BuiltinPluginDescriptor[]> {
+  return invoke("builtin_plugin_list");
+}
+
+export function builtinPluginGet(id: string): Promise<BuiltinPluginDescriptor | null> {
+  return invoke("builtin_plugin_get", { id });
+}
+
+export function builtinPluginChainValidate(pipeline: PipelineConfig): Promise<ChainValidation> {
+  return invoke("builtin_plugin_chain_validate", { pipeline });
 }
 
 /// `skillIds` null installs every missing member; pass ids to install just those.

@@ -3,6 +3,9 @@ import { motion } from "motion/react";
 import {
   BarChart3,
   Bot,
+  Boxes,
+  ChevronDown,
+  Layers3,
   History,
   Info,
   Images,
@@ -151,6 +154,7 @@ export function AppLayout({
     () => typeof window !== "undefined" && window.innerWidth < SIDEBAR_DRAWER_BREAKPOINT,
   );
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const [otherOpen, setOtherOpen] = useState(false);
   const settingsActive = isSettingsArea(activeScreen);
   const accountWorkspaceActive = activeScreen === "Suppliers" || modalityForScreen(activeScreen) !== undefined;
   const sidebarDrawerVisible = narrowLayout && sidebarDrawerOpen;
@@ -293,9 +297,17 @@ export function AppLayout({
 
             <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-0.5">
               <NavButton
+                active={activeScreen === "Gateway"}
+                collapsed={sidebarContentCollapsed}
+                icon={Server}
+                label={t("nav.gateway")}
+                onClick={() => handleNavigate("Gateway")}
+                variant="primary"
+              />
+              <NavButton
                 active={activeScreen === "Suppliers" || modalityForScreen(activeScreen) !== undefined}
                 collapsed={sidebarContentCollapsed}
-                icon="codex"
+                icon={Boxes}
                 label={t("nav.suppliers")}
                 onClick={() => handleNavigate("Suppliers")}
                 variant="primary"
@@ -308,11 +320,11 @@ export function AppLayout({
                 onClick={() => handleNavigate("ClientSetup")}
               />
               <NavButton
-                active={activeScreen === "Gateway"}
+                active={activeScreen === "Traffic"}
                 collapsed={sidebarContentCollapsed}
-                icon={Server}
-                label={t("nav.gateway")}
-                onClick={() => handleNavigate("Gateway")}
+                icon={Network}
+                label={t("nav.traffic")}
+                onClick={() => handleNavigate("Traffic")}
               />
               <NavButton
                 active={activeScreen === "Sessions"}
@@ -322,40 +334,71 @@ export function AppLayout({
                 onClick={() => handleNavigate("Sessions")}
               />
               <NavButton
-                active={activeScreen === "Traffic"}
-                collapsed={sidebarContentCollapsed}
-                icon={Network}
-                label={t("nav.traffic")}
-                onClick={() => handleNavigate("Traffic")}
-              />
-              <NavButton
                 active={activeScreen === "Stats"}
                 collapsed={sidebarContentCollapsed}
                 icon={BarChart3}
                 label={t("nav.stats")}
                 onClick={() => handleNavigate("Stats")}
               />
-              <NavButton
-                active={activeScreen === "ImageGen"}
-                collapsed={sidebarContentCollapsed}
-                icon={Images}
-                label={t("nav.imagegen")}
-                onClick={() => handleNavigate("ImageGen")}
-              />
-              <NavButton
-                active={activeScreen === "MCP"}
-                collapsed={sidebarContentCollapsed}
-                icon={PlugZap}
-                label={t("nav.mcp")}
-                onClick={() => handleNavigate("MCP")}
-              />
-              <NavButton
-                active={activeScreen === "Skills"}
-                collapsed={sidebarContentCollapsed}
-                icon={Sparkles}
-                label={t("nav.skills")}
-                onClick={() => handleNavigate("Skills")}
-              />
+              <button
+                aria-expanded={otherOpen}
+                aria-label={t("nav.other")}
+                className={`group relative flex w-full items-center rounded-xl border py-2 text-left text-[13px] motion-control duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
+                  sidebarContentCollapsed ? "justify-center px-0" : "justify-between px-3"
+                } ${
+                  ["ImageGen", "MCP", "Skills"].includes(activeScreen)
+                    ? "border-stone-300 bg-stone-100 text-stone-950 shadow-sm"
+                    : "border-transparent bg-transparent text-stone-600 hover:bg-stone-100 hover:text-stone-950"
+                }`}
+                onClick={() => setOtherOpen((open) => !open)}
+                title={t("nav.other")}
+                type="button"
+              >
+                <span className="relative z-10 flex min-w-0 items-center gap-2">
+                  <span
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${sidebarContentCollapsed ? "hidden" : ""} ${
+                      ["ImageGen", "MCP", "Skills"].includes(activeScreen)
+                        ? "bg-amber-500"
+                        : "bg-stone-300 group-hover:bg-stone-400"
+                    }`}
+                  />
+                  <Layers3 aria-hidden="true" className="h-4 w-4 shrink-0 text-stone-500" />
+                  <span className={`truncate font-medium ${sidebarContentCollapsed ? "sr-only" : ""}`}>
+                    {t("nav.other")}
+                  </span>
+                </span>
+                <ChevronDown
+                  aria-hidden="true"
+                  className={`h-3.5 w-3.5 motion-control ${sidebarContentCollapsed ? "hidden" : ""} ${
+                    otherOpen ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+              {otherOpen ? (
+                <div className="space-y-1 pl-3">
+                  <NavButton
+                    active={activeScreen === "ImageGen"}
+                    collapsed={sidebarContentCollapsed}
+                    icon={Images}
+                    label={t("nav.imagegen")}
+                    onClick={() => handleNavigate("ImageGen")}
+                  />
+                  <NavButton
+                    active={activeScreen === "MCP"}
+                    collapsed={sidebarContentCollapsed}
+                    icon={PlugZap}
+                    label={t("nav.mcp")}
+                    onClick={() => handleNavigate("MCP")}
+                  />
+                  <NavButton
+                    active={activeScreen === "Skills"}
+                    collapsed={sidebarContentCollapsed}
+                    icon={Sparkles}
+                    label={t("nav.skills")}
+                    onClick={() => handleNavigate("Skills")}
+                  />
+                </div>
+              ) : null}
               <NavButton
                 active={settingsActive}
                 collapsed={sidebarContentCollapsed}

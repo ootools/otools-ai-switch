@@ -113,32 +113,34 @@ export function CodexChannelsScreen({
     storeSegment(next);
   };
 
-  return (
-    <div className="flex h-full min-h-0 flex-1 flex-col gap-3 overflow-hidden">
-      {!hideSegmentTabs && <div
-        aria-label={t("codex.segments")}
-        className="flex shrink-0 flex-wrap items-center gap-1 border-b border-stone-200 px-1 pb-2"
-        role="tablist"
-      >
-        {SEGMENTS.map((item) => (
-          <button
-            aria-selected={segment === item}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] font-semibold motion-control ${
-              segment === item
-                ? "bg-stone-900 text-white"
-                : "text-stone-600 hover:bg-stone-100"
-            }`}
-            key={item}
-            onClick={() => select(item)}
-            role="tab"
-            type="button"
-          >
-            <AgentIcon className="h-3.5 w-3.5" platform={SEGMENT_ICONS[item]} />
-            {t(SEGMENT_LABEL_KEYS[item])}
-          </button>
-        ))}
-      </div>}
+  const tabs = (
+    <div
+      aria-label={t("codex.segments")}
+      className="flex min-w-0 shrink-0 items-center gap-0.5 rounded-xl border border-stone-300/70 bg-white/70 p-1"
+      role="tablist"
+    >
+      {SEGMENTS.map((item) => (
+        <button
+          aria-selected={segment === item}
+          className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-semibold motion-control ${
+            segment === item
+              ? "bg-stone-900 text-white shadow-sm"
+              : "text-stone-600 hover:bg-stone-100"
+          }`}
+          key={item}
+          onClick={() => select(item)}
+          role="tab"
+          type="button"
+        >
+          <AgentIcon className="h-3.5 w-3.5" platform={SEGMENT_ICONS[item]} />
+          {t(SEGMENT_LABEL_KEYS[item])}
+        </button>
+      ))}
+    </div>
+  );
 
+  return (
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
       <AccountsScreen
         key={segment}
         modality={segment}
@@ -151,6 +153,7 @@ export function CodexChannelsScreen({
         poolScopeFocus={segment === "general" ? poolScopeFocus : undefined}
         providerFilterFocus={segment === "general" ? providerFilterFocus : undefined}
         sidebarCollapsed={sidebarCollapsed}
+        toolbarLeading={hideSegmentTabs ? undefined : tabs}
       />
     </div>
   );

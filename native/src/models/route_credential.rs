@@ -426,6 +426,9 @@ pub struct RouteCredential {
     /// Average duration in milliseconds of the most recent 10 successful requests.
     #[sqlx(default)]
     pub avg_recent_duration_ms: Option<f64>,
+    /// Output tokens/s over the most recent 10 successful requests (×1000).
+    #[sqlx(default)]
+    pub recent_tps_milli: Option<f64>,
     // Legacy single-window fields kept for existing DBs/migrations.
     pub quota_remaining: Option<i64>,
     pub quota_limit: Option<i64>,

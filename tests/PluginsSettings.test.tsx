@@ -37,6 +37,7 @@ const pack: PluginSummary = {
   preset_count: 1,
   source: "local",
   warnings: [],
+  has_middleware: false,
 };
 
 const detail: PluginDetail = {

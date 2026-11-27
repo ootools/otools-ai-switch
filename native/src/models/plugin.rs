@@ -38,8 +38,18 @@ pub struct PluginManifest {
 pub struct PluginContributes {
     #[serde(default)]
     pub provider_presets: Vec<ProviderPreset>,
+    #[serde(default)]
+    pub middleware: Option<PluginMiddlewareContribution>,
 }
 
+
+/// A gateway middleware script. Only `middleware.js` is accepted: the runtime
+/// looks for exactly that file and a fixed name rules out path traversal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMiddlewareContribution {
+    pub file: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderPreset {
@@ -75,6 +85,8 @@ pub struct PluginSummary {
     /// Non-fatal problems found while loading the pack (e.g. unknown field).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Whether this pack ships a middleware.js that can join account chains.
+    pub has_middleware: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -150,6 +162,15 @@ impl PluginManifest {
         }
         validate_short(&self.author, 120, "plugin.author_invalid", "作者")?;
         validate_short(&self.license, 64, "plugin.license_invalid", "许可证")?;
+
+        if let Some(middleware) = &self.contributes.middleware {
+            if middleware.file != "middleware.js" {
+                return Err(invalid(
+                    "plugin.middleware_file_invalid",
+                    "中间件文件只能是 middleware.js。".into(),
+                ));
+            }
+        }
 
         if self.contributes.provider_presets.len() > MAX_PRESETS_PER_PACK {
             return Err(invalid(
@@ -235,6 +256,7 @@ impl PluginManifest {
             preset_count: self.contributes.provider_presets.len(),
             source: source.to_string(),
             warnings: Vec::new(),
+            has_middleware: self.contributes.middleware.is_some(),
         }
     }
 

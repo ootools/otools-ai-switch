@@ -328,6 +328,8 @@ export type RouteCredential = {
   last_duration_ms?: number | null;
   /** Average duration in milliseconds of the most recent 10 successful requests. */
   avg_recent_duration_ms?: number | null;
+  /** Output tokens/s over the most recent 10 successful requests, ×1000. */
+  recent_tps_milli?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -1632,6 +1634,38 @@ export type PluginProviderPreset = {
   model_mappings: PluginMapping[];
 };
 
+export type PluginMiddlewareContribution = { file: string };
+
+/** Per-account request/response plugin pipeline. */
+export type PipelineMode = "passthrough" | "process";
+export type PluginInstance = {
+  id: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+};
+export type DirectionConfig = {
+  mode: PipelineMode;
+  chain: PluginInstance[];
+};
+export type PipelineConfig = {
+  version: number;
+  request: DirectionConfig;
+  response: DirectionConfig;
+};
+export type PluginConfigField = { key: string; label: string; kind: string };
+export type BuiltinPluginDescriptor = {
+  id: string;
+  name: string;
+  description: string;
+  lane: "request" | "response" | "both";
+  kind: "transform" | "schedule";
+  config_fields: PluginConfigField[];
+};
+export type ChainValidation = {
+  ok: boolean;
+  errors: Array<{ code: string; message: string }>;
+};
+
 export type PluginManifest = {
   schema_version: number;
   id: string;
@@ -1640,7 +1674,10 @@ export type PluginManifest = {
   description: string;
   author: string;
   license: string;
-  contributes: { provider_presets: PluginProviderPreset[] };
+  contributes: {
+    provider_presets: PluginProviderPreset[];
+    middleware?: PluginMiddlewareContribution | null;
+  };
 };
 
 export type PluginSummary = {
@@ -1654,6 +1691,7 @@ export type PluginSummary = {
   preset_count: number;
   source: string;
   warnings: string[];
+  has_middleware: boolean;
 };
 
 export type PluginDetail = {

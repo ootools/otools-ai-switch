@@ -1,6 +1,7 @@
 pub(crate) mod account_proxy;
 pub(crate) mod anthropic_thinking;
 pub mod batch_service;
+pub mod builtin_plugins;
 pub mod brotli_codec;
 pub mod cc_switch_import_service;
 pub mod claude_trust_service;
@@ -24,6 +25,7 @@ pub mod model_pricing;
 pub mod notification_service;
 pub mod official_agent_identity_service;
 pub mod platform_capability_service;
+pub mod plugin_middleware;
 pub mod plugin_service;
 pub mod proxy_service;
 pub mod remote_probe;

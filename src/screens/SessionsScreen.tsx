@@ -25,6 +25,7 @@ import { useI18n, type Language } from "../lib/i18n";
 import type { SessionMessage, SessionMeta } from "../lib/api/types";
 import { MotionMenu } from "../components/motion/MotionPrimitives";
 import { DismissButton } from "../components/ui/DismissButton";
+import { MarkdownContent } from "../components/common/MarkdownContent";
 
 type SessionsScreenProps = {
   initialPlatform?: string | null;
@@ -135,7 +136,7 @@ export function SessionsScreen({ initialPlatform = null }: SessionsScreenProps) 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
   const [copiedValue, setCopiedValue] = useState<string | null>(null);
-  const [listMode, setListMode] = useState<ListMode>("grouped");
+  const [listMode, setListMode] = useState<ListMode>("flat");
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const [copyMenuOpen, setCopyMenuOpen] = useState(false);
   const [navigationOpen, setNavigationOpen] = useState(false);
@@ -693,9 +694,9 @@ export function SessionsScreen({ initialPlatform = null }: SessionsScreenProps) 
                         </p>
                         <p className="text-[11px] text-stone-400">{formatTime(message.ts, language, t)}</p>
                       </div>
-                      <p className="mt-1 whitespace-pre-wrap break-words text-[13px] leading-5 text-stone-800">
-                        {message.content}
-                      </p>
+                      <div className="mt-1 text-[13px] leading-5 text-stone-800">
+                        <MarkdownContent content={message.content} />
+                      </div>
                     </article>
                   ))}
                 </div>

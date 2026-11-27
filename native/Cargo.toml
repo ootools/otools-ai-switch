@@ -50,6 +50,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
+# Declarative plugin middleware: a small JS runtime embedded in the native
+# core. No filesystem or network host functions are exposed to plugin scripts.
+rquickjs = { version = "0.14", default-features = false, features = ["std", "parallel"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }

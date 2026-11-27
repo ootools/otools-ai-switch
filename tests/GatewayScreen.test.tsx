@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   getRouteProxyStatus,
+  getRouteProxyKey,
   routePoolTestModel,
   startRouteProxy,
   stopRouteProxy,
@@ -17,6 +18,7 @@ import { GatewayScreen } from "../src/screens/GatewayScreen";
 
 vi.mock("../src/lib/api/client", () => ({
   getRouteProxyStatus: vi.fn(),
+  getRouteProxyKey: vi.fn(),
   startRouteProxy: vi.fn(),
   stopRouteProxy: vi.fn(),
   routePoolTestModel: vi.fn(),
@@ -33,7 +35,7 @@ const runningStatus = {
   route_access_enabled: true,
   bind_host: "127.0.0.1",
   port: 43111,
-  base_url: "http://127.0.0.1:43111/v1/",
+  base_url: "http://127.0.0.1:43111/v1",
   https_base_url: "https://127.0.0.1:43111/v1/",
 };
 
@@ -51,6 +53,7 @@ describe("GatewayScreen", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getRouteProxyStatus).mockResolvedValue(runningStatus);
+    vi.mocked(getRouteProxyKey).mockResolvedValue("sk-ai-switch-test");
     vi.mocked(fetchRouteProxyModels).mockResolvedValue([{ id: "gpt-5" }, { id: "gpt-5-mini" }]);
     vi.mocked(subscribeRouteProxyLiveLog).mockResolvedValue([]);
     vi.mocked(unsubscribeRouteProxyLiveLog).mockResolvedValue(undefined);
@@ -62,7 +65,7 @@ describe("GatewayScreen", () => {
 
   it("shows gateway status, endpoints, model list and live log section", async () => {
     renderGateway();
-    expect(await screen.findByText("http://127.0.0.1:43111/v1/")).toBeInTheDocument();
+    expect(await screen.findByText("http://127.0.0.1:43111/v1")).toBeInTheDocument();
     expect(screen.getByText("https://127.0.0.1:43111/v1/")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停止 AI 服务" })).toBeInTheDocument();
     expect(await screen.findByText("gpt-5")).toBeInTheDocument();
@@ -77,9 +80,9 @@ describe("GatewayScreen", () => {
       configurable: true,
       value: { writeText },
     });
-    await userEvent.click(await screen.findByRole("button", { name: "复制端点" }));
-    expect(writeText).toHaveBeenCalledWith("http://127.0.0.1:43111/v1/");
-    expect(await screen.findByRole("button", { name: "已复制" })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "复制 Base URL" }));
+    expect(writeText).toHaveBeenCalledWith("http://127.0.0.1:43111/v1");
+    expect(screen.getByRole("button", { name: "复制 Base URL" })).toBeInTheDocument();
   });
 
   it("starts and stops the gateway through the API", async () => {

@@ -56,6 +56,8 @@ import {
   writeRouteProxyConfigs,
   previewExternalClientImport,
   pluginPackListPresets,
+  pluginPackList,
+  builtinPluginList,
 } from "../src/lib/api/client";
 import { recognizeApiKeysFromImageBlob } from "../src/lib/ocr/apiKeyOcr";
 import type { FetchedRouteModel } from "../src/lib/api/types";
@@ -149,6 +151,8 @@ vi.mock("../src/lib/api/client", () => ({
   writeRouteProxyConfigs: vi.fn(),
   previewExternalClientImport: vi.fn(),
   pluginPackListPresets: vi.fn(),
+  pluginPackList: vi.fn(),
+  builtinPluginList: vi.fn(),
 }));
 
 const transportTestState = vi.hoisted(() => ({
@@ -539,6 +543,176 @@ function dispatchPointerEvent(
 
 describe("AccountsScreen", () => {
 
+  it("shows one unified stats strip with model count, success rate, concurrency and TPS", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([
+      {
+        ...credentialsFixture[1],
+        recent_tps_milli: 45_000,
+        active_request_count: 3,
+        max_concurrency: 5,
+        request_count: 20,
+        success_count: 19,
+        success_rate: 95,
+      },
+    ]);
+    renderScreen();
+
+    const strip = await screen.findByTestId("account-stats-strip-cred-api-1");
+    expect(strip).toHaveTextContent("1个模型");
+    expect(strip).toHaveTextContent(/成功率\s*95%/);
+    expect(strip).toHaveTextContent("3/5并发");
+    expect(strip).toHaveTextContent("45.0tok/s");
+  });
+
+  it("expands success-rate details on hover and hides them again", async () => {
+    renderScreen();
+
+    const trigger = await screen.findByRole("button", { name: "成功率 66.7% 详情" });
+    expect(screen.queryByLabelText("请求统计详情")).not.toBeInTheDocument();
+    await userEvent.hover(trigger);
+    const detail = await screen.findByLabelText("请求统计详情");
+    expect(detail).toHaveTextContent("请求");
+    expect(detail).toHaveTextContent("成功 / 失败");
+    expect(detail).toHaveTextContent("输出速度");
+    await userEvent.unhover(trigger);
+    await waitFor(() =>
+      expect(screen.queryByLabelText("请求统计详情")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("no longer offers the removed model-list, request-stats and latency toggles", async () => {
+    renderScreen();
+    await screen.findByTestId("account-stats-strip-cred-official-1");
+    await userEvent.click(screen.getByRole("button", { name: "打开刷新菜单" }));
+
+    expect(screen.queryByLabelText("显示模型列表")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("显示请求统计")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("显示请求耗时")).not.toBeInTheDocument();
+  });
+
+  it("opens the merged request-processing tab with two flow lanes", async () => {
+    renderScreen();
+    await screen.findByText("Team Account");
+    await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
+
+    await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+    expect(screen.getAllByRole("button", { name: "原样透传" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "AI Switch 处理" })).toHaveLength(2);
+    expect(screen.getAllByText("智能体").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("供应商").length).toBeGreaterThan(0);
+  });
+
+  it("switches a lane to passthrough and persists the pipeline on save", async () => {
+    vi.mocked(builtinPluginList).mockResolvedValue([
+      {
+        id: "builtin.request.compression",
+        name: "请求压缩",
+        description: "压缩请求体",
+        lane: "request",
+        kind: "transform",
+        config_fields: [{ key: "mode", label: "模式", kind: "select" }],
+      },
+    ]);
+    renderScreen();
+    await screen.findByText("Team Account");
+    await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+
+    const passthrough = screen.getAllByRole("button", { name: "原样透传" })[0];
+    await userEvent.click(passthrough);
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
+    const config = JSON.parse(payload?.config_json ?? "{}");
+    expect(config.pipeline.request.mode).toBe("passthrough");
+    expect(config.request_brotli_compression).toBeUndefined();
+  });
+
+  it("adds an enabled plugin from the catalog into the request chain", async () => {
+    vi.mocked(builtinPluginList).mockResolvedValue([
+      {
+        id: "builtin.request.compression",
+        name: "请求压缩",
+        description: "压缩请求体",
+        lane: "request",
+        kind: "transform",
+        config_fields: [{ key: "mode", label: "模式", kind: "select" }],
+      },
+    ]);
+    renderScreen();
+    await screen.findByText("Team Account");
+    await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+
+    const add = await screen.findByLabelText("添加插件 - 请求方向");
+    await userEvent.selectOptions(add, "builtin.request.compression");
+    expect(screen.getAllByText("请求压缩").length).toBeGreaterThan(0);
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
+    const config = JSON.parse(payload?.config_json ?? "{}");
+    expect(config.pipeline.request.chain.some((item: { id: string }) => item.id === "builtin.request.compression")).toBe(true);
+  });
+  it("offers enabled third-party middleware packs in the account flow", async () => {
+    vi.mocked(pluginPackList).mockResolvedValue([
+      {
+        id: "my-pack",
+        version: "1.0.0",
+        name: "My Pack",
+        description: "custom middleware",
+        author: "me",
+        license: "MIT",
+        enabled: true,
+        preset_count: 0,
+        source: "local",
+        warnings: [],
+        has_middleware: true,
+      },
+    ]);
+    renderScreen();
+    await screen.findByText("Team Account");
+    await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+
+    const add = await screen.findByLabelText("添加插件 - 请求方向");
+    expect(within(add).getByRole("option", { name: "My Pack" })).toBeInTheDocument();
+    await userEvent.selectOptions(add, "pack:my-pack");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
+    const config = JSON.parse(payload?.config_json ?? "{}");
+    expect(config.pipeline.request.chain.some((item: { id: string }) => item.id === "pack:my-pack")).toBe(true);
+  });
+  it("enables only domain-matching built-ins by default", async () => {
+    vi.mocked(listRouteCredentials).mockResolvedValue([
+      {
+        ...credentialsFixture[1],
+        config_json: JSON.stringify({
+          base_url: "https://agentrouter.org/v1",
+          interface_format: "openai",
+          model_mappings: [],
+        }),
+      },
+    ]);
+    renderScreen();
+    await screen.findByText("API Account");
+    await userEvent.click(screen.getByRole("button", { name: "编辑 API Account" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
+    const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
+    const config = JSON.parse(payload?.config_json ?? "{}");
+    const enabled = (id: string) =>
+      config.pipeline.response.chain.some((item: { id: string; enabled: boolean }) => item.id === id && item.enabled);
+    expect(enabled("builtin.response.crossResourceStrip")).toBe(true);
+    expect(enabled("builtin.response.plaintextReasoning")).toBe(false);
+    expect(enabled("builtin.response.encryptedContentCleanup")).toBe(false);
+  });
+
+
+
   it("直连首次说明取消时不写入任何客户端", async () => {
     renderScreen();
     await userEvent.click(await screen.findByRole("button", { name: "启用 Team Account 的直连模式" }));
@@ -668,6 +842,8 @@ describe("AccountsScreen", () => {
     vi.mocked(previewExternalClientImport).mockReset();
     vi.mocked(pluginPackListPresets).mockReset();
     vi.mocked(pluginPackListPresets).mockResolvedValue([]);
+    vi.mocked(pluginPackList).mockResolvedValue([]);
+    vi.mocked(builtinPluginList).mockResolvedValue([]);
     // The panel only reads another app's config when its tab is open, so the
     // default is an empty preview rather than a rejection.
     vi.mocked(previewExternalClientImport).mockResolvedValue(externalPreviewFixture([]));
@@ -1044,52 +1220,6 @@ describe("AccountsScreen", () => {
 
 
 
-  it("customizes account card content from the refresh menu and remembers the choices", async () => {
-    renderScreen();
-
-    await screen.findByText("Team Account");
-    await userEvent.click(screen.getByLabelText("打开刷新菜单"));
-    expect(screen.getByRole("group", { name: "显示内容自定义" })).toBeInTheDocument();
-
-    const accountType = screen.getByLabelText("显示账号类型（API/Token）");
-    const modelList = screen.getByLabelText("显示模型列表");
-    const requestStats = screen.getByLabelText("显示请求统计");
-    const relayGroupName = screen.getByLabelText("显示API Key 用户组名");
-    const provider = screen.getByLabelText("显示账号来源");
-    expect(accountType).not.toBeChecked();
-    expect(modelList).toBeChecked();
-    expect(requestStats).toBeChecked();
-    expect(relayGroupName).not.toBeChecked();
-    // 账号来源徽标默认隐藏，需要时才在刷新下拉里打开。
-    expect(provider).not.toBeChecked();
-
-    await userEvent.click(accountType);
-    await userEvent.click(modelList);
-    await userEvent.click(requestStats);
-
-    expect(screen.getByText("Token")).toBeInTheDocument();
-    expect(within(screen.getByLabelText("放置在 API Account 前")).getByText("API")).toBeInTheDocument();
-    expect(screen.queryByText("基线模型")).not.toBeInTheDocument();
-    expect(screen.queryByText("暂无请求")).not.toBeInTheDocument();
-    expect(window.localStorage.getItem(ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY)).toBe(
-      JSON.stringify({
-        showProvider: false,
-        showAccountType: true,
-        showModelList: false,
-        showRequestStats: false,
-        showLatencyStats: false,
-        showResetTime: true,
-        showRelayGroupName: false,
-      }),
-    );
-
-    await userEvent.click(screen.getByLabelText("打开刷新菜单"));
-    expect(screen.queryByRole("menu", { name: "刷新操作" })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText("打开刷新菜单"));
-    expect(screen.getByLabelText("显示账号类型（API/Token）")).toBeChecked();
-    expect(screen.getByLabelText("显示模型列表")).not.toBeChecked();
-    expect(screen.getByLabelText("显示请求统计")).not.toBeChecked();
-  });
 
   it("uses the red status treatment for paused accounts", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
@@ -1304,30 +1434,6 @@ describe("AccountsScreen", () => {
     });
   });
 
-  it("shows account model mapping tags and the complete mapping popover", async () => {
-    const account = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [
-          { from: "gpt-5.6-sol", to: "sol-upstream" },
-          { from: "gpt-5.6-terra", to: "terra-upstream" },
-          { from: "gpt-5.6-luna", to: "luna-upstream" },
-          { from: "gpt-5.5", to: "gpt-5.5-upstream" },
-        ],
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([account]);
-
-    renderScreen();
-
-    expect(await screen.findByText("gpt-5.6-sol")).toBeInTheDocument();
-    expect(screen.getByText("gpt-5.6-terra")).toBeInTheDocument();
-    expect(screen.getByText("gpt-5.6-luna")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "+1" }));
-    expect(screen.getByText("gpt-5.5 → gpt-5.5-upstream")).toBeInTheDocument();
-  });
 
 
 
@@ -1511,114 +1617,9 @@ describe("AccountsScreen", () => {
     expect(card).not.toHaveClass("z-50");
   });
 
-  it("keeps every account detail on a card and folds the row actions into its menu", async () => {
-    renderScreen();
 
-    await screen.findByText("Team Account");
-    await selectAccountLayout("卡片模式");
 
-    const card = screen.getByTestId("account-card-cred-official-1");
-    expect(card).toHaveTextContent("P3-");
-    expect(card).toHaveTextContent("Team Account");
-    expect(within(card).queryByText("官方")).not.toBeInTheDocument();
-    expect(within(card).queryByText("Token")).not.toBeInTheDocument();
-    expect(within(card).getByText("正常")).toBeInTheDocument();
-    expect(card).toHaveTextContent("请求 3");
-    expect(card).toHaveTextContent("成功率 66.7%");
-    // The card is too narrow for the success/failure breakdown the row spells out.
-    expect(within(card).getByText("· 成功 2 · 失败 1")).toHaveClass("hidden");
-    expect(within(card).getByLabelText("选择 Team Account")).toBeInTheDocument();
-    expect(within(card).getByLabelText("拖动 Team Account")).toBeInTheDocument();
 
-    expect(screen.queryByRole("button", { name: "编辑 Team Account" })).not.toBeInTheDocument();
-    await userEvent.click(within(card).getByLabelText("更多操作 Team Account"));
-    expect(
-      within(card).getByRole("menuitem", { name: "编辑 Team Account" }),
-    ).toBeInTheDocument();
-  });
-
-  it("shows the request duration only once 请求耗时 is switched on", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      { ...credentialsFixture[0], last_duration_ms: 2_480, avg_recent_duration_ms: 1_910.4 },
-    ]);
-    renderScreen();
-
-    // 默认不显示：这一块要用右上角下拉里的开关打开。
-    await screen.findByText("Team Account");
-    expect(screen.queryByTestId("account-latency-cred-official-1")).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByLabelText("打开刷新菜单"));
-    await userEvent.click(screen.getByLabelText("显示请求耗时"));
-
-    const tag = await screen.findByTestId("account-latency-cred-official-1");
-    expect(tag).toHaveTextContent("耗时 2.5s");
-    // 鼠标移过看最近 10 次的平均，别的都在 title 里。
-    expect(tag).toHaveAttribute(
-      "title",
-      "最近 10 次成功请求平均 1.9s（最近一次 2.5s）",
-    );
-    expect(window.localStorage.getItem(ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY)).toContain(
-      '"showLatencyStats":true',
-    );
-  });
-
-  it("places reset time after request duration and lets the refresh menu hide it", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      {
-        ...credentialsFixture[0],
-        reset_primary: "2026-09-07T12:00:00Z",
-        last_duration_ms: 384,
-      },
-    ]);
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({
-        showAccountType: false,
-        showModelList: false,
-        showRequestStats: true,
-        showLatencyStats: true,
-      }),
-    );
-    renderScreen();
-
-    const row = await screen.findByLabelText("放置在 Team Account 前");
-    const latency = within(row).getByTestId("account-latency-cred-official-1");
-    const reset = within(row).getByTestId("account-reset-time-cred-official-1");
-    expect(latency.compareDocumentPosition(reset) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-
-    await userEvent.click(screen.getByLabelText("打开刷新菜单"));
-    const toggle = screen.getByLabelText("显示重置时间");
-    expect(toggle).toBeChecked();
-    await userEvent.click(toggle);
-    expect(within(row).queryByTestId("account-reset-time-cred-official-1")).not.toBeInTheDocument();
-  });
-
-  it("keeps reset time after duration in card footer", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      {
-        ...credentialsFixture[0],
-        reset_primary: "2026-09-07T12:00:00Z",
-        last_duration_ms: 384,
-      },
-    ]);
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({
-        showAccountType: false,
-        showModelList: false,
-        showRequestStats: true,
-        showLatencyStats: true,
-        showResetTime: true,
-      }),
-    );
-    renderScreen();
-    await selectAccountLayout("卡片模式");
-
-    const card = await screen.findByTestId("account-card-cred-official-1");
-    const latency = within(card).getByTestId("account-latency-cred-official-1");
-    const reset = within(card).getByTestId("account-reset-time-cred-official-1");
-    expect(latency.compareDocumentPosition(reset) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
 
   it("shows a friendly subscription type and keeps the raw value in hover metadata", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
@@ -1696,30 +1697,6 @@ describe("AccountsScreen", () => {
     expect(screen.queryByText("已更新额度（codex.default_wham_usage）")).not.toBeInTheDocument();
   });
 
-  it("keeps sub-second durations in milliseconds and says when no average exists", async () => {
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({
-        showAccountType: false,
-        showModelList: true,
-        showRequestStats: true,
-        showLatencyStats: true,
-      }),
-    );
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      // Only a failed request so far: it has a duration but no average to report.
-      { ...credentialsFixture[0], last_duration_ms: 384, avg_recent_duration_ms: null },
-    ]);
-    renderScreen();
-
-    const tag = await screen.findByTestId("account-latency-cred-official-1");
-    // "0.4s" would hide the difference between 380ms and 440ms.
-    expect(tag).toHaveTextContent("耗时 384ms");
-    expect(tag).toHaveAttribute(
-      "title",
-      "最近一次请求 384ms；还没有成功的请求可以求平均",
-    );
-  });
 
   it("leaves the duration out of a row that has never been timed", async () => {
     window.localStorage.setItem(
@@ -1738,52 +1715,7 @@ describe("AccountsScreen", () => {
     expect(screen.queryByTestId("account-latency-cred-official-1")).not.toBeInTheDocument();
   });
 
-  it("swaps every stats line for a dot-separated model list when the tag row is off", async () => {
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({ showAccountType: false, showModelList: false, showRequestStats: true }),
-    );
-    renderScreen();
 
-    await screen.findByText("Team Account");
-    const line = await screen.findByTestId("account-stats-line-cred-api-1");
-    const other = screen.getByTestId("account-stats-line-cred-official-1");
-    expect(line).toHaveTextContent("暂无请求");
-    expect(line).toHaveAttribute("title", "点击把所有账号的这一行换成模型列表");
-
-    await userEvent.click(line);
-    expect(line).toHaveTextContent("gpt-5");
-    expect(line).not.toHaveTextContent("暂无请求");
-    expect(line.getAttribute("title")).toContain("gpt-5 →");
-    // 一次点击切换整个列表：另一个账号也跟着换成了模型列表（它没配映射，所以是基线模型）。
-    expect(other).toHaveTextContent("基线模型");
-    expect(other).not.toHaveTextContent("请求 3");
-
-    // 从任意一行点回来，整列一起换回统计。
-    await userEvent.click(other);
-    expect(line).toHaveTextContent("暂无请求");
-    expect(other).toHaveTextContent("请求 3");
-  });
-
-  it("keeps the stats line looking like text rather than a control", async () => {
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({ showAccountType: false, showModelList: false, showRequestStats: true }),
-    );
-    renderScreen();
-
-    // styles.css lifts every button 1px on hover and scales it on press. On a line of
-    // running text that reads as a card, so both are cancelled on this one.
-    const line = await screen.findByTestId("account-stats-line-cred-api-1");
-    expect(line.className).toContain("hover:translate-y-0");
-    expect(line.className).toContain("active:translate-y-0");
-    expect(line.className).toContain("active:scale-100");
-    // The rest of that chrome — a radius plus a shadow, which together drew a ghost
-    // border around the sentence — cannot be cancelled by a utility class, because
-    // the .accounts-screen rules outweigh one. This attribute is how styles.css is
-    // told to skip the line.
-    expect(line).toHaveAttribute("data-plain-text");
-  });
 
   it("keeps the quick-edit numbers free of the button chrome too", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
@@ -1804,32 +1736,6 @@ describe("AccountsScreen", () => {
     expect(counter.className).toContain("rounded-full");
   });
 
-  it("keeps the duration next to the stats instead of at the row's right edge", async () => {
-    window.localStorage.setItem(
-      ACCOUNT_DISPLAY_PREFERENCES_STORAGE_KEY,
-      JSON.stringify({
-        showAccountType: false,
-        showModelList: false,
-        showRequestStats: true,
-        showLatencyStats: true,
-      }),
-    );
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      { ...credentialsFixture[0], last_duration_ms: 110_900, avg_recent_duration_ms: 98_100 },
-    ]);
-    renderScreen();
-
-    // 统计行占满整行时会把耗时顶到最右边，离它说明的数字十几厘米远。给它一个
-    // 跟名称同宽的下限，短行的耗时就落在名称那些标签的同一列；长行照旧顺着排，
-    // 不会被截断。
-    const line = await screen.findByTestId("account-stats-line-cred-official-1");
-    expect(line.className).not.toContain("flex-1");
-    expect(line.className).toContain("min-[600px]:min-w-64");
-    // margin-left:auto would eat the free space the width floor just created.
-    const latencySlot = screen.getByTestId("account-latency-cred-official-1").parentElement;
-    expect(latencySlot?.className).toContain("shrink-0");
-    expect(latencySlot?.className).not.toContain("ml-auto");
-  });
 
   it("leaves the stats line inert while the model tag row is shown", async () => {
     renderScreen();
@@ -1842,96 +1748,8 @@ describe("AccountsScreen", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("gives the model list its own line in both layouts", async () => {
-    renderScreen();
 
-    await screen.findByText("Team Account");
-    const row = await screen.findByLabelText("放置在 Team Account 前");
-    const listRow = within(row).getByTestId("account-model-list-cred-official-1");
-    expect(listRow).toContainElement(within(row).getByText("基线模型"));
-    expect(listRow).not.toContainElement(within(row).getByText("正常"));
 
-    await selectAccountLayout("卡片模式");
-
-    const card = screen.getByTestId("account-card-cred-official-1");
-    const cardRow = within(card).getByTestId("account-model-list-cred-official-1");
-    expect(cardRow).toContainElement(within(card).getByText("基线模型"));
-    expect(cardRow).not.toContainElement(within(card).getByText("正常"));
-  });
-
-  it("sends the card's live counters to the footer and keeps a row's in the badges", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      {
-        ...credentialsFixture[0],
-        active_request_count: 1,
-        cooldown_until: new Date(Date.now() + 45_000).toISOString(),
-        max_concurrency: 2,
-      },
-    ]);
-    renderScreen();
-
-    await screen.findByText("Team Account");
-    await selectAccountLayout("卡片模式");
-
-    const card = screen.getByTestId("account-card-cred-official-1");
-    const footer = within(card).getByTestId("account-card-footer-cred-official-1");
-    // 右下角：footer 是卡片最后一块（mt-auto 贴底），计数器又是 footer 的末尾。
-    expect(card.lastElementChild).toBe(footer);
-    expect(footer.firstElementChild).toContainElement(within(card).getByText(/请求 3/));
-    expect(footer.lastElementChild).toContainElement(
-      within(card).getByTestId("credential-activity-cred-official-1"),
-    );
-    expect(footer.lastElementChild).toContainElement(
-      within(card).getByTestId("credential-cooldown-cred-official-1"),
-    );
-    expect(within(card).getByTestId("account-model-list-cred-official-1")).not.toContainElement(
-      within(card).getByTestId("credential-cooldown-cred-official-1"),
-    );
-
-    // 列表模式：两个计数器都留在徽章行，并发排在最后（余额之后），冷却紧跟状态标签。
-    await selectAccountLayout("列表模式");
-    const row = await screen.findByLabelText("放置在 Team Account 前");
-    expect(screen.queryByTestId("account-card-footer-cred-official-1")).not.toBeInTheDocument();
-    const rowBadges = within(row).getByText("正常").closest("div");
-    const activity = within(row).getByTestId("credential-activity-cred-official-1");
-    expect(rowBadges).toContainElement(activity);
-    expect(rowBadges).toContainElement(
-      within(row).getByTestId("credential-cooldown-cred-official-1"),
-    );
-    expect(rowBadges?.lastElementChild).toBe(activity);
-  });
-
-  it("keeps the card footer for a live counter when request stats are hidden", async () => {
-    window.localStorage.setItem(
-      "ai-switch.account-display-preferences",
-      JSON.stringify({ showAccountType: false, showModelList: true, showRequestStats: false }),
-    );
-    vi.mocked(listRouteCredentials).mockResolvedValue([
-      {
-        ...credentialsFixture[0],
-        active_request_count: 1,
-        max_concurrency: 2,
-      },
-    ]);
-    renderScreen();
-
-    await screen.findByText("Team Account");
-    await selectAccountLayout("卡片模式");
-
-    const card = screen.getByTestId("account-card-cred-official-1");
-    expect(card).not.toHaveTextContent("请求 3");
-    expect(
-      within(card).getByTestId("account-card-footer-cred-official-1"),
-    ).toContainElement(within(card).getByTestId("credential-activity-cred-official-1"));
-
-    // 列表模式不需要这个兜底：并发本来就在徽章行，跟请求统计的开关无关。
-    await selectAccountLayout("列表模式");
-    const row = await screen.findByLabelText("放置在 Team Account 前");
-    expect(row).not.toHaveTextContent("请求 3");
-    expect(within(row).getByText("正常").closest("div")).toContainElement(
-      within(row).getByTestId("credential-activity-cred-official-1"),
-    );
-  });
 
   it("reorders accounts when a card is dropped on the right half of its neighbour", async () => {
     renderScreen();
@@ -2272,7 +2090,7 @@ describe("AccountsScreen", () => {
 
   it("renders dynamic groups and supports creation, editing, and moving accounts", async () => {
     poolStateByPlatform.set("codex", ["cred-official-1"]);
-    renderScreen();
+    renderScreen("codex", "in_pool");
 
     expect(screen.getByTitle(/^默认组/)).toBeInTheDocument();
     expect(screen.getByTitle(/^未入池/)).toBeInTheDocument();
@@ -2355,10 +2173,8 @@ describe("AccountsScreen", () => {
       expect(lastCall?.account_ids).toContain("cred-official-1");
     });
   });
-
   it("switches between dynamic groups with scoped actions", async () => {
     renderScreen("codex", "in_pool");
-
     await waitFor(() =>
       expect(screen.getByTitle(/^默认组/)).toHaveAttribute("aria-pressed", "true"),
     );
@@ -2625,86 +2441,8 @@ describe("AccountsScreen", () => {
     );
   });
 
-  it("removes content rejection compatibility from config when edited off", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      platform: "codex" as const,
-      display_name: "Compat Edit",
-      config_json: JSON.stringify({
-        base_url: "https://api.upstream.test/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        content_rejection_compat: "trim_old_tool_outputs",
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
 
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Compat Edit" }));
-    await openFormTab("高级");
-    const toggle = screen.getByLabelText("内容过滤兼容");
-    expect(toggle).toBeChecked();
-    await userEvent.click(toggle);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.content_rejection_compat).toBeUndefined();
-  });
-
-  it("writes image limit compatibility when edited on", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      platform: "codex" as const,
-      display_name: "Image Limit Off",
-      config_json: JSON.stringify({
-        base_url: "https://api.upstream.test/v1",
-        interface_format: "openai",
-        model_mappings: [],
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Image Limit Off" }));
-    await openFormTab("高级");
-    await userEvent.click(screen.getByLabelText("图片超限兼容"));
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.image_limit_compat).toBe("trim_old_images");
-  });
-
-  it("removes image limit compatibility from config when edited off", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      platform: "codex" as const,
-      display_name: "Image Limit Edit",
-      config_json: JSON.stringify({
-        base_url: "https://api.upstream.test/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        image_limit_compat: "trim_old_images",
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Image Limit Edit" }));
-    await openFormTab("高级");
-    const toggle = screen.getByLabelText("图片超限兼容");
-    expect(toggle).toBeChecked();
-    await userEvent.click(toggle);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.image_limit_compat).toBeUndefined();
-  });
 
   it("points at the image limit compatibility switch when the upstream caps images", async () => {
     const cappedResponse = JSON.stringify({
@@ -4805,39 +4543,7 @@ describe("AccountsScreen", () => {
     );
   });
 
-  it("明文推理兼容自动匹配账号网站且手动关闭优先", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],config_json:JSON.stringify({base_url:"https://anyrouter.top/v1",interface_format:"openai-responses",model_mappings:[],unrelated:"keep"}),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button",{name:"编辑 API Account"}));
-    await openFormTab("高级");
-    expect(screen.getByLabelText("Responses 明文推理兼容")).toHaveValue("auto");
-    expect(screen.getByText("自动：已开启，命中 anyrouter.top")).toBeInTheDocument();
-    expect(screen.getByLabelText("Responses 推理兼容清理")).not.toBeChecked();
-    await userEvent.selectOptions(screen.getByLabelText("Responses 明文推理兼容"),"off");
-    await userEvent.click(screen.getByRole("button",{name:"保存修改"}));
-    await waitFor(()=>expect(updateRouteCredential).toHaveBeenCalled());
-    const config=JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.responses_plaintext_reasoning_compat).toBe("off");
-    expect(config.responses_encrypted_content_cleanup).toBe(false);
-    expect(config.unrelated).toBe("keep");
-  });
 
-  it("明文推理兼容保留已有关闭配置并可恢复自动", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],config_json:JSON.stringify({base_url:"https://anyrouter.top/v1",interface_format:"openai-responses",model_mappings:[],responses_plaintext_reasoning_compat:"off"}),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button",{name:"编辑 API Account"}));
-    await openFormTab("高级");
-    expect(screen.getByLabelText("Responses 明文推理兼容")).toHaveValue("off");
-    await userEvent.selectOptions(screen.getByLabelText("Responses 明文推理兼容"),"auto");
-    await userEvent.click(screen.getByRole("button",{name:"保存修改"}));
-    await waitFor(()=>expect(updateRouteCredential).toHaveBeenCalled());
-    const config=JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.responses_plaintext_reasoning_compat).toBeUndefined();
-  });
 
   it("明文推理兼容可为其他网站强制开启，创建后重置且 Chat 不展示", async () => {
     renderScreen();
@@ -4864,22 +4570,6 @@ describe("AccountsScreen", () => {
     expect(screen.queryByLabelText("Responses 明文推理兼容")).not.toBeInTheDocument();
   });
 
-  it("跨资源状态剥离自动匹配 agentrouter 备用域名且手动关闭优先", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],config_json:JSON.stringify({base_url:"https://ps.air-outer.com/v1",interface_format:"openai-responses",model_mappings:[],unrelated:"keep"}),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button",{name:"编辑 API Account"}));
-    await openFormTab("高级");
-    expect(screen.getByLabelText("跨资源状态剥离")).toHaveValue("auto");
-    expect(screen.getByText(/自动：已开启，命中 ps\.air-outer\.com/)).toBeInTheDocument();
-    await userEvent.selectOptions(screen.getByLabelText("跨资源状态剥离"),"off");
-    await userEvent.click(screen.getByRole("button",{name:"保存修改"}));
-    await waitFor(()=>expect(updateRouteCredential).toHaveBeenCalled());
-    const config=JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.responses_cross_resource_strip).toBe("off");
-    expect(config.unrelated).toBe("keep");
-  });
 
   it("跨资源状态剥离可为其他网站强制开启，创建后重置且 Chat 不展示", async () => {
     renderScreen();
@@ -4928,66 +4618,8 @@ describe("AccountsScreen", () => {
     expect(screen.getByRole("combobox", { name: /Brotli/ })).toHaveValue("auto");
   });
 
-  it("loads and disables Brotli request compression even for a whitelisted account", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://ps.air-outer.com/v1", interface_format: "openai-responses",
-        model_mappings: [], request_brotli_compression: "on", unrelated: "keep",
-      }),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    const compression = screen.getByRole("combobox", { name: /Brotli/ });
-    expect(compression).toHaveValue("on");
-    await userEvent.selectOptions(compression, "off");
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.request_brotli_compression).toBe("off");
-    expect(config.unrelated).toBe("keep");
-  });
 
-  it("restores automatic Brotli request compression by clearing the explicit override", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://ps.air-outer.com/v1", interface_format: "anthropic",
-        model_mappings: [], request_brotli_compression: "off", unrelated: "keep",
-      }),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    const compression = screen.getByRole("combobox", { name: /Brotli/ });
-    expect(compression).toHaveValue("off");
-    await userEvent.selectOptions(compression, "auto");
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.request_brotli_compression).toBeUndefined();
-    expect(config.unrelated).toBe("keep");
-  });
 
-  it("keeps legacy API accounts on automatic Brotli request compression", async () => {
-    vi.mocked(listRouteCredentials).mockResolvedValue([{
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://ps.air-outer.com/v1", interface_format: "openai",
-        model_mappings: [], unrelated: "keep",
-      }),
-    }]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    expect(screen.getByRole("combobox", { name: /Brotli/ })).toHaveValue("auto");
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.request_brotli_compression).toBeUndefined();
-    expect(config.unrelated).toBe("keep");
-  });
 
   it("creates API account with Responses encrypted content cleanup enabled and resets it", async () => {
     renderScreen();
@@ -5060,72 +4692,8 @@ describe("AccountsScreen", () => {
     expect(screen.getByLabelText("激进剥离推理密文")).not.toBeChecked();
   });
 
-  it("drops the aggressive reasoning strip when the cleanup switch is turned off", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1", interface_format: "openai-responses",
-        model_mappings: [], responses_encrypted_content_cleanup: true,
-        responses_encrypted_content_aggressive_strip: true,
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    expect(screen.getByLabelText("激进剥离推理密文")).toBeChecked();
 
-    await userEvent.click(screen.getByLabelText("Responses 推理兼容清理"));
-    expect(screen.queryByLabelText("激进剥离推理密文")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.responses_encrypted_content_cleanup).toBe(false);
-    expect(config.responses_encrypted_content_aggressive_strip).toBe(false);
-  });
-
-  it("loads and disables Responses encrypted content cleanup independently of other settings", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1", interface_format: "openai-responses",
-        model_mappings: [], responses_encrypted_content_cleanup: true,
-        responses_custom_tool_compat: true, unrelated: "keep",
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    const checkbox = screen.getByLabelText("Responses 推理兼容清理");
-    expect(checkbox).toBeChecked();
-    await userEvent.click(checkbox);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.responses_encrypted_content_cleanup).toBe(false);
-    expect(config.responses_custom_tool_compat).toBe(true);
-    expect(config.unrelated).toBe("keep");
-  });
-
-  it("keeps Responses encrypted content cleanup off for existing accounts and hides it for Chat", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1", interface_format: "openai-responses", model_mappings: [],
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    expect(screen.getByLabelText("Responses 推理兼容清理")).not.toBeChecked();
-    await openFormTab("基础");
-    await userEvent.selectOptions(screen.getByLabelText("接口格式"), "openai");
-    await openFormTab("高级");
-    expect(screen.queryByLabelText("Responses 推理兼容清理")).not.toBeInTheDocument();
-  });
 
   it("creates API account with responses custom tool compat enabled when checked", async () => {
     renderScreen();
@@ -5194,120 +4762,9 @@ describe("AccountsScreen", () => {
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.kept.test/v1");
   });
 
-  it("loads and saves responses custom tool compat from API account config", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai-responses",
-        model_mappings: [],
-        responses_custom_tool_compat: true,
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue({
-      ...api,
-      display_name: "API Account Updated",
-    });
 
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    const checkbox = await screen.findByLabelText("兼容 custom 工具（Responses 中转）");
-    expect(checkbox).toBeChecked();
-    await userEvent.click(checkbox);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    const config = JSON.parse(payload.config_json);
-    expect(config.responses_custom_tool_compat).toBe(false);
-  });
 
-  it("turns the per-turn reminder on with a custom text and writes both keys", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-
-    // The text field only exists once the box is ticked.
-    expect(screen.queryByLabelText("纠偏提醒内容")).not.toBeInTheDocument();
-    await userEvent.click(await screen.findByLabelText("每轮追加纠偏提醒"));
-    await userEvent.type(screen.getByLabelText("纠偏提醒内容"), "Answer in Japanese.");
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.turn_reminder).toBe(true);
-    expect(config.turn_reminder_text).toBe("Answer in Japanese.");
-  });
-
-  it("hydrates the per-turn reminder and clears both keys when switched off", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        turn_reminder: true,
-        turn_reminder_text: "请用简体中文回复。",
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-
-    const checkbox = await screen.findByLabelText("每轮追加纠偏提醒");
-    expect(checkbox).toBeChecked();
-    expect(screen.getByLabelText("纠偏提醒内容")).toHaveValue("请用简体中文回复。");
-
-    await userEvent.click(checkbox);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    // Removed, not written as false: an account that opted out carries no trace.
-    expect(config).not.toHaveProperty("turn_reminder");
-    expect(config).not.toHaveProperty("turn_reminder_text");
-  });
-
-  it("leaves the reminder out of an empty-text save so the default applies", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
-    await userEvent.click(await screen.findByLabelText("每轮追加纠偏提醒"));
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const config = JSON.parse(vi.mocked(updateRouteCredential).mock.calls[0][1].config_json);
-    expect(config.turn_reminder).toBe(true);
-    // No text key at all — the proxy falls back to its own default.
-    expect(config).not.toHaveProperty("turn_reminder_text");
-  });
 
   it("hydrates and saves User-Agent when editing an API account", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
@@ -5610,276 +5067,16 @@ describe("AccountsScreen", () => {
     expect(JSON.parse(updateInput.preview_json).auth_json.api_key).toBe("sk-edit");
   });
 
-  it("shows default failure policy values and explains handled failures", async () => {
-    renderScreen();
 
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
 
-    expect(screen.getByLabelText("额外重试次数")).toHaveValue(2);
-    expect(screen.getByLabelText("重试间隔（毫秒）")).toHaveValue(200);
-    expect(screen.getByLabelText("异常触发次数")).toHaveValue(10);
-    expect(screen.getByLabelText("失败冷却（秒）")).toHaveValue(10);
-    expect(screen.getByText(/网络连接失败、请求超时、响应读取失败/)).toBeInTheDocument();
-    expect(screen.getByText(/相同且连续达到设定次数后/)).toBeInTheDocument();
-    expect(screen.getByText(/HTTP 401 \/ 403/)).toBeInTheDocument();
-  });
 
-  it("hydrates custom failure policy and preserves other account config when saving", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [{ from: "gpt-5", to: "existing-upstream" }],
-        headers: { "User-Agent": "ExistingBot/1.0" },
-        custom_option: "keep-me",
-        failure_policy: {
-          retry_count: 4,
-          retry_interval_ms: 750,
-          semantic_error_threshold: 18,
-        },
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
 
-    renderScreen();
 
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("故障处理");
-    expect(screen.getByLabelText("额外重试次数")).toHaveValue(4);
-    expect(screen.getByLabelText("重试间隔（毫秒）")).toHaveValue(750);
-    expect(screen.getByLabelText("异常触发次数")).toHaveValue(18);
 
-    fireEvent.change(screen.getByLabelText("额外重试次数"), { target: { value: "6" } });
-    fireEvent.change(screen.getByLabelText("重试间隔（毫秒）"), { target: { value: "900" } });
-    fireEvent.change(screen.getByLabelText("异常触发次数"), { target: { value: "25" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    expect(JSON.parse(payload.config_json)).toMatchObject({
-      base_url: "https://api.example.com/v1",
-      interface_format: "openai",
-      model_mappings: [{ from: "gpt-5", to: "existing-upstream" }],
-      headers: { "User-Agent": "ExistingBot/1.0" },
-      custom_option: "keep-me",
-      failure_policy: {
-        retry_count: 6,
-        retry_interval_ms: 900,
-        semantic_error_threshold: 25,
-      },
-    });
-  });
 
-  it("rejects an invalid retry count before saving the account", async () => {
-    renderScreen();
 
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    fireEvent.change(screen.getByLabelText("额外重试次数"), { target: { value: "11" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
-    expect(
-      await screen.findAllByText("额外重试次数必须是 0-10 的整数"),
-    ).toHaveLength(2);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
-
-  it("offers per-error-class retry budgets and a one-click 100-retry capacity preset", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-
-    expect(screen.getByLabelText("重试总时长上限（秒）")).toHaveValue(0);
-    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(0);
-    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(null);
-    expect(screen.getByLabelText("网络连接 / 超时的额外重试次数")).toHaveValue(null);
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "一键设为容量类重试100次、间隔500毫秒" }),
-    );
-    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(100);
-    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(500);
-
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
-      retry_class_limits: {
-        transport: null,
-        server_error: null,
-        rate_limit: null,
-        capacity: 100,
-        semantic: null,
-      },
-      capacity_retry_interval_ms: 500,
-      max_retry_elapsed_seconds: 0,
-    });
-  });
-
-  it("hydrates stored per-class retry limits without inventing values for the others", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        failure_policy: {
-          retry_count: 2,
-          retry_class_limits: { capacity: 100, rate_limit: 0 },
-          capacity_retry_interval_ms: 3000,
-          max_retry_elapsed_seconds: 900,
-        },
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("故障处理");
-
-    expect(screen.getByLabelText("容量不足 / 高负载的额外重试次数")).toHaveValue(100);
-    expect(screen.getByLabelText("限流 429的额外重试次数")).toHaveValue(0);
-    expect(screen.getByLabelText("网络连接 / 超时的额外重试次数")).toHaveValue(null);
-    expect(screen.getByLabelText("容量类重试间隔（毫秒）")).toHaveValue(3000);
-    expect(screen.getByLabelText("重试总时长上限（秒）")).toHaveValue(900);
-  });
-
-  it("rejects a per-class retry limit above the safe ceiling", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    fireEvent.change(screen.getByLabelText("容量不足 / 高负载的额外重试次数"), {
-      target: { value: "1001" },
-    });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    expect(
-      await screen.findAllByText(
-        /「容量不足 \/ 高负载」的额外重试次数必须是 0-1000 的整数/,
-      ),
-    ).not.toHaveLength(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
-
-  it("validates the capacity retry interval and the total elapsed ceiling", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    fireEvent.change(screen.getByLabelText("容量类重试间隔（毫秒）"), {
-      target: { value: "60001" },
-    });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    expect(
-      await screen.findAllByText("容量类重试间隔必须是 0-60000 毫秒的整数"),
-    ).not.toHaveLength(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-
-    fireEvent.change(screen.getByLabelText("容量类重试间隔（毫秒）"), {
-      target: { value: "5000" },
-    });
-    fireEvent.change(screen.getByLabelText("重试总时长上限（秒）"), {
-      target: { value: "86401" },
-    });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    expect(
-      await screen.findAllByText("重试总时长上限必须是 0-86400 秒的整数"),
-    ).not.toHaveLength(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
-
-  it("defaults the stream prelude window to 60s and writes a tuned value on save", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    expect(screen.getByLabelText("建流等待窗口（毫秒）")).toHaveValue(60_000);
-
-    fireEvent.change(screen.getByLabelText("建流等待窗口（毫秒）"), {
-      target: { value: "120000" },
-    });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
-      stream_prelude_wait_ms: 120_000,
-    });
-  });
-
-  it("hydrates a stored stream prelude window and rejects an oversized one", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        failure_policy: { retry_count: 2, stream_prelude_wait_ms: 0 },
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-    vi.mocked(updateRouteCredential).mockResolvedValue(api);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("故障处理");
-    expect(screen.getByLabelText("建流等待窗口（毫秒）")).toHaveValue(0);
-
-    fireEvent.change(screen.getByLabelText("建流等待窗口（毫秒）"), {
-      target: { value: "600001" },
-    });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-    expect(
-      await screen.findAllByText("建流等待窗口必须是 0-600000 毫秒的整数"),
-    ).not.toHaveLength(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
-
-  it("keeps in-stream salvage off by default and writes the opt-in on save", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    const toggle = screen.getByLabelText("流内失败时自动救回") as HTMLInputElement;
-    expect(toggle.checked).toBe(false);
-
-    await userEvent.click(toggle);
-    expect(toggle.checked).toBe(true);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    expect(JSON.parse(payload.config_json).failure_policy).toMatchObject({
-      stream_salvage_enabled: true,
-    });
-  });
-
-  it("hydrates a stored in-stream salvage opt-in", async () => {
-    const api = {
-      ...credentialsFixture[1],
-      config_json: JSON.stringify({
-        base_url: "https://api.example.com/v1",
-        interface_format: "openai",
-        model_mappings: [],
-        failure_policy: { retry_count: 2, stream_salvage_enabled: true },
-      }),
-    };
-    vi.mocked(listRouteCredentials).mockResolvedValue([api]);
-
-    renderScreen();
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("故障处理");
-    expect((screen.getByLabelText("流内失败时自动救回") as HTMLInputElement).checked).toBe(true);
-  });
 
   it("recognizes an API key from a clipboard image while editing an API credential", async () => {
     const imageBlob = new Blob(["fake"], { type: "image/png" });
@@ -5922,7 +5119,7 @@ describe("AccountsScreen", () => {
         route_priority: 3,
         max_concurrency: 1,
         secret_payload_json: "{\n  \"access_token\": \"at\",\n  \"refresh_token\": \"rt\"\n}",
-        config_json: expect.stringContaining('"failure_policy"'),
+        config_json: expect.stringContaining('"pipeline"'),
         preview_json: "{\n  \"auth_json\": {}\n}",
       }),
     );
@@ -6611,120 +5808,11 @@ describe("AccountsScreen", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("saves per-account scheduled recovery settings", async () => {
-    renderScreen();
 
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    await userEvent.selectOptions(screen.getByLabelText("自动恢复模式"), "scheduled");
-    fireEvent.change(screen.getByLabelText("恢复时间 1"), { target: { value: "03:30" } });
-    await userEvent.click(screen.getByLabelText("添加恢复时间"));
-    fireEvent.change(screen.getByLabelText("恢复时间 2"), { target: { value: "15:45" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
-    await waitFor(() =>
-      expect(setRouteCredentialRecovery).toHaveBeenCalledWith("cred-official-1", {
-        mode: "scheduled",
-        times: ["03:30", "15:45"],
-        probe_interval_minutes: null,
-      }),
-    );
-  });
 
-  it("saves the failure cooldown and error status toggles into the failure policy", async () => {
-    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
-    renderScreen();
 
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
 
-    const cooldownToggle = screen.getByLabelText("启用失败冷却");
-    const errorStatusToggle = screen.getByLabelText("启用异常状态标记");
-    expect(cooldownToggle).not.toBeChecked();
-    expect(errorStatusToggle).toBeChecked();
-
-    await userEvent.click(cooldownToggle);
-    await userEvent.click(errorStatusToggle);
-    fireEvent.change(screen.getByLabelText("失败冷却（秒）"), { target: { value: "25" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    const config = JSON.parse(payload.config_json);
-    expect(config.failure_policy.cooldown_enabled).toBe(true);
-    expect(config.failure_policy.cooldown_seconds).toBe(25);
-    expect(config.failure_policy.error_status_enabled).toBe(false);
-  });
-
-  it("rejects a failure cooldown outside the supported range", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    fireEvent.change(screen.getByLabelText("失败冷却（秒）"), { target: { value: "0" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    expect(
-      (await screen.findAllByText("失败冷却需在 1 到 86400 秒之间。")).length,
-    ).toBeGreaterThan(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
-
-  it("saves the stream continuation and failover switches into the failure policy", async () => {
-    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-
-    const continueToggle = screen.getByLabelText("断流后自动续写");
-    const failoverToggle = screen.getByLabelText("失败后切换到池内其它账号");
-    expect(continueToggle).not.toBeChecked();
-    expect(failoverToggle).toBeChecked();
-    expect(screen.getByLabelText("最多续写轮次")).toHaveValue(10);
-
-    await userEvent.click(continueToggle);
-    fireEvent.change(screen.getByLabelText("最多续写轮次"), { target: { value: "3" } });
-    await userEvent.click(failoverToggle);
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    const config = JSON.parse(payload.config_json);
-    expect(config.failure_policy.stream_continue_enabled).toBe(true);
-    expect(config.failure_policy.stream_continue_max).toBe(3);
-    expect(config.failure_policy.failover_enabled).toBe(false);
-  });
-
-  it("leaves continuation off for an account without the new keys", async () => {
-    vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
-    const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
-    const config = JSON.parse(payload.config_json);
-    expect(config.failure_policy.stream_continue_enabled).toBe(false);
-    expect(config.failure_policy.stream_continue_max).toBe(10);
-    expect(config.failure_policy.failover_enabled).toBe(true);
-  });
-
-  it("rejects a continuation budget above the per-account ceiling", async () => {
-    renderScreen();
-
-    await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("故障处理");
-    fireEvent.change(screen.getByLabelText("最多续写轮次"), { target: { value: "11" } });
-    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
-
-    expect(
-      (await screen.findAllByText("最多续写轮次必须是 0-10 的整数")).length,
-    ).toBeGreaterThan(0);
-    expect(updateRouteCredential).not.toHaveBeenCalled();
-  });
 
   it("shows the transient failure count as its own status tag until a request succeeds", async () => {
     vi.mocked(listRouteCredentials).mockResolvedValue([
@@ -7128,79 +6216,10 @@ describe("AccountsScreen", () => {
     expect(detail).not.toHaveTextContent("upstream-glm");
   });
 
-  it("在编辑抽屉里列出全部已知模型并可暂停", async () => {
-    vi.mocked(setRouteCredentialModelStatus).mockResolvedValue(credentialsWithModelStates()[1]);
-    renderPoolWithModelStates();
-    await userEvent.click(await screen.findByLabelText("编辑 API Account"));
-    await openFormTab("故障处理");
 
-    const section = await screen.findByLabelText("模型状态");
-    // Healthy models are listed too, so a model can be paused before it fails.
-    expect(section).toHaveTextContent("upstream-glm");
 
-    await userEvent.click(screen.getByLabelText("暂停模型 upstream-glm"));
-    expect(setRouteCredentialModelStatus).toHaveBeenCalledWith(
-      "cred-api-1",
-      "upstream-glm",
-      "paused",
-    );
-  });
 
-  it("可恢复已暂停的模型", async () => {
-    vi.mocked(setRouteCredentialModelStatus).mockResolvedValue(credentialsWithModelStates()[1]);
-    renderPoolWithModelStates();
-    await userEvent.click(await screen.findByLabelText("编辑 API Account"));
-    await openFormTab("故障处理");
 
-    await userEvent.click(await screen.findByLabelText("恢复模型 upstream-held"));
-    expect(setRouteCredentialModelStatus).toHaveBeenCalledWith(
-      "cred-api-1",
-      "upstream-held",
-      "ok",
-    );
-  });
-
-  it("暂停模型不会丢弃抽屉里未保存的修改", async () => {
-    // The mutation hands back a fresh account row so the model list can update.
-    // Re-hydrating the whole form from it would silently throw away whatever the
-    // user has typed but not saved.
-    vi.mocked(setRouteCredentialModelStatus).mockResolvedValue(credentialsWithModelStates()[1]);
-    renderPoolWithModelStates();
-    await userEvent.click(await screen.findByLabelText("编辑 API Account"));
-
-    await userEvent.clear(screen.getByLabelText("编辑账号名称"));
-    await userEvent.type(screen.getByLabelText("编辑账号名称"), "Renamed But Unsaved");
-
-    await openFormTab("故障处理");
-    await userEvent.click(await screen.findByLabelText("暂停模型 upstream-glm"));
-    await waitFor(() => expect(setRouteCredentialModelStatus).toHaveBeenCalled());
-
-    await openFormTab("基础");
-    expect(screen.getByLabelText("编辑账号名称")).toHaveValue("Renamed But Unsaved");
-  });
-
-  it("可解除单个模型的冷却", async () => {
-    vi.mocked(clearRouteCredentialModelState).mockResolvedValue(credentialsWithModelStates()[1]);
-    renderPoolWithModelStates();
-    await userEvent.click(await screen.findByLabelText("编辑 API Account"));
-    await openFormTab("故障处理");
-
-    await userEvent.click(await screen.findByLabelText("解除模型 upstream-sol"));
-    expect(clearRouteCredentialModelState).toHaveBeenCalledWith("cred-api-1", "upstream-sol");
-  });
-
-  it("一次解除全部非暂停模型", async () => {
-    vi.mocked(clearRouteCredentialModelState).mockResolvedValue(credentialsWithModelStates()[1]);
-    renderPoolWithModelStates();
-    await userEvent.click(await screen.findByLabelText("编辑 API Account"));
-    await openFormTab("故障处理");
-
-    await userEvent.click(await screen.findByLabelText("解除全部模型冷却"));
-    // Only the cooling model: a paused one is the user's own decision, and a
-    // healthy model has no state to clear.
-    expect(clearRouteCredentialModelState).toHaveBeenCalledTimes(1);
-    expect(clearRouteCredentialModelState).toHaveBeenCalledWith("cred-api-1", "upstream-sol");
-  });
 
   it("已失效账号不显示模型徽章", async () => {
     renderPoolWithModelStates(

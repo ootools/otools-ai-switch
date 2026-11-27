@@ -119,6 +119,25 @@ describe("AppLayout", () => {
     expect(navigate).toHaveBeenCalledWith("Traffic");
   });
 
+  it("expands the Other group to reveal image, MCP and skills entries", async () => {
+    render(
+      <I18nProvider initialLanguage="zh-CN">
+        <AppLayout activeScreen="Stats" onNavigate={vi.fn()} onToggleSidebar={vi.fn()} sidebarCollapsed={false}>
+          <div>content</div>
+        </AppLayout>
+      </I18nProvider>,
+    );
+
+    expect(screen.queryByRole("button", { name: /MCP/ })).not.toBeInTheDocument();
+    const other = screen.getByRole("button", { name: "其它" });
+    expect(other).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(other);
+    expect(other).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /MCP/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /技能/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "生图" })).toBeInTheDocument();
+  });
+
   it("renders system utility nav entries and navigates to their screens", async () => {
     const onNavigate = vi.fn();
 
@@ -139,6 +158,7 @@ describe("AppLayout", () => {
     await userEvent.click(screen.getByRole("button", { name: /智能体/ }));
     await userEvent.click(screen.getByRole("button", { name: /网关/ }));
     await userEvent.click(screen.getByRole("button", { name: "统计" }));
+    await userEvent.click(screen.getByRole("button", { name: "其它" }));
     await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
     await userEvent.click(screen.getByRole("button", { name: /技能/ }));
     expect(screen.queryByRole("button", { name: /客户端接入/ })).not.toBeInTheDocument();
@@ -153,7 +173,7 @@ describe("AppLayout", () => {
     expect(onNavigate).toHaveBeenCalledWith("About");
   });
 
-  it("places visualization directly above usage and highlights usage on its own", () => {
+  it("places visualization directly above usage and highlights usage on its own", async () => {
     const onNavigate = vi.fn();
 
     render(
@@ -167,6 +187,7 @@ describe("AppLayout", () => {
 
     const visualization = screen.getByRole("button", { name: "可视化" });
     const stats = screen.getByRole("button", { name: "统计" });
+    await userEvent.click(screen.getByRole("button", { name: "其它" }));
     const mcp = screen.getByRole("button", { name: /MCP/ });
     expect(visualization.compareDocumentPosition(stats) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(stats.compareDocumentPosition(mcp) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -227,7 +248,7 @@ describe("AppLayout", () => {
     expect(screen.getByRole("button", { name: /设置/ })).not.toHaveAttribute("aria-current");
   });
 
-  it("only highlights the active system utility entry", () => {
+  it("only highlights the active system utility entry", async () => {
     render(
       <I18nProvider initialLanguage="zh-CN">
         <AppLayout
@@ -241,6 +262,7 @@ describe("AppLayout", () => {
       </I18nProvider>,
     );
 
+    await userEvent.click(screen.getByRole("button", { name: "其它" }));
     expect(screen.getByRole("button", { name: /MCP/ })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("button", { name: /设置/ })).not.toHaveAttribute("aria-current");
   });
@@ -332,6 +354,7 @@ describe("AppLayout", () => {
     expect(sidebar).not.toHaveClass("app-sidebar-drawer");
 
     await userEvent.click(screen.getByRole("button", { name: "展开侧栏" }));
+    await userEvent.click(screen.getByRole("button", { name: "其它" }));
     await userEvent.click(screen.getByRole("button", { name: /MCP/ }));
     expect(onNavigate).toHaveBeenCalledWith("MCP");
     expect(sidebar).not.toHaveClass("app-sidebar-drawer");

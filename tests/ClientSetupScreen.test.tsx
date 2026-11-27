@@ -247,7 +247,7 @@ describe("ClientSetupScreen", () => {
     const client = await screen.findByRole("checkbox", { name: "写入 ZCode" });
     const scrollRegion = screen.getByTestId("client-setup-scroll-region");
     const actions = screen.getByRole("group", { name: "配置写入操作" });
-    const write = within(actions).getByRole("button", { name: "写入" });
+    const write = within(actions).getByRole("button", { name: "一键写入" });
     expect(scrollRegion).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
     expect(scrollRegion).toContainElement(client);
     expect(scrollRegion).not.toContainElement(actions);
@@ -314,7 +314,7 @@ describe("ClientSetupScreen", () => {
     await waitFor(() => expect(toggle).toBeChecked());
     expect(saveSettings).toHaveBeenCalledWith({ ...settingsFixture, codex_keep_login_state: true });
 
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
     await waitFor(() => expect(writeRouteProxyConfigs).toHaveBeenCalled());
     await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(2));
     expect(vi.mocked(saveSettings).mock.calls[1][0].codex_keep_login_state).toBe(true);
@@ -385,15 +385,15 @@ describe("ClientSetupScreen", () => {
     const checksBeforeSave = vi.mocked(routeConfigWriteIsStale).mock.calls.length;
     await user.click(toggle);
     await waitFor(() => expect(toggle).toBeDisabled());
-    expect(screen.getByRole("button", { name: "写入" })).toBeDisabled();
-    fireEvent.submit(screen.getByRole("button", { name: "写入" }).closest("form")!);
+    expect(screen.getByRole("button", { name: "一键写入" })).toBeDisabled();
+    fireEvent.submit(screen.getByRole("button", { name: "一键写入" }).closest("form")!);
     expect(writeRouteProxyConfigs).not.toHaveBeenCalled();
 
     resolveSave({ ...settingsFixture, codex_keep_login_state: true });
     await waitFor(() => expect(toggle).toBeEnabled());
     expect(toggle).toBeChecked();
     await waitFor(() => expect(vi.mocked(routeConfigWriteIsStale).mock.calls.length).toBeGreaterThan(checksBeforeSave));
-    expect(screen.getByRole("button", { name: "写入" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "一键写入" })).toBeEnabled();
   });
 
   it("keeps the stored login option when saving fails and shows an actionable error", async () => {
@@ -416,7 +416,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     const toggle = await screen.findByRole("checkbox", { name: "保持 Codex 登录态" });
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
     await waitFor(() => expect(toggle).toBeDisabled());
     resolveWrite([]);
     await waitFor(() => expect(toggle).toBeEnabled());
@@ -438,7 +438,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     await waitFor(() =>
       expect(writeRouteProxyConfigs).toHaveBeenCalledWith(
@@ -455,7 +455,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     expect(await screen.findByText("配置写入结果")).toBeInTheDocument();
     expect(screen.getByText(/ZCode · codex/)).toBeInTheDocument();
@@ -467,7 +467,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
     expect(await screen.findByRole("button", { name: /回滚此次写入/ })).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /回滚此次写入/ }));
@@ -530,8 +530,9 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 DeepSeek Harness" }));
+    await user.click(screen.getByText("高级：DeepSeek Harness 配置路径"));
     await user.type(screen.getByLabelText("DSH 配置文件路径"), "D:\\Portable\\settings.yaml");
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     await waitFor(() =>
       expect(writeRouteProxyConfigs).toHaveBeenCalledWith(
@@ -555,7 +556,7 @@ describe("ClientSetupScreen", () => {
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
     await user.click(screen.getByRole("checkbox", { name: "写入 Codex CLI" }));
     await user.click(screen.getByRole("checkbox", { name: "写入 ZCode" }));
-    expect(screen.getByRole("button", { name: "写入" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键写入" })).toBeDisabled();
     expect(writeRouteProxyConfigs).not.toHaveBeenCalled();
   });
 
@@ -584,7 +585,7 @@ describe("ClientSetupScreen", () => {
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
     expect(screen.getByRole("alert")).toHaveTextContent("该接入方式暂不支持此功能。");
-    expect(screen.getByRole("button", { name: "写入" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键写入" })).toBeDisabled();
     await user.click(screen.getByRole("checkbox", { name: "写入 Codex CLI" }));
     expect(screen.getByRole("checkbox", { name: "写入 Codex CLI" })).toBeDisabled();
   });
@@ -597,9 +598,9 @@ describe("ClientSetupScreen", () => {
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
     // Codex reads the base URL as-is and appends /responses, so the endpoint the
     // user copies has to carry /v1 exactly like the written config does.
-    const manual = screen.getByText("手动配置参数（内置支持之外的 Agent）").closest("details");
+    const manual = screen.getByText("手动接入参数").closest("details");
     expect(manual).not.toHaveAttribute("open");
-    await user.click(screen.getByText("手动配置参数（内置支持之外的 Agent）"));
+    await user.click(screen.getByText("手动接入参数"));
     expect(manual).toHaveAttribute("open");
 
     expect(screen.getByLabelText("Base URL")).toHaveValue("http://127.0.0.1:43111/v1");
@@ -615,10 +616,10 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
-    await user.click(screen.getByText("手动配置参数（内置支持之外的 Agent）"));
+    await user.click(screen.getByText("手动接入参数"));
 
-    expect(screen.getByText(/主接入 Key（Codex \/ Chat 协议族）/)).toBeInTheDocument();
-    expect(screen.getByText(/Anthropic Messages 客户端使用另一把 Key/)).toBeInTheDocument();
+    expect(screen.getByText(/主 Key 覆盖 Codex \/ Chat 协议族/)).toBeInTheDocument();
+    expect(screen.getByText(/内置支持之外的 Agent 可手动填写这些参数/)).toBeInTheDocument();
     const key = screen.getByLabelText("API Key");
     expect(key).toHaveAttribute("type", "password");
     await user.click(screen.getByLabelText("显示 API Key"));
@@ -633,8 +634,8 @@ describe("ClientSetupScreen", () => {
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
     expect(screen.queryByRole("tab")).not.toBeInTheDocument();
-    expect(screen.getByText("智能体接入目标")).toBeInTheDocument();
-    expect(screen.getByText(/账号池始终只有同一个/)).toBeInTheDocument();
+    expect(screen.getByText("接入目标")).toBeInTheDocument();
+    expect(screen.getByText(/选择目标，一键把当前算力池写入它们的配置/)).toBeInTheDocument();
     // Both halves of the old, wrong copy must be gone with the tabs.
     expect(screen.queryByText(/每个平台的算力池/)).not.toBeInTheDocument();
     expect(screen.queryByText(/切换平台后要各自复制/)).not.toBeInTheDocument();
@@ -646,7 +647,7 @@ describe("ClientSetupScreen", () => {
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
     expect(screen.getByRole("checkbox", { name: "写入 Claude Code" })).toBeInTheDocument();
-    await user.click(screen.getByText("手动配置参数（内置支持之外的 Agent）"));
+    await user.click(screen.getByText("手动接入参数"));
     expect(screen.getByLabelText("Base URL")).toHaveValue("http://127.0.0.1:43111/v1");
   });
 
@@ -656,7 +657,7 @@ describe("ClientSetupScreen", () => {
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
     await user.click(screen.getByRole("checkbox", { name: "写入 Claude Code" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     await waitFor(() => expect(writeRouteProxyConfigs).toHaveBeenCalledTimes(2));
     expect(writeRouteProxyConfigs).toHaveBeenCalledWith("http://127.0.0.1:43111", "codex", [
@@ -874,7 +875,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
-    await user.click(screen.getByText("手动配置参数（内置支持之外的 Agent）"));
+    await user.click(screen.getByText("手动接入参数"));
 
     expect(screen.getByLabelText("Base URL")).toHaveValue("http://127.0.0.1:19527/v1");
     expect(screen.getByLabelText("HTTPS Base URL")).toHaveValue("https://127.0.0.1:19528/v1");
@@ -919,7 +920,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await screen.findByRole("checkbox", { name: "写入 Codex CLI" });
-    await user.click(screen.getByText("手动配置参数（内置支持之外的 Agent）"));
+    await user.click(screen.getByText("手动接入参数"));
 
     // codex 的 Base URL 已经带 /v1，所以图片端点接在它后面
     expect(screen.getByLabelText("图片端点")).toHaveValue(
@@ -939,7 +940,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
     expect(await screen.findByText("配置写入结果")).toBeInTheDocument();
 
     await user.click(screen.getByLabelText("关闭配置写入结果"));
@@ -965,7 +966,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     expect(await screen.findByText("配置写入结果")).toBeInTheDocument();
     // `zcode_codex` is an internal key and means nothing to the user.
@@ -1008,7 +1009,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("没有写入成功");
@@ -1028,7 +1029,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     // The stakes are specific here: a bad parse makes ZCode fall back and lose
     // every provider, so the message has to say we did not touch the file.
@@ -1061,7 +1062,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     // Codex CLI 是原生默认勾选，直接写入即可。
-    await user.click(await screen.findByRole("button", { name: "写入" }));
+    await user.click(await screen.findByRole("button", { name: "一键写入" }));
 
     expect(
       await screen.findByText(/当前 Codex 只有 API Key 登录、没有 ChatGPT 登录态/),
@@ -1073,7 +1074,7 @@ describe("ClientSetupScreen", () => {
     setup();
 
     await user.click(await screen.findByRole("checkbox", { name: "写入 ZCode" }));
-    await user.click(screen.getByRole("button", { name: "写入" }));
+    await user.click(screen.getByRole("button", { name: "一键写入" }));
 
     await waitFor(() =>
       expect(vi.mocked(saveSettings)).toHaveBeenCalledWith(

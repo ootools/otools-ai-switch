@@ -1196,7 +1196,7 @@ async fn forward_request_in_generation(
     } else {
         (limit_mib as usize).saturating_mul(1024 * 1024)
     };
-    let body_bytes = axum::body::to_bytes(body, limit_bytes)
+    let mut body_bytes = axum::body::to_bytes(body, limit_bytes)
         .await
         .map_err(|err| {
             if std::error::Error::source(&err)
@@ -1586,8 +1586,19 @@ async fn forward_request_in_generation(
                     continue;
                 }
             };
+        let pipeline = crate::models::pipeline::resolve_pipeline(&credential.config_json);
+        let effective_config =
+            crate::services::builtin_plugins::effective_config(&pipeline, &credential.config_json);
+        let effective_config_json = effective_config.to_string();
         let failure_policy =
-            RouteCredentialFailurePolicy::from_config_json(&credential.config_json);
+            crate::services::builtin_plugins::failure_policy_from_pipeline(&pipeline, &credential.config_json);
+        body_bytes = axum::body::Bytes::from(crate::services::builtin_plugins::apply_pack_chain(
+            &pipeline,
+            &body_bytes,
+            true,
+            &platform,
+            &path,
+        ));
         let client =
             match state.outbound_client_for_config(&default_client, &credential.config_json) {
                 Ok(client) => client,
@@ -1635,7 +1646,7 @@ async fn forward_request_in_generation(
         // the switch is per account, and computed from `body_bytes` rather than
         // replacing it, so the client's own request still appears untrimmed in the
         // logs and in every other candidate's attempt.
-        let proactive_image_trim = if image_limit_trim_enabled(&credential.config_json) {
+        let proactive_image_trim = if image_limit_trim_enabled(&effective_config_json) {
             request_image_limit::trim_old_images(&body_bytes)
         } else {
             None
@@ -1752,7 +1763,7 @@ async fn forward_request_in_generation(
         if chat_bridge
             && (reasoning_forced
                 || force_reasoning_content_enabled(
-                    &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+                    &parse_json_object(&effective_config_json, "config").unwrap_or(Value::Null),
                 ))
         {
             if let Some(forced) = force_reasoning_content_on_chat_body(&outbound_body) {
@@ -1767,7 +1778,7 @@ async fn forward_request_in_generation(
             &target_url,
             &mut request_headers,
             &outbound_body,
-            &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+            &parse_json_object(&effective_config_json, "config").unwrap_or(Value::Null),
         )
         .unwrap_or(outbound_body);
         let mut active_attempt = activity_request_id.as_deref().and_then(|request_id| {
@@ -2565,6 +2576,13 @@ async fn forward_request_in_generation(
             );
             response_bytes = axum::body::Bytes::from(restored.into_bytes());
         }
+        response_bytes = axum::body::Bytes::from(crate::services::builtin_plugins::apply_pack_chain(
+            &pipeline,
+            &response_bytes,
+            false,
+            &platform,
+            &path,
+        ));
         // Capture official subscription/quota signals (e.g. Grok free-usage-exhausted).
         let quota_exhausted = if credential.kind == "official" {
             if let Ok(body_text) = std::str::from_utf8(&response_bytes) {
@@ -4970,9 +4988,12 @@ impl StreamPump {
             // 续写开关与预算属于断流的那个账号：它决定「要不要续写、最多续几轮」。
             // 换号只决定这一轮续写请求打给谁——被换到的账号的策略不参与本轮决策，
             // 否则两个账号的策略会互相引用，绕不出来。
-            let policy =
-                RouteCredentialFailurePolicy::from_config_json(&completion.credential.config_json);
-            // 普通断流续写沿用原来的开关与轮次；流内救回是「容量类重试」在
+            let pipeline =
+                crate::models::pipeline::resolve_pipeline(&completion.credential.config_json);
+            let policy = crate::services::builtin_plugins::failure_policy_from_pipeline(
+                &pipeline,
+                &completion.credential.config_json,
+            );
             // 已输出内容之后的延续，因此借同一个按类别预算和专用间隔。
             let (allowed, max_rounds) = match salvage {
                 Some(class) => (policy.stream_salvage_enabled, policy.retry_limit_for(class)),
@@ -5082,12 +5103,15 @@ impl StreamPump {
                 _ => HashSet::new(),
             };
             // 与原请求同一条编码路径，别让压缩设置上的差异暴露出来。
+            let resume_pipeline = crate::models::pipeline::resolve_pipeline(&credential.config_json);
+            let resume_effective =
+                crate::services::builtin_plugins::effective_config(&resume_pipeline, &credential.config_json);
             let mut request_headers = built.headers;
             let outbound_body = request_compression::encode_request_body(
                 &built.target_url,
                 &mut request_headers,
                 &built.body,
-                &parse_json_object(&credential.config_json, "config").unwrap_or(Value::Null),
+                &resume_effective,
             )
             .unwrap_or(built.body);
             let active_attempt = self.guard.completion.as_ref().and_then(|completion| {
@@ -24126,3 +24150,4 @@ data: [DONE]\n\n";
         );
     }
 }
+

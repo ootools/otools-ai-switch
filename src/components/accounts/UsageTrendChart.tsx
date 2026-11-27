@@ -110,6 +110,8 @@ export type UsageTrendChartProps = {
   undatedRequestCount: number;
   /** True while a newly selected period is still loading. */
   stale?: boolean;
+  /** Optional visible-title override; aria labels keep the unit-based text. */
+  title?: string;
 };
 
 /**
@@ -182,6 +184,7 @@ export function UsageTrendChart({
   dimensionLabel,
   undatedRequestCount,
   stale,
+  title,
 }: UsageTrendChartProps) {
   const [width, attach] = useMeasuredWidth();
   const [active, setActive] = useState<number | null>(null);
@@ -198,7 +201,7 @@ export function UsageTrendChart({
   if (buckets.length === 0 || axisMax === 0) {
     return (
       <div className="rounded-xl border border-stone-200 bg-white p-3">
-        <p className="text-[12px] font-semibold text-stone-800">{unitTitles[unit]}</p>
+        <p className="text-[12px] font-semibold text-stone-800">{title ?? unitTitles[unit]}</p>
         <p className="mt-2 text-[12px] text-stone-500">当前筛选范围内没有数据。</p>
         {undatedRequestCount > 0 ? <UndatedNote count={undatedRequestCount} /> : null}
       </div>
@@ -245,12 +248,12 @@ export function UsageTrendChart({
       }`}
     >
       <div className="flex flex-wrap items-baseline gap-x-2">
-        <p className="text-[12px] font-semibold text-stone-800">{unitTitles[unit]}</p>
+        <p className="text-[12px] font-semibold text-stone-800">{title ?? unitTitles[unit]}</p>
         <p className="text-[11px] text-stone-400">输入+输出 Token，按{dimensionLabel}堆叠</p>
       </div>
       <div className="relative mt-1" ref={attach}>
         <svg
-          aria-label={`${unitTitles[unit]}，按${dimensionLabel}堆叠`}
+          aria-label={`${title ?? unitTitles[unit]}，按${dimensionLabel}堆叠`}
           height={padTop + plotHeight + axisHeight}
           role="group"
           width={width}

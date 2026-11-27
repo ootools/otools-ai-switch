@@ -5,6 +5,7 @@ pub mod disk_space;
 pub mod external_client_import;
 pub mod import_job;
 pub mod notification;
+pub mod pipeline;
 pub mod platform;
 pub mod plugin;
 pub mod provider;
