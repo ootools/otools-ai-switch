@@ -1,0 +1,163 @@
+[
+  {
+    "id": "regional-throughput",
+    "name": "区域吞吐暂时不足",
+    "enabled": true,
+    "groups": [
+      [
+        {
+          "field": "code_or_type",
+          "op": "equals_any",
+          "value": "rate_limit_exceeded\ntokens_per_minute_limit\ntoo_many_requests"
+        },
+        {
+          "field": "message",
+          "op": "contains_any",
+          "value": "exceeded token rate limit\ntoken rate limit exceeded\nexceeded the token rate limit\nexceeded tokens per minute limit"
+        }
+      ]
+    ],
+    "exclude": [
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "your current quota"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "insufficient_quota"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "plan and billing"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "check your plan"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "billing details"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "quota exhausted"
+      },
+      {
+        "field": "message",
+        "op": "contains",
+        "value": "额度"
+      }
+    ],
+    "action": "retry",
+    "class": "capacity"
+  },
+  {
+    "id": "capacity",
+    "name": "上游容量不足",
+    "enabled": true,
+    "groups": [
+      [
+        {
+          "field": "code",
+          "op": "equals_any",
+          "value": "no_capacity\ncapacity_exceeded\ninsufficient_capacity\noverloaded\noverloaded_error\nserver_overloaded\nmodel_overloaded\nhigh_demand"
+        }
+      ],
+      [
+        {
+          "field": "message",
+          "op": "contains_any",
+          "value": "high demand\npeak load\nprovisioned throughput\nno capacity\ninsufficient capacity\nout of capacity\ncurrently overloaded\nservers are overloaded\nmodel is overloaded\nat capacity"
+        }
+      ]
+    ],
+    "exclude": [],
+    "action": "retry",
+    "class": "capacity"
+  },
+  {
+    "id": "rate-limit",
+    "name": "请求限流",
+    "enabled": true,
+    "groups": [
+      [
+        {
+          "field": "code",
+          "op": "equals_any",
+          "value": "rate_limit_exceeded\nrate_limit_error\ntoo_many_requests\nrequests_per_minute_limit\ntokens_per_minute_limit"
+        }
+      ],
+      [
+        {
+          "field": "type",
+          "op": "equals_any",
+          "value": "rate_limit_exceeded\nrate_limit_error\ntoo_many_requests\nrequests_per_minute_limit\ntokens_per_minute_limit"
+        }
+      ],
+      [
+        {
+          "field": "message",
+          "op": "contains_any",
+          "value": "rate limit\ntoo many requests\nrequests per minute\ntokens per minute\nplease slow down"
+        }
+      ],
+      [
+        {
+          "field": "status",
+          "op": "equals",
+          "value": "429"
+        }
+      ]
+    ],
+    "exclude": [],
+    "action": "retry",
+    "class": "rate_limit"
+  },
+  {
+    "id": "server",
+    "name": "上游超时或服务器错误",
+    "enabled": true,
+    "groups": [
+      [
+        {
+          "field": "status",
+          "op": "equals",
+          "value": "408"
+        }
+      ],
+      [
+        {
+          "field": "status",
+          "op": "range",
+          "value": "500-599"
+        }
+      ]
+    ],
+    "exclude": [],
+    "action": "retry",
+    "class": "server_error"
+  },
+  {
+    "id": "transport",
+    "name": "连接或读取失败",
+    "enabled": true,
+    "groups": [
+      [
+        {
+          "field": "transport",
+          "op": "equals",
+          "value": "true"
+        }
+      ]
+    ],
+    "exclude": [],
+    "action": "retry",
+    "class": "transport"
+  }
+]

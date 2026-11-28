@@ -1634,7 +1634,7 @@ export type PluginProviderPreset = {
   model_mappings: PluginMapping[];
 };
 
-export type PluginMiddlewareContribution = { file: string };
+export type PluginMiddlewareContribution = { file: string; descriptor?: BuiltinPluginDescriptor };
 
 /** Per-account request/response plugin pipeline. */
 export type PipelineMode = "passthrough" | "process";
@@ -1649,17 +1649,30 @@ export type DirectionConfig = {
 };
 export type PipelineConfig = {
   version: number;
+  catalog_revision?: number;
   request: DirectionConfig;
   response: DirectionConfig;
+  recovery?: DirectionConfig;
 };
-export type PluginConfigField = { key: string; label: string; kind: string };
+export type PluginConfigField = { key: string; label: string; kind: string; default?: unknown; help?: string; min?: number; max?: number };
 export type BuiltinPluginDescriptor = {
   id: string;
   name: string;
   description: string;
-  lane: "request" | "response" | "both";
+  lane: "request" | "response" | "recovery" | "both";
   kind: "transform" | "schedule";
   config_fields: PluginConfigField[];
+  stage?: string;
+  defaults?: Record<string, unknown>;
+  legacy_rules?: unknown[];
+  limitations?: string;
+  api_version?: number;
+  hooks?: string[];
+  stages?: string[];
+  capabilities?: string[];
+  policy_domain?: string;
+  rule_editor?: "" | "retry" | "stream" | "health";
+  class_limits_editor?: boolean;
 };
 export type ChainValidation = {
   ok: boolean;
@@ -1692,6 +1705,7 @@ export type PluginSummary = {
   source: string;
   warnings: string[];
   has_middleware: boolean;
+  middleware_descriptor?: BuiltinPluginDescriptor | null;
 };
 
 export type PluginDetail = {

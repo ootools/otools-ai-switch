@@ -142,19 +142,8 @@ async fn start_chunked_heal_upstream(
 }
 
 async fn wait_for_force_flag(pool: &SqlitePool, id: &str) -> bool {
-    for _ in 0..100 {
-        let cred = RouteCredentialRepository::get(pool, id).await.unwrap();
-        let enabled = serde_json::from_str::<Value>(&cred.config_json)
-            .ok()
-            .and_then(|v| v.get("force_reasoning_content").cloned())
-            .and_then(|v| v.as_bool())
-            == Some(true);
-        if enabled {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
+    let cred = RouteCredentialRepository::get(pool, id).await.unwrap();
+    serde_json::from_str::<Value>(&cred.config_json).ok().and_then(|v|v.get("force_reasoning_content").cloned()).and_then(|v|v.as_bool()) == Some(true)
 }
 
 fn sse(content_type: &str, body: &str) -> (StatusCode, HeaderMap, String) {
@@ -280,8 +269,8 @@ async fn claude_to_chat_missing_reasoning_buffered_self_heal() {
     drop(recorded);
 
     assert!(
-        wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
-        "account self-heal flag must be persisted"
+        !wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
+        "compatibility recovery must not persist an implicit plugin enable"
     );
 }
 
@@ -382,8 +371,8 @@ async fn chat_passthrough_prime_missing_reasoning_self_heal() {
     drop(recorded);
 
     assert!(
-        wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
-        "account self-heal flag must be persisted"
+        !wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
+        "compatibility recovery must not persist an implicit plugin enable"
     );
 }
 
@@ -492,8 +481,8 @@ async fn chat_passthrough_role_prelude_then_missing_reasoning_self_heal() {
     drop(recorded);
 
     assert!(
-        wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
-        "account self-heal flag must be persisted"
+        !wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
+        "compatibility recovery must not persist an implicit plugin enable"
     );
 }
 
@@ -594,7 +583,7 @@ async fn responses_to_chat_prime_missing_reasoning_self_heal() {
     drop(recorded);
 
     assert!(
-        wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
-        "account self-heal flag must be persisted"
+        !wait_for_force_flag(&fixture.pool, &fixture.credential_id).await,
+        "compatibility recovery must not persist an implicit plugin enable"
     );
 }

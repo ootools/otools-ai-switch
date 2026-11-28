@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "id": "example-account-health",
+  "version": "1.0.0",
+  "name": "账号故障处理（外部示例）",
+  "description": "与内置账号故障插件使用相同脚本和宿主接口的可安装示例。",
+  "author": "AI Switch",
+  "license": "MIT",
+  "contributes": {
+    "middleware": {
+      "file": "middleware.js",
+      "descriptor": {
+        "id": "example-account-health",
+        "name": "账号故障处理（外部示例）",
+        "description": "同一账号反复返回错误、后续请求仍不断选中它时，记录故障并按设置冷却或标记异常，减少重复撞到故障账号。",
+        "lane": "recovery",
+        "kind": "schedule",
+        "stage": "policy",
+        "defaults": {
+          "cooldown_enabled": false,
+          "cooldown_seconds": 10,
+          "semantic_error_threshold": 10,
+          "error_status_enabled": true,
+          "rules": [
+            {
+              "id": "failures",
+              "name": "匹配所有已分类失败",
+              "enabled": true,
+              "groups": [
+                [
+                  {
+                    "field": "message",
+                    "op": "present",
+                    "value": "true"
+                  }
+                ]
+              ],
+              "exclude": [],
+              "action": "record",
+              "class": "semantic"
+            }
+          ]
+        },
+        "config_fields": [
+          {
+            "key": "cooldown_enabled",
+            "label": "启用短暂冷却",
+            "kind": "bool",
+            "default": false
+          },
+          {
+            "key": "cooldown_seconds",
+            "label": "冷却秒数",
+            "kind": "number",
+            "default": 10,
+            "min": 0,
+            "max": 86400
+          },
+          {
+            "key": "semantic_error_threshold",
+            "label": "连续失败阈值",
+            "kind": "number",
+            "default": 10,
+            "min": 0,
+            "max": 1000
+          },
+          {
+            "key": "error_status_enabled",
+            "label": "标记账号异常",
+            "kind": "bool",
+            "default": true
+          }
+        ],
+        "limitations": "常见场景：账号持续报错、短时间内反复失败，或上游明确报告额度耗尽、权限不足。\n启用后：按下方匹配规则及开关处理账号/模型状态；短暂冷却期间暂时避开故障对象，满足条件时标记异常。它不负责补全当前回答，重发和续接分别使用“失败重试”“流式恢复”。\n阈值含义：相同语义错误的连续计数，不是总请求失败数；容量不足属于上游繁忙，不惩罚账号。明确额度/权限错误可直接标记，凭据撤销由认证机制处理。",
+        "api_version": 1,
+        "policy_domain": "health",
+        "rule_editor": "health",
+        "class_limits_editor": false,
+        "hooks": [
+          "policy",
+          "onFailure"
+        ],
+        "capabilities": [
+          "policy.configure",
+          "diagnostics.log",
+          "account.read",
+          "account.write"
+        ]
+      }
+    }
+  }
+}

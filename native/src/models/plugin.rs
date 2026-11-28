@@ -49,6 +49,8 @@ pub struct PluginContributes {
 #[serde(deny_unknown_fields)]
 pub struct PluginMiddlewareContribution {
     pub file: String,
+    #[serde(default)]
+    pub descriptor: Option<crate::services::builtin_plugins::BuiltinPluginDescriptor>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +89,7 @@ pub struct PluginSummary {
     pub warnings: Vec<String>,
     /// Whether this pack ships a middleware.js that can join account chains.
     pub has_middleware: bool,
+    pub middleware_descriptor: Option<crate::services::builtin_plugins::BuiltinPluginDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -164,6 +167,9 @@ impl PluginManifest {
         validate_short(&self.license, 64, "plugin.license_invalid", "许可证")?;
 
         if let Some(middleware) = &self.contributes.middleware {
+            if let Some(d)=&middleware.descriptor {
+                crate::services::plugin_contract::validate_descriptor(d).map_err(|message|invalid("plugin.middleware_descriptor",message))?;
+            }
             if middleware.file != "middleware.js" {
                 return Err(invalid(
                     "plugin.middleware_file_invalid",
@@ -244,6 +250,17 @@ impl PluginManifest {
         Ok(())
     }
 
+    pub fn middleware_descriptor(&self) -> Option<crate::services::builtin_plugins::BuiltinPluginDescriptor> {
+        let contribution=self.contributes.middleware.as_ref()?;
+        let mut descriptor=contribution.descriptor.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({
+            "id":"", "name":self.name,"description":self.description,"lane":"both","kind":"transform","stage":"perAttempt",
+            "stages":["perAttempt","response"],"hooks":["onRequest","onResponse","policy"],"capabilities":["request.transform","response.transform","policy.configure","codec.brotli","network.image","diagnostics.log"]
+        })).expect("legacy middleware descriptor"));
+        descriptor.id=format!("pack:{}",self.id);
+        descriptor.name=self.name.clone();
+        Some(descriptor)
+    }
+
     pub fn summary(&self, enabled: bool, source: &str) -> PluginSummary {
         PluginSummary {
             id: self.id.clone(),
@@ -257,6 +274,7 @@ impl PluginManifest {
             source: source.to_string(),
             warnings: Vec::new(),
             has_middleware: self.contributes.middleware.is_some(),
+            middleware_descriptor: self.middleware_descriptor(),
         }
     }
 

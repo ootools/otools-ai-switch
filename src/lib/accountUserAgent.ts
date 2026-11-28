@@ -38,6 +38,12 @@ function headersFromConfig(config: Record<string, unknown>): Record<string, unkn
 }
 
 export function readUserAgentFromConfig(config: Record<string, unknown>): string {
+  const pipeline=config.pipeline as {catalog_revision?:number;request?:{mode:string;chain:{id:string;enabled:boolean;config:Record<string,unknown>}[]}} | undefined;
+  if ((pipeline?.catalog_revision ?? 0) >= 1) {
+    if (pipeline?.request?.mode === "passthrough") return "";
+    const plugin=pipeline?.request?.chain.find(p=>p.id === "builtin.request.requestHeaders" && p.enabled);
+    return typeof plugin?.config.user_agent === "string" ? plugin.config.user_agent.trim() : "";
+  }
   const headers = headersFromConfig(config);
   for (const [name, value] of Object.entries(headers)) {
     if (name.toLowerCase() === "user-agent" && typeof value === "string") {

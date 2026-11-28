@@ -59,3 +59,12 @@ function onRequest(body, ctx) {
 }
 
 function onResponse(body, ctx) { return onRequest(body, ctx); }
+
+function onFailure(event,ctx) {
+  if(event.phase!=="request_recovery")return null;
+  var code=(event.code||"").toLowerCase().replace(/[_ :\-]/g,"");
+  var text=(event.message||"").toLowerCase().replace(/[_`]/g," ");
+  if(code!=="invalidencryptedcontent" && !(text.indexOf("encrypted content")>=0 && /verif|decrypt|invalid/.test(text)))return null;
+  var body=onRequest(ctx.request,ctx);
+  return body ? {actions:[host.request.replace(body)]}:null;
+}

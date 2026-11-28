@@ -1,324 +1,286 @@
-import { ChevronDown, ChevronUp, Plus, X } from "lucide-react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
+import { ArrowDown, ArrowRight, ArrowUp, ChevronDown, Plus, Trash2 } from "lucide-react";
+import { HeaderRulesField, UserAgentField } from "./HeaderRulesField";
+import { FailureRulesEditor } from "./FailureRulesEditor";
 import { useI18n } from "../lib/i18n";
-import type {
-  BuiltinPluginDescriptor,
-  DirectionConfig,
-  PipelineConfig,
-  PipelineMode,
-} from "../lib/api/types";
-import { useFlowGeometry } from "../lib/useFlowGeometry";
+import type { BuiltinPluginDescriptor, DirectionConfig, PipelineConfig, PluginInstance } from "../lib/api/types";
 
 type Props = {
   pipeline: PipelineConfig;
   catalog: BuiltinPluginDescriptor[];
   onChange: (pipeline: PipelineConfig) => void;
 };
+type Direction = "request" | "response" | "recovery";
+const laneKey = (d: Direction) => d === "recovery" ? "account.pipeline.recoveryLane" : d === "request" ? "account.pipeline.requestLane" : "account.pipeline.responseLane";
+type Translate = ReturnType<typeof useI18n>["t"];
 
-function ConfigField({
-  descriptor,
-  field,
-  value,
-  onChange,
-}: {
+function configSummary(item: PluginInstance, descriptor: BuiltinPluginDescriptor | undefined, t: Translate) {
+  if (!descriptor) return t("account.pipeline.unavailable");
+  const values = descriptor.config_fields.flatMap((field) => {
+    const value = item.config[field.key] ?? descriptor.defaults?.[field.key] ?? field.default;
+    if (value === undefined || value === null || value === "") return [];
+    let label: string;
+    if (field.kind === "headers" && Array.isArray(value)) {
+      label=`${value.length} 项`;
+    } else if (field.kind === "select") {
+      label = value === "auto" ? t("account.pipeline.auto") : value === "on" ? t("account.pipeline.on") : value === "off" ? t("account.pipeline.off") : String(value);
+    } else if (field.kind === "bool") {
+      label = value ? t("account.pipeline.on") : t("account.pipeline.off");
+    } else if (typeof value === "number" || typeof value === "string") {
+      label = String(value).replace(/\s+/g, " ");
+    } else {
+      return [];
+    }
+    return [`${field.label} ${label}`];
+  });
+  return values.length ? values.join(" · ") : descriptor.config_fields.length ? t("account.pipeline.defaultConfig") : t("account.pipeline.noConfig");
+}
+
+function ConfigField({ descriptor, field, value, onChange }: {
   descriptor: BuiltinPluginDescriptor;
   field: BuiltinPluginDescriptor["config_fields"][number];
   value: unknown;
   onChange: (value: unknown) => void;
 }) {
-  const inputClass =
-    "mt-1 w-full rounded-md border border-stone-200 bg-white px-2 py-1 text-[11px] text-stone-800 outline-none focus:border-blue-400";
-  if (field.kind === "select") {
-    return (
-      <label className="mt-1.5 block text-[10px] text-stone-500">
-        {field.label}
-        <select
-          aria-label={`${descriptor.name} ${field.label}`}
-          className={inputClass}
-          onChange={(event) => onChange(event.target.value)}
-          value={typeof value === "string" ? value : "auto"}
-        >
-          <option value="auto">自动</option>
-          <option value="on">开启</option>
-          <option value="off">关闭</option>
-        </select>
-      </label>
-    );
-  }
-  if (field.kind === "number") {
-    return (
-      <label className="mt-1.5 block text-[10px] text-stone-500">
-        {field.label}
-        <input
-          aria-label={`${descriptor.name} ${field.label}`}
-          className={inputClass}
-          min={0}
-          onChange={(event) => onChange(Number(event.target.value))}
-          type="number"
-          value={typeof value === "number" ? value : 0}
-        />
-      </label>
-    );
-  }
-  if (field.kind === "textarea") {
-    return (
-      <label className="mt-1.5 block text-[10px] text-stone-500">
-        {field.label}
-        <textarea
-          aria-label={`${descriptor.name} ${field.label}`}
-          className={inputClass}
-          onChange={(event) => onChange(event.target.value)}
-          rows={2}
-          value={typeof value === "string" ? value : ""}
-        />
-      </label>
-    );
-  }
+  const { t } = useI18n();
+  const label = `${descriptor.name} ${field.label}`;
+  if (field.kind === "userAgent") return <UserAgentField label={label} value={value} onChange={onChange}/>;
+  if (field.kind === "headers") return <HeaderRulesField label={label} value={value} onChange={onChange}/>;
   if (field.kind === "bool") {
-    return (
-      <label className="mt-1.5 flex items-center gap-1.5 text-[10px] text-stone-500">
-        <input
-          aria-label={`${descriptor.name} ${field.label}`}
-          checked={Boolean(value)}
-          onChange={(event) => onChange(event.target.checked)}
-          type="checkbox"
-        />
-        {field.label}
-      </label>
-    );
+    return <label className="pipeline-field pipeline-field-bool">
+      <input aria-label={label} checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+      {field.label}
+    </label>;
   }
-  return null;
+  if (!["select", "number", "textarea"].includes(field.kind)) return null;
+  return <label className={`pipeline-field${field.kind === "textarea" ? " pipeline-field-wide" : ""}`}>
+    <span>{field.label}</span>
+    {field.kind === "select" ? (
+      <select aria-label={label} onChange={(event) => onChange(event.target.value)} value={typeof value === "string" ? value : "auto"}>
+        <option value="auto">{t("account.pipeline.auto")}</option>
+        <option value="on">{t("account.pipeline.on")}</option>
+        <option value="off">{t("account.pipeline.off")}</option>
+      </select>
+    ) : field.kind === "number" ? (
+      <input aria-label={label} min={field.min ?? 0} max={field.max} onChange={(event) => onChange(Number(event.target.value))} type="number" value={typeof value === "number" ? value : 0} />
+    ) : (
+      <textarea aria-label={label} onChange={(event) => onChange(event.target.value)} rows={3} value={typeof value === "string" ? value : ""} />
+    )}
+  </label>;
 }
 
-function Lane({
-  direction,
-  title,
-  startLabel,
-  endLabel,
-  config,
-  catalog,
-  onChange,
-}: {
-  direction: "request" | "response";
-  title: string;
-  startLabel: string;
-  endLabel: string;
+function Lane({ direction, config, catalog, onChange }: {
+  direction: Direction;
   config: DirectionConfig;
   catalog: BuiltinPluginDescriptor[];
   onChange: (config: DirectionConfig) => void;
 }) {
   const { t } = useI18n();
+  const id = useId();
+  const [adding, setAdding] = useState(false);
+  const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const rowButtons = useRef(new Map<number, HTMLButtonElement>());
+  const addSelect = useRef<HTMLButtonElement>(null);
+  const pendingFocus = useRef<number | "add" | null>(null);
+  useLayoutEffect(() => {
+    const target = pendingFocus.current;
+    if (target === null) return;
+    pendingFocus.current = null;
+    if (target === "add") addSelect.current?.focus();
+    else rowButtons.current.get(target)?.focus();
+  }, [config.chain]);
   const passed = config.mode === "passthrough";
-  const descriptors = config.chain.map((item) => catalog.find((entry) => entry.id === item.id));
-  const nodeIds = passed
-    ? [`${direction}-start`, `${direction}-end`]
-    : [
-        `${direction}-start`,
-        ...config.chain.map((_, index) => `${direction}-plugin-${index}`),
-        `${direction}-end`,
-      ];
-  const { boardRef, nodeRefs, paths, size } = useFlowGeometry(nodeIds);
-
-  const setMode = (mode: PipelineMode) => onChange({ ...config, mode });
-  const addPlugin = (id: string) => {
-    if (!id) return;
-    onChange({
-      ...config,
-      chain: [...config.chain, { id, enabled: true, config: {} }],
-    });
-  };
-  const removePlugin = (index: number) => {
-    onChange({ ...config, chain: config.chain.filter((_, itemIndex) => itemIndex !== index) });
-  };
-  const movePlugin = (index: number, delta: number) => {
-    const next = [...config.chain];
-    const target = index + delta;
-    if (target < 0 || target >= next.length) return;
-    [next[index], next[target]] = [next[target], next[index]];
-    onChange({ ...config, chain: next });
-  };
-  const updateConfig = (index: number, key: string, value: unknown) => {
-    const next = [...config.chain];
-    next[index] = { ...next[index], config: { ...next[index].config, [key]: value } };
-    onChange({ ...config, chain: next });
-  };
-
-  const available = catalog.filter(
-    (entry) => (entry.lane === direction || entry.lane === "both") && !config.chain.some((item) => item.enabled && item.id === entry.id),
+  const title = t(laneKey(direction));
+  const start = t(direction === "request" ? "account.pipeline.agent" : "account.pipeline.provider");
+  const end = t(direction === "request" ? "account.pipeline.provider" : "account.pipeline.agent");
+  const available = catalog.filter((entry) =>
+    (entry.lane === direction || (entry.lane === "both" && direction !== "recovery")) && !config.chain.some((item) => item.id === entry.id),
   );
 
-  return (
-    <section className="rounded-2xl border border-stone-200 bg-white p-3 shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-[13px] font-semibold text-stone-950">{title}</h3>
-        <div className="flex gap-1 rounded-xl bg-stone-100 p-1">
-          {(["passthrough", "process"] as const).map((mode) => (
-            <button
-              aria-pressed={config.mode === mode}
-              className={`rounded-lg px-2.5 py-1 text-[11px] font-semibold motion-control ${
-                config.mode === mode
-                  ? "bg-white text-stone-950 shadow-sm"
-                  : "text-stone-500 hover:text-stone-900"
-              }`}
-              key={mode}
-              onClick={() => setMode(mode)}
-              type="button"
-            >
-              {t(mode === "passthrough" ? "account.pipeline.passthrough" : "account.pipeline.process")}
-            </button>
-          ))}
-        </div>
+  const updateItem = (index: number, update: Partial<PluginInstance>) => {
+    onChange({ ...config, chain: config.chain.map((item, i) => i === index ? { ...item, ...update } : item) });
+  };
+  const addPlugin = (pluginId: string) => {
+    if (!available.some((entry) => entry.id === pluginId)) return;
+    const index = config.chain.findIndex((item) => item.id === pluginId);
+    if (index >= 0) {
+      updateItem(index, { enabled: true });
+      setExpanded(index);
+    } else {
+      onChange({ ...config, chain: [...config.chain, { id: pluginId, enabled: true, config: structuredClone(catalog.find(entry => entry.id === pluginId)?.defaults ?? {}) }] });
+      setExpanded(config.chain.length);
+    }
+  };
+  const movePlugin = (index: number, delta: number) => {
+    const target = index + delta;
+    if (target < 0 || target >= config.chain.length || direction === "recovery") return;
+    if (catalog.find(e => e.id === config.chain[index].id)?.stage !== catalog.find(e => e.id === config.chain[target].id)?.stage) return;
+    const chain = [...config.chain];
+    [chain[index], chain[target]] = [chain[target], chain[index]];
+    onChange({ ...config, chain });
+    setExpanded(target);
+    pendingFocus.current = target;
+  };
+  const removePlugin = (index: number) => {
+    onChange({ ...config, chain: config.chain.filter((_, i) => i !== index) });
+    setExpanded(null);
+    // Restore focus after React mounts the new row order.
+    const target = config.chain.length > 1 ? Math.min(index, config.chain.length - 2) : null;
+    pendingFocus.current = target ?? "add";
+  };
+
+  return <>
+    <div className="pipeline-toolbar">
+      <div className="pipeline-route">{direction === "recovery" ? <span>失败识别 → 重试 / 续接 / 账号状态</span> : <><span>{start}</span><ArrowRight aria-hidden="true" size={14} /><span>{end}</span></>}</div>
+      <div className="pipeline-modes" role="group" aria-label={t("account.pipeline.mode")}>
+        {(["passthrough", "process"] as const).map((mode) => (
+          <button aria-pressed={config.mode === mode} data-plain-text key={mode} onClick={() => onChange({ ...config, mode })} type="button">
+            {t(mode === "passthrough" ? "account.pipeline.passthrough" : "account.pipeline.process")}
+          </button>
+        ))}
       </div>
-
-      {passed ? (
-        <p className="mt-2 rounded-lg border border-dashed border-stone-200 bg-stone-50 px-3 py-2 text-[11px] text-stone-500">
-          {t("account.pipeline.passthroughHint")}
-        </p>
-      ) : null}
-
-      <div className="relative mt-3" ref={boardRef}>
-        <svg
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0"
-          height={size.height}
-          width={size.width}
-        >
-          {paths.map((path) => (
-            <path
-              className="pipeline-flow-line"
-              data-direction={direction}
-              d={path.d}
-              key={path.id}
-            />
-          ))}
-        </svg>
-        <div className="relative flex flex-wrap items-stretch gap-2">
-          <div
-            className="flex min-w-24 flex-col justify-center rounded-xl border border-stone-300 bg-stone-900 px-3 py-2 text-center text-[11px] font-semibold text-white"
-            ref={(node) => {
-              if (node) nodeRefs.current.set(`${direction}-start`, node);
-            }}
-          >
-            {startLabel}
-          </div>
-
-          {!passed
-            ? config.chain.map((item, index) => {
-                const descriptor = descriptors[index];
-                return (
-                  <div
-                    className="min-w-40 rounded-xl border border-stone-200 bg-stone-50 px-2.5 py-2"
-                    key={`${item.id}-${index}`}
-                    ref={(node) => {
-                      if (node) nodeRefs.current.set(`${direction}-plugin-${index}`, node);
-                    }}
-                  >
-                    <div className="flex items-center gap-1">
-                      <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-stone-800" title={descriptor?.description}>
-                        {descriptor?.name ?? item.id}
-                      </span>
-                      <button
-                        aria-label={`${t("account.pipeline.removePlugin")} ${descriptor?.name ?? item.id}`}
-                        className="grid h-5 w-5 place-items-center rounded text-stone-400 motion-control hover:bg-red-50 hover:text-red-600"
-                        onClick={() => removePlugin(index)}
-                        title={t("account.pipeline.removePlugin")}
-                        type="button"
-                      >
-                        <X aria-hidden="true" className="h-3 w-3" />
-                      </button>
-                    </div>
-                    <div className="flex gap-1">
-                      <button
-                        aria-label="上移"
-                        className="grid h-5 w-5 place-items-center rounded text-stone-400 motion-control hover:bg-stone-100 disabled:opacity-30"
-                        disabled={index === 0}
-                        onClick={() => movePlugin(index, -1)}
-                        type="button"
-                      >
-                        <ChevronUp aria-hidden="true" className="h-3 w-3" />
-                      </button>
-                      <button
-                        aria-label="下移"
-                        className="grid h-5 w-5 place-items-center rounded text-stone-400 motion-control hover:bg-stone-100 disabled:opacity-30"
-                        disabled={index === config.chain.length - 1}
-                        onClick={() => movePlugin(index, 1)}
-                        type="button"
-                      >
-                        <ChevronDown aria-hidden="true" className="h-3 w-3" />
-                      </button>
-                    </div>
-                    {descriptor?.config_fields.map((field) => (
-                      <ConfigField
+    </div>
+    {passed ? (
+      <div className="pipeline-empty">
+        <p>{t("account.pipeline.passthroughHint")}</p>
+        <span>{t("account.pipeline.retained")}</span>
+      </div>
+    ) : <>
+      <div className="pipeline-list-heading">
+        <span>{direction === "recovery" ? "独立策略 · 展开查看触发条件和参数" : t("account.pipeline.orderHint")}</span>
+        <span>{t("account.pipeline.enabledCount", { count: config.chain.filter((item) => item.enabled).length, total: config.chain.length })}</span>
+      </div>
+      {config.chain.length ? (
+        <ol className="pipeline-list" aria-label={t("account.pipeline.pluginList", { direction: title })}>
+          {config.chain.map((item, index) => {
+            const descriptor = catalog.find((entry) => entry.id === item.id);
+            const name = descriptor?.name ?? item.id;
+            const open = expanded === index;
+            const summary = configSummary(item, descriptor, t);
+            const detailsId = `${id}-details-${index}`;
+            const buttonId = `${id}-row-${index}`;
+            return <li className="pipeline-row" data-expanded={open} key={`${item.id}-${index}`}>
+              <div className="pipeline-row-main">
+                <button
+                  aria-controls={detailsId}
+                  aria-expanded={open}
+                  aria-label={`${t("account.pipeline.configure")} ${name}`}
+                  className="pipeline-row-trigger"
+                  data-plain-text
+                  id={buttonId}
+                  onClick={() => setExpanded(open ? null : index)}
+                  ref={(node) => { if (node) rowButtons.current.set(index, node); else rowButtons.current.delete(index); }}
+                  type="button"
+                >
+                  {direction !== "recovery" ? <span aria-hidden="true" className="pipeline-index">{String(index + 1).padStart(2, "0")}</span> : null}
+                  <span className="pipeline-row-copy">
+                    <span className="pipeline-row-name">{name}</span>
+                    <span className="pipeline-row-purpose">{descriptor?.description}</span>
+                    <span className="pipeline-row-summary" title={summary}>{summary}</span>
+                  </span>
+                  <ChevronDown aria-hidden="true" className="pipeline-chevron" size={15} />
+                </button>
+                <label className="pipeline-toggle">
+                  <span>{t(item.enabled ? "account.pipeline.enabled" : "account.pipeline.disabled")}</span>
+                  <input
+                    aria-label={`${t("account.pipeline.enablePlugin")} ${name}`}
+                    checked={item.enabled}
+                    onChange={(event) => updateItem(index, { enabled: event.target.checked })}
+                    role="switch"
+                    type="checkbox"
+                  />
+                </label>
+              </div>
+              {open ? (
+                <div aria-labelledby={buttonId} className="pipeline-details" id={detailsId} role="region">
+                  <p className="pipeline-description">{descriptor ? descriptor.description || t("account.pipeline.noConfig") : t("account.pipeline.unavailable")}</p>
+                  {descriptor?.limitations ? <p className="pipeline-description">{descriptor.limitations}</p> : null}
+                  {descriptor?.config_fields.length ? (
+                    <div className="pipeline-fields">
+                      {descriptor.config_fields.map((field) => <ConfigField
                         descriptor={descriptor}
                         field={field}
                         key={field.key}
-                        onChange={(value) => updateConfig(index, field.key, value)}
-                        value={item.config[field.key]}
-                      />
-                    ))}
+                        onChange={(value) => updateItem(index, { config: { ...item.config, [field.key]: value } })}
+                        value={item.config[field.key] ?? descriptor.defaults?.[field.key] ?? field.default}
+                      />)}
+                    </div>
+                  ) : null}
+                  {descriptor?.class_limits_editor ? <details className="pipeline-class-limits"><summary>按错误类别覆盖重试次数</summary><p>留空沿用全局次数，0 表示此类不重试。单次请求共用计数，不会按类别重新累计。</p><div className="pipeline-fields">
+                    {Object.entries({transport:"连接错误",server_error:"服务器错误",rate_limit:"限流",capacity:"容量不足",semantic:"其他结构化错误"}).map(([key,label]) => <label className="pipeline-field" key={key}>{label}<input aria-label={`${name} ${label}重试次数`} type="number" min={0} max={1000} placeholder="沿用全局" value={(item.config.retry_class_limits as Record<string,number|null>|undefined)?.[key] ?? ""} onChange={event => updateItem(index,{config:{...item.config,retry_class_limits:{...(item.config.retry_class_limits as object ?? {}),[key]:event.target.value === "" ? null : Number(event.target.value)}}})} /></label>)}
+                  </div></details> : null}
+                  {Boolean(descriptor?.rule_editor) ? <FailureRulesEditor stream={descriptor?.rule_editor === "stream"} health={descriptor?.rule_editor === "health"} config={item.config} defaults={{...descriptor?.defaults,legacy_rules:descriptor?.legacy_rules}} onChange={config => updateItem(index, { config })} /> : null}
+                  <div className="pipeline-actions">
+                    {direction !== "recovery" ? <><button aria-label={`${t("account.pipeline.moveUp")} ${name}`} data-plain-text disabled={index === 0 || descriptor?.stage !== catalog.find(e => e.id === config.chain[index - 1]?.id)?.stage} onClick={() => movePlugin(index, -1)} type="button">
+                      <ArrowUp aria-hidden="true" size={14} />{t("account.pipeline.moveUp")}
+                    </button>
+                    <button aria-label={`${t("account.pipeline.moveDown")} ${name}`} data-plain-text disabled={index === config.chain.length - 1 || descriptor?.stage !== catalog.find(e => e.id === config.chain[index + 1]?.id)?.stage} onClick={() => movePlugin(index, 1)} type="button">
+                      <ArrowDown aria-hidden="true" size={14} />{t("account.pipeline.moveDown")}
+                    </button>
+                    </> : null}
+                    <button aria-label={`${t("account.pipeline.removePlugin")} ${name}`} className="pipeline-remove" data-plain-text onClick={() => removePlugin(index)} type="button">
+                      <Trash2 aria-hidden="true" size={14} />{t("account.pipeline.removePlugin")}
+                    </button>
                   </div>
-                );
-              })
-            : null}
-
-          <div
-            className="flex min-w-24 flex-col justify-center rounded-xl border border-stone-300 bg-white px-3 py-2 text-center text-[11px] font-semibold text-stone-800"
-            ref={(node) => {
-              if (node) nodeRefs.current.set(`${direction}-end`, node);
-            }}
-          >
-            {endLabel}
-          </div>
-        </div>
-      </div>
-
-      {!passed ? (
-        <label className="mt-3 flex items-center gap-2 text-[11px] font-semibold text-stone-600">
-          <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-          {t("account.pipeline.addPlugin")}
-          <select
-            aria-label={`${t("account.pipeline.addPlugin")} - ${title}`}
-            className="ml-auto max-w-52 rounded-lg border border-stone-200 bg-white px-2 py-1 text-[11px] outline-none focus:border-blue-400"
-            onChange={(event) => {
-              addPlugin(event.target.value);
-              event.target.value = "";
-            }}
-            value=""
-          >
-            <option value="">—</option>
-            {available.map((entry) => (
-              <option key={entry.id} value={entry.id}>
-                {entry.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      ) : null}
-    </section>
-  );
+                </div>
+              ) : null}
+            </li>;
+          })}
+        </ol>
+      ) : <p className="pipeline-empty">{t("account.pipeline.noPlugins")}</p>}
+      <button ref={addSelect} className="pipeline-add" type="button" disabled={!available.length && !adding} onClick={() => setAdding(!adding)}><Plus size={16} />{adding ? "关闭中间件目录" : "添加中间件"}</button>
+      {adding ? <div className="pipeline-catalog" role="region" aria-label="添加中间件目录">
+        <input type="search" aria-label="搜索中间件" placeholder="搜索名称或要解决的问题" value={search} onChange={e => setSearch(e.target.value)} />
+        {available.filter(e => `${e.name} ${e.description}`.toLowerCase().includes(search.toLowerCase())).map(entry => <div className="pipeline-catalog-item" key={entry.id}>
+          <div><strong>{entry.name}</strong><p>{entry.description}</p></div>
+          <button type="button" aria-label={`添加 ${entry.name}`} onClick={() => { addPlugin(entry.id); setAdding(false); setSearch(""); }}>添加</button>
+        </div>)}
+        {!available.length ? <p>{t("account.pipeline.allAdded")}</p> : null}
+      </div> : null}
+    </>}
+  </>;
 }
 
 export function PipelineFlowEditor({ pipeline, catalog, onChange }: Props) {
   const { t } = useI18n();
-  return (
-    <div className="space-y-3">
-      <Lane
-        catalog={catalog}
-        config={pipeline.request}
-        direction="request"
-        endLabel={t("account.pipeline.provider")}
-        onChange={(config) => onChange({ ...pipeline, request: config })}
-        startLabel={t("account.pipeline.agent")}
-        title={t("account.pipeline.requestLane")}
-      />
-      <Lane
-        catalog={catalog}
-        config={pipeline.response}
-        direction="response"
-        endLabel={t("account.pipeline.agent")}
-        onChange={(config) => onChange({ ...pipeline, response: config })}
-        startLabel={t("account.pipeline.provider")}
-        title={t("account.pipeline.responseLane")}
-      />
+  const id = useId();
+  const [direction, setDirection] = useState<Direction>(pipeline.version >= 2 && !pipeline.request.chain.length && pipeline.recovery?.chain.length ? "recovery" : "request");
+  const tabs = useRef(new Map<Direction, HTMLButtonElement>());
+  const directions: Direction[] = ["request", "response", "recovery"];
+  return <section className="pipeline-settings" aria-label={t("account.pipeline.title")}>
+    <div className="pipeline-tabs" role="tablist" aria-label={t("account.pipeline.direction")}>
+      {directions.map((lane) => (
+        <button
+          aria-controls={`${id}-panel-${lane}`}
+          aria-label={t(laneKey(lane))}
+          aria-selected={direction === lane}
+          data-plain-text
+          id={`${id}-tab-${lane}`}
+          key={lane}
+          onClick={() => setDirection(lane)}
+          onKeyDown={(event) => {
+            let next: Direction;
+            if (event.key === "Home") next = "request";
+            else if (event.key === "End") next = "recovery";
+            else if (event.key === "ArrowLeft" || event.key === "ArrowRight") next = directions[(directions.indexOf(lane) + (event.key === "ArrowLeft" ? 2 : 1)) % 3];
+            else return;
+            event.preventDefault();
+            setDirection(next);
+            tabs.current.get(next)?.focus();
+          }}
+          ref={(node) => { if (node) tabs.current.set(lane, node); else tabs.current.delete(lane); }}
+          role="tab"
+          tabIndex={direction === lane ? 0 : -1}
+          type="button"
+        >
+          {t(laneKey(lane))}
+          <span aria-hidden="true">{pipeline[lane]?.chain.length ?? 0}</span>
+        </button>
+      ))}
     </div>
-  );
+    <div aria-labelledby={`${id}-tab-${direction}`} id={`${id}-panel-${direction}`} role="tabpanel" tabIndex={0}>
+      <Lane catalog={catalog} config={pipeline[direction] ?? { mode: "process", chain: [] }} direction={direction} key={direction} onChange={(config) => onChange({ ...pipeline, [direction]: config })} />
+    </div>
+  </section>;
 }

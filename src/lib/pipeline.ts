@@ -1,15 +1,14 @@
+import builtinManifest from "../../native/src/services/builtin_plugins/scripts/manifest.json";
+import defaultRules from "../../native/src/services/builtin_plugins/scripts/failure-rules.json";
 import type { PipelineConfig, RouteCredentialFailurePolicy } from "./api/types";
 import {
   plaintextReasoningMatchedHost,
-  type ResponsesPlaintextReasoningMode,
 } from "./responsesPlaintextReasoning";
 import {
   crossResourceStripMatchedHost,
-  type ResponsesCrossResourceStripMode,
 } from "./responsesCrossResourceStrip";
 import {
   requestCompressionMatchedHost,
-  type RequestCompressionMode,
 } from "./requestCompression";
 
 export const REQUEST_TRANSFORM_PLUGINS = [
@@ -75,57 +74,107 @@ function plug(
   return { id, enabled, config };
 }
 
-/**
- * Built-ins are off by default. Only plugins whose declared host list matches
- * the provider's base URL turn themselves on automatically.
- */
+/** New accounts only install useful defaults; absent plugins stay absent. */
 export function createDefaultPipeline(baseUrl = ""): PipelineConfig {
-  const compressionMode: RequestCompressionMode = requestCompressionMatchedHost(baseUrl) ? "auto" : "off";
-  const plaintextMode: ResponsesPlaintextReasoningMode = plaintextReasoningMatchedHost(baseUrl) ? "auto" : "off";
-  const stripMode: ResponsesCrossResourceStripMode = crossResourceStripMatchedHost(baseUrl) ? "auto" : "off";
-  return {
-    version: 1,
-    request: {
-      mode: "process",
-      chain: [
-        plug("builtin.request.compression", compressionMode === "auto", { mode: compressionMode }),
-        plug("builtin.request.contentRejection", false),
-        plug("builtin.request.imageLimit", false),
-        plug("builtin.request.forceReasoning", false),
-        plug("builtin.request.inlineRemoteImages", false),
-        plug("builtin.request.turnReminder", false, { text: "" }),
-        plug("builtin.request.customToolCompat", false),
-        plug("builtin.schedule.retry", false, { retry_count: 2, retry_interval_ms: 200, max_retry_elapsed_seconds: 0, capacity_retry_interval_ms: 0 }),
-        plug("builtin.schedule.semanticThreshold", false, { value: 10 }),
-        plug("builtin.schedule.cooldown", false, { seconds: 10 }),
-        plug("builtin.schedule.errorStatus", false),
-        plug("builtin.schedule.streamPrelude", false, { ms: 60000 }),
-        plug("builtin.schedule.streamSalvage", false),
-        plug("builtin.schedule.streamContinue", false, { max: 10 }),
-        plug("builtin.schedule.failover", false),
-      ],
-    },
-    response: {
-      mode: "process",
-      chain: [
-        plug("builtin.response.plaintextReasoning", plaintextMode === "auto", { mode: plaintextMode }),
-        plug("builtin.response.crossResourceStrip", stripMode === "auto", { mode: stripMode }),
-        plug("builtin.response.encryptedContentCleanup", false, { aggressive_strip: false }),
-      ],
-    },
-  };
+  const request = [];
+  if (requestCompressionMatchedHost(baseUrl)) request.push(plug("builtin.request.compression", true, { mode: "auto" }));
+  if (plaintextReasoningMatchedHost(baseUrl)) request.push(plug("builtin.request.plaintextReasoning", true, { mode: "auto" }));
+  if (crossResourceStripMatchedHost(baseUrl)) request.push(plug("builtin.request.crossResourceStrip", true, { mode: "auto" }));
+  return { version: 2, catalog_revision: 1, request: { mode: "process", chain: request }, response: { mode: "process", chain: [] }, recovery: { mode: "process", chain: recoveryPlugins(defaultFailurePolicy()) } };
 }
 
-/** `config_json.pipeline` is the only source of truth. */
+function recoveryPlugins(policy: RouteCredentialFailurePolicy, legacy = false) {
+  const { retry_count, retry_interval_ms, max_retry_elapsed_seconds, capacity_retry_interval_ms, retry_class_limits, failover_enabled, stream_prelude_wait_ms,
+    cooldown_enabled, cooldown_seconds, semantic_error_threshold, error_status_enabled, stream_continue_enabled, stream_continue_max, stream_salvage_enabled } = policy;
+  const plugins = [
+    plug("builtin.recovery.retry", retry_count > 0 || failover_enabled || stream_prelude_wait_ms > 0, { retry_count, retry_interval_ms, max_retry_elapsed_seconds, capacity_retry_interval_ms, retry_class_limits, failover_enabled, stream_prelude_wait_ms, ...(legacy ? { legacy_matching: true } : { rules: structuredClone(defaultRules) }) }),
+    plug("builtin.recovery.accountHealth", cooldown_enabled || error_status_enabled, { cooldown_enabled, cooldown_seconds, semantic_error_threshold, error_status_enabled }),
+  ];
+  if (stream_continue_enabled || stream_salvage_enabled) plugins.push(plug("builtin.recovery.stream", true, { stream_continue_enabled, stream_continue_max, stream_salvage_enabled, retry_count, retry_interval_ms, max_retry_elapsed_seconds, capacity_retry_interval_ms, retry_class_limits, failover_enabled }));
+  return plugins;
+}
+
+/** V1's disabled schedule rows did not zero native defaults. Preserve actual behavior. */
+export function migratePipeline(raw: PipelineConfig, base = defaultFailurePolicy()): PipelineConfig {
+  if (raw.version >= 2) return { ...raw, recovery: raw.recovery ?? { mode: "process", chain: [] } };
+  const policy = failurePolicyFromPipeline(raw, base);
+  const oldSchedule = raw.request.chain.filter(p => p.id.startsWith("builtin.schedule."));
+  const request = raw.request.chain.filter(p => !p.id.startsWith("builtin.schedule.")).map(p => raw.request.mode === "passthrough" ? { ...p, enabled: false } : p);
+  let requestMode = raw.request.mode;
+  const response = [];
+  for (const p of raw.response.chain) {
+    if ((RESPONSE_PLUGINS as readonly string[]).includes(p.id)) {
+      if (p.enabled && raw.response.mode !== "passthrough") requestMode = "process";
+      request.push({ ...p, id: p.id.replace("builtin.response.", "builtin.request."), enabled: p.enabled && raw.response.mode !== "passthrough" });
+    } else response.push(p);
+  }
+  const recovery = recoveryPlugins(policy, true);
+  for (const plugin of recovery) plugin.config.legacy_plugins = oldSchedule;
+  const retained = request.filter(p => p.enabled || p.id.startsWith("pack:") || !isUntouchedDisabled(p));
+  return { version: 2, request: { ...raw.request, mode: requestMode, chain: retained }, response: { ...raw.response, chain: response }, recovery: { mode: raw.request.mode, chain: recovery } };
+}
+
+function isUntouchedDisabled(p: { id: string; config: Record<string, unknown> }) {
+  const empty = Object.keys(p.config).length === 0;
+  if (!(REQUEST_TRANSFORM_PLUGINS as readonly string[]).includes(p.id) && !["builtin.request.plaintextReasoning", "builtin.request.crossResourceStrip", "builtin.request.encryptedContentCleanup"].includes(p.id)) return false;
+  return empty || JSON.stringify(p.config) === '{"mode":"off"}' || JSON.stringify(p.config) === '{"text":""}' || JSON.stringify(p.config) === '{"aggressive_strip":false}';
+}
+
+function upgradeCatalog(pipeline: PipelineConfig, config: Record<string, unknown>): PipelineConfig {
+  if ((pipeline.catalog_revision ?? 0) >= 1) return pipeline;
+  const chain: typeof pipeline.request.chain = [];
+  let merged: typeof chain[number] | undefined;
+  const hasImages = pipeline.request.chain.some(p => p.id === "builtin.request.imageProcessing");
+  const redundant: typeof chain = [];
+  let requestMode=pipeline.request.mode;
+  for (const plugin of pipeline.request.chain) {
+    const key = plugin.id === "builtin.request.inlineRemoteImages" ? "inline_remote" : plugin.id === "builtin.request.imageLimit" ? "trim_old_images" : null;
+    if (!key) { chain.push(plugin); continue; }
+    if (hasImages) { redundant.push(plugin); continue; }
+    if (!merged) { merged = plug("builtin.request.imageProcessing", false, { inline_remote:false, trim_old_images:false, max_images:10, legacy_plugins:[] }); chain.push(merged); }
+    merged.enabled ||= plugin.enabled; merged.config[key] = plugin.enabled;
+    (merged.config.legacy_plugins as unknown[]).push(plugin);
+  }
+  if (redundant.length) { const index=chain.findIndex(p=>p.id === "builtin.request.imageProcessing"); const item=chain[index]; chain[index]={...item,config:{...item.config,legacy_plugins:[...(Array.isArray(item.config.legacy_plugins)?item.config.legacy_plugins:[]),...redundant]}}; }
+  if (!chain.some(p => p.id === "builtin.request.requestHeaders") && config.headers && typeof config.headers === "object" && !Array.isArray(config.headers)) {
+    let user_agent = ""; const headers = [];
+    for (const [name, value] of Object.entries(config.headers)) {
+      if (typeof value !== "string" || !value.trim()) continue;
+      if (name.toLowerCase() === "user-agent") user_agent = value.trim();
+      else headers.push({ name, value:value.trim(), operation:"fill" });
+    }
+    if (user_agent || headers.length) {
+      if (requestMode === "passthrough") { for (let i=0;i<chain.length;i++) chain[i]={...chain[i],enabled:false}; requestMode="process"; }
+      chain.push(plug("builtin.request.requestHeaders", true, { user_agent, headers }));
+    }
+  }
+  return {...pipeline, catalog_revision:1, request:{...pipeline.request,mode:requestMode,chain}};
+}
+
 export function resolvePipeline(configJson: string, baseUrl = ""): PipelineConfig {
   try {
-    const config = JSON.parse(configJson) as Record<string, unknown>;
+    const config = JSON.parse(configJson);
     const raw = config.pipeline as PipelineConfig | undefined;
-    if (raw && raw.version === 1 && raw.request && raw.response) return raw;
-    return createDefaultPipeline(baseUrl);
-  } catch {
-    return createDefaultPipeline(baseUrl);
-  }
+    if (raw && [1, 2].includes(raw.version)) {
+      const normalized:PipelineConfig={...raw,request:raw.request ?? {mode:"process",chain:[]},response:raw.response ?? {mode:"process",chain:[]},recovery:raw.recovery ?? {mode:"process",chain:[]}};
+      return upgradeCatalog(migratePipeline(normalized, { ...defaultFailurePolicy(), ...config.failure_policy }),config);
+    }
+    const pipeline = createDefaultPipeline(baseUrl);
+    if (config.failure_policy) pipeline.recovery = { mode: "process", chain: recoveryPlugins({ ...defaultFailurePolicy(), ...config.failure_policy }, true) };
+    const mappings: [string, string, string, unknown][] = [
+      ["request_brotli_compression", "compression", "mode", "off"], ["responses_plaintext_reasoning_compat", "plaintextReasoning", "mode", "off"], ["responses_cross_resource_strip", "crossResourceStrip", "mode", "off"],
+      ["responses_encrypted_content_cleanup", "encryptedContentCleanup", "aggressive_strip", false], ["inline_remote_images", "inlineRemoteImages", "", false], ["force_reasoning_content", "forceReasoning", "", false],
+      ["image_limit_compat", "imageLimit", "", "off"], ["responses_custom_tool_compat", "customToolCompat", "", false], ["content_rejection_compat", "contentRejection", "", "off"],
+    ];
+    for (const [key, suffix, field, off] of mappings) {
+      if (config[key] === undefined) continue;
+      const id = `builtin.request.${suffix}`;
+      pipeline.request.chain = pipeline.request.chain.filter(p => p.id !== id);
+      if (config[key] !== off && config[key] !== false) pipeline.request.chain.push(plug(id, true, field ? { [field]: suffix === "encryptedContentCleanup" ? config.responses_encrypted_content_aggressive_strip === true : config[key] } : {}));
+    }
+    if (config.turn_reminder === true) pipeline.request.chain.push(plug("builtin.request.turnReminder",true,{text:config.turn_reminder_text ?? ""}));
+    return upgradeCatalog({...pipeline,catalog_revision:0},config);
+  } catch { return createDefaultPipeline(baseUrl); }
 }
 
 function num(config: Record<string, unknown>, key: string, fallback: number): number {
@@ -136,6 +185,20 @@ export function failurePolicyFromPipeline(
   pipeline: PipelineConfig,
   base: RouteCredentialFailurePolicy,
 ): RouteCredentialFailurePolicy {
+  if (pipeline.version >= 2) {
+    const zero = failurePolicyFromPipeline({ version: 1, request: { mode: "passthrough", chain: [] }, response: { mode: "process", chain: [] } }, base);
+    if (pipeline.recovery?.mode === "passthrough") return zero;
+    for (const item of pipeline.recovery?.chain ?? []) {
+      if (!item.enabled) continue;
+      const descriptor=builtinManifest.find(p=>p.id===item.id);
+      const keys = descriptor?.policy_domain === "retry" ? ["retry_count", "retry_interval_ms", "max_retry_elapsed_seconds", "capacity_retry_interval_ms", "retry_class_limits", "failover_enabled", "stream_prelude_wait_ms"]
+        : descriptor?.policy_domain === "health" ? ["cooldown_enabled", "cooldown_seconds", "semantic_error_threshold", "error_status_enabled"]
+        : descriptor?.policy_domain === "stream" ? ["stream_continue_enabled", "stream_continue_max", "stream_salvage_enabled"] : [];
+      const config = { ...builtinManifest.find(p => p.id === item.id)?.defaults, ...item.config };
+      for (const key of keys) if ((config as Record<string, unknown>)[key] !== undefined) Object.assign(zero, { [key]: (config as Record<string, unknown>)[key] });
+    }
+    return zero;
+  }
   const policy: RouteCredentialFailurePolicy = { ...base, retry_class_limits: { ...base.retry_class_limits } };
   if (pipeline.request.mode === "passthrough") {
     return {
@@ -203,4 +266,5 @@ export function writePipelineToConfig(
   pipeline: PipelineConfig,
 ): void {
   config.pipeline = pipeline;
+  if ((pipeline.catalog_revision ?? 0) >= 1) delete config.headers;
 }

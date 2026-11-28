@@ -77,3 +77,7 @@ pub mod direct_mode_auth;
 pub mod direct_mode_service;
 
 pub mod responses_plaintext_reasoning;
+pub mod failure_rules;
+pub mod plugin_contract;
+pub mod plugin_host;
+pub mod plugin_actions;

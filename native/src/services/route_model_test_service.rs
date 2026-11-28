@@ -179,7 +179,7 @@ impl RouteModelTestService {
                 recoverable: true,
             })?;
         let failure_policy =
-            RouteCredentialFailurePolicy::from_config_json(&credential.config_json);
+            crate::services::builtin_plugins::effective_policy(&credential.config_json);
         let start = Instant::now();
 
         let parts = match build_model_test_request_with_tool_call(
@@ -479,7 +479,7 @@ impl RouteModelTestService {
         let credential = credentials[selected_index].clone();
         validate_model_test_credential(platform_id, &credential)?;
         let failure_policy =
-            RouteCredentialFailurePolicy::from_config_json(&credential.config_json);
+            crate::services::builtin_plugins::effective_policy(&credential.config_json);
         let start = Instant::now();
         let parts = match build_model_test_request_with_tool_call(
             &credential,

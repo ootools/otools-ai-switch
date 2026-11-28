@@ -50,3 +50,11 @@ function onRequest(body, ctx) {
   });
   return state.changed ? body : null;
 }
+
+function onFailure(event,ctx) {
+  if(event.phase!=="request_recovery") return null;
+  var message=(event.message||"").toLowerCase();
+  if(message.indexOf("maximum number of images")<0 && message.indexOf("too many images")<0) return null;
+  var body=onRequest(ctx.request,ctx);
+  return body ? {actions:[host.request.replace(body)]}:null;
+}

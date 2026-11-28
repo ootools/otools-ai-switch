@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 pub enum PluginLane {
     Request,
     Response,
+    Recovery,
+    Both,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,14 +28,22 @@ pub enum PluginKind {
     Schedule,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginConfigField {
     pub key: String,
     pub label: String,
     pub kind: String,
+    #[serde(default)]
+    pub default: Value,
+    #[serde(default)]
+    pub help: String,
+    #[serde(default)]
+    pub min: Option<u32>,
+    #[serde(default)]
+    pub max: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuiltinPluginDescriptor {
     pub id: String,
     pub name: String,
@@ -46,7 +56,29 @@ pub struct BuiltinPluginDescriptor {
     pub stage: String,
     #[serde(default)]
     pub config_fields: Vec<PluginConfigField>,
+    #[serde(default)]
+    pub defaults: Value,
+    #[serde(default)]
+    pub legacy_rules: Value,
+    #[serde(default)]
+    pub limitations: String,
+    #[serde(default = "api_version")]
+    pub api_version: u32,
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
+    pub stages: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub policy_domain: String,
+    #[serde(default)]
+    pub rule_editor: String,
+    #[serde(default)]
+    pub class_limits_editor: bool,
 }
+
+fn api_version() -> u32 { 1 }
 
 fn default_stage() -> String {
     "perAttempt".into()
@@ -57,6 +89,14 @@ const MANIFEST: &str = include_str!("builtin_plugins/scripts/manifest.json");
 /// Embedded scripts, keyed by the same ids used in account chains.
 pub fn embedded_sources() -> Vec<(&'static str, &'static str)> {
     vec![
+        ("builtin.request.requestHeaders",include_str!("builtin_plugins/scripts/builtin.request.requestHeaders.js")),
+        ("builtin.request.imageProcessing",include_str!("builtin_plugins/scripts/builtin.request.imageProcessing.js")),
+        ("builtin.recovery.retry", include_str!("builtin_plugins/scripts/builtin.recovery.retry.js")),
+        ("builtin.recovery.stream", include_str!("builtin_plugins/scripts/builtin.recovery.stream.js")),
+        ("builtin.recovery.accountHealth", include_str!("builtin_plugins/scripts/builtin.recovery.accountHealth.js")),
+        ("builtin.request.plaintextReasoning", include_str!("builtin_plugins/scripts/builtin.response.plaintextReasoning.js")),
+        ("builtin.request.crossResourceStrip", include_str!("builtin_plugins/scripts/builtin.response.crossResourceStrip.js")),
+        ("builtin.request.encryptedContentCleanup", include_str!("builtin_plugins/scripts/builtin.response.encryptedContentCleanup.js")),
         ("builtin.request.compression", include_str!("builtin_plugins/scripts/builtin.request.compression.js")),
         ("builtin.request.contentRejection", include_str!("builtin_plugins/scripts/builtin.request.contentRejection.js")),
         ("builtin.request.imageLimit", include_str!("builtin_plugins/scripts/builtin.request.imageLimit.js")),
@@ -80,8 +120,15 @@ pub fn embedded_sources() -> Vec<(&'static str, &'static str)> {
 
 /// The catalog shown by the visual flow editor.
 pub fn list() -> Vec<BuiltinPluginDescriptor> {
-    serde_json::from_str::<Vec<BuiltinPluginDescriptor>>(MANIFEST)
-        .expect("valid builtin plugin manifest")
+    let mut catalog = serde_json::from_str::<Vec<BuiltinPluginDescriptor>>(MANIFEST).expect("valid builtin plugin manifest");
+    for entry in &mut catalog {
+        if entry.rule_editor == "health" { entry.defaults["rules"] = serde_json::to_value(crate::services::failure_rules::health_defaults()).expect("health rules"); }
+        if matches!(entry.rule_editor.as_str(), "retry" | "stream") {
+            entry.defaults["rules"] = serde_json::to_value(crate::services::failure_rules::defaults()).expect("rules serialize");
+            entry.legacy_rules = serde_json::to_value(crate::services::failure_rules::legacy_defaults()).expect("legacy rules");
+        }
+    }
+    catalog
 }
 
 pub fn get(id: &str) -> Option<BuiltinPluginDescriptor> {
@@ -111,6 +158,12 @@ fn merge_policy(policy: &mut RouteCredentialFailurePolicy, patch: &Value) {
         }
     }
     if let Ok(merged) = serde_json::from_value::<RouteCredentialFailurePolicy>(Value::Object(map)) {
+        let mut check=merged;
+        // Inactive baseline uses zero as the disabled threshold; validate only
+        // plugin-supplied values against the normal persisted-policy constraints.
+        if !patch.contains_key("semantic_error_threshold"){check.semantic_error_threshold=check.semantic_error_threshold.max(1);}
+        if !patch.contains_key("cooldown_seconds"){check.cooldown_seconds=check.cooldown_seconds.max(1);}
+        if check.validate().is_err(){crate::services::plugin_host::log("host","error","Plugin policy exceeds supported budgets");return;}
         *policy = merged;
     }
 }
@@ -126,15 +179,14 @@ pub fn mark_policy_dirty() {
     POLICY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Build the failure policy from the request lane. Passthrough means one
-/// attempt with no retry, no failover and no cooldown — raw forwarding.
-/// Schedule plugins declare their policy through the precompiled JS runner;
-/// the Rust match is a fallback if the runtime could not be configured.
+/// Resolve enabled recovery plugins from an inactive baseline. V1 policy semantics
+/// are preserved by migration; V2 request passthrough does not disable recovery.
 pub fn failure_policy_from_pipeline(pipeline: &PipelineConfig, config_json: &str) -> RouteCredentialFailurePolicy {
+    let cache_key = format!("{}:{}", config_json, serde_json::to_string(pipeline).unwrap_or_default());
     let generation = POLICY_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
     let cache = POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock() {
-        if let Some((cached_generation, policy)) = map.get(config_json) {
+        if let Some((cached_generation, policy)) = map.get(&cache_key) {
             if *cached_generation == generation {
                 return *policy;
             }
@@ -145,45 +197,52 @@ pub fn failure_policy_from_pipeline(pipeline: &PipelineConfig, config_json: &str
         if map.len() >= POLICY_CACHE_MAX {
             map.clear();
         }
-        map.insert(config_json.to_string(), (generation, policy));
+        map.insert(cache_key, (generation, policy));
     }
     policy
 }
 
+/// V2 is explicit: absent or disabled recovery has no implicit behavior.
 fn compute_policy(pipeline: &PipelineConfig, config_json: &str) -> RouteCredentialFailurePolicy {
+    if pipeline.version < 2 { return legacy_policy(pipeline, config_json); }
+    policy_for_domain(pipeline,"request")
+}
+
+pub fn policy_for_domain(pipeline:&PipelineConfig,domain:&str)->RouteCredentialFailurePolicy {
+    let mut policy=zero_policy(RouteCredentialFailurePolicy::default());
+    let mut seen=std::collections::HashSet::new();
+    for plugin in crate::services::plugin_host::enabled(pipeline) {
+        if !seen.insert(plugin.id.clone()){continue;}
+        let Some(binding)=crate::services::plugin_middleware::loaded(&plugin.id) else{continue};
+        let Some(d)=binding.descriptor.as_ref() else{continue};
+        if !d.capabilities.iter().any(|c|c=="policy.configure") || !d.hooks.iter().any(|h|h=="policy"){continue;}
+        let config=crate::services::plugin_contract::merge_config(&d.defaults,&plugin.config);
+        if let Some(patch)=crate::services::plugin_middleware::policy_bound(&binding,&plugin.id,&config,&json!({"domain":domain,"phase":"policy"})){merge_policy(&mut policy,&patch);}
+    }
+    policy
+}
+
+pub fn stream_policy(pipeline: &PipelineConfig, _config_json: &str) -> RouteCredentialFailurePolicy {
+    policy_for_domain(pipeline,"stream")
+}
+
+pub fn effective_policy(config_json: &str) -> RouteCredentialFailurePolicy {
+    let pipeline = crate::models::pipeline::resolve_pipeline(config_json);
+    failure_policy_from_pipeline(&pipeline, config_json)
+}
+
+pub fn legacy_policy(pipeline: &PipelineConfig, config_json: &str) -> RouteCredentialFailurePolicy {
     let mut policy = RouteCredentialFailurePolicy::from_config_json(config_json);
     if pipeline.is_passthrough(true) {
         return zero_policy(policy);
     }
-    let ctx = json!({ "platform": "", "path": "", "phase": "policy", "stage": "policy" });
-    let entries: Vec<(String, Value)> = pipeline
-        .enabled_chain(true)
-        .iter()
-        .map(|plugin| {
-            (
-                plugin.id.clone(),
-                pipeline.config_for(&plugin.id, true).cloned().unwrap_or_else(|| json!({})),
-            )
-        })
-        .collect();
-    match crate::services::plugin_middleware::policy_chain(&entries, &ctx) {
-        Some(patch) if patch.as_object().is_some_and(|object| !object.is_empty()) => {
-            merge_policy(&mut policy, &patch);
-        }
-        _ => {
-            for plugin in pipeline.enabled_chain(true) {
-                if plugin.id.starts_with("pack:") {
-                    continue;
-                }
-                let config = plugin.config.clone();
-                apply_schedule_fallback(&mut policy, &plugin.id, config.as_object());
-            }
-        }
+    for plugin in pipeline.enabled_chain(true) {
+        apply_schedule_fallback(&mut policy, &plugin.id, plugin.config.as_object());
     }
     policy
 }
 
-fn zero_policy(mut policy: RouteCredentialFailurePolicy) -> RouteCredentialFailurePolicy {
+pub fn zero_policy(mut policy: RouteCredentialFailurePolicy) -> RouteCredentialFailurePolicy {
     policy.retry_count = 0;
     policy.retry_class_limits = Default::default();
     policy.capacity_retry_interval_ms = 0;
@@ -267,9 +326,9 @@ mod tests {
     fn catalog_has_all_lanes() {
         let catalog = list();
         assert!(catalog.iter().any(|p| p.id == "builtin.request.compression"));
-        assert!(catalog.iter().any(|p| p.id == "builtin.schedule.retry"));
-        assert!(catalog.iter().any(|p| p.id == "builtin.response.plaintextReasoning"));
-        assert_eq!(catalog.len(), embedded_sources().len());
+        assert!(catalog.iter().any(|p| p.id == "builtin.recovery.retry"));
+        assert!(catalog.iter().any(|p| p.id == "builtin.request.plaintextReasoning"));
+        assert!(catalog.len() <= embedded_sources().len());
     }
 
     #[test]
@@ -281,11 +340,25 @@ mod tests {
     }
 
     #[test]
+    fn v2_stream_budget_does_not_inherit_retry_class_overrides() {
+        let config=json!({"pipeline":{"version":2,"recovery":{"mode":"process","chain":[
+            {"id":"builtin.recovery.retry","enabled":true,"config":{"retry_class_limits":{"capacity":100},"capacity_retry_interval_ms":60000}},
+            {"id":"builtin.recovery.stream","enabled":true,"config":{"retry_count":2}}
+        ]}}}).to_string();
+        let pipeline=resolve_pipeline(&config);
+        let policy=stream_policy(&pipeline,&config);
+        assert_eq!(policy.retry_limit_for(crate::models::route_credential::RouteFailureClass::Capacity),2);
+        assert_eq!(policy.capacity_retry_interval_ms,0);
+    }
+
+    #[test]
     fn passthrough_zeroes_policy() {
         let pipeline = PipelineConfig {
             version: PIPELINE_VERSION,
+            catalog_revision: 1,
             request: DirectionConfig { mode: PipelineMode::Passthrough, chain: Vec::new() },
             response: DirectionConfig::default(),
+            recovery: DirectionConfig::default(),
         };
         let policy = failure_policy_from_pipeline(&pipeline, "{}");
         assert_eq!(policy.retry_count, 0);

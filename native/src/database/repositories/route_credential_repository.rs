@@ -1,7 +1,7 @@
 use crate::database::repositories::route_credential_model_repository::RouteCredentialModelRepository;
 use crate::error::AppError;
 use crate::models::route_credential::{
-    RecoveryCandidate, ReorderRouteCredentialInput, RouteCredential, RouteCredentialFailurePolicy,
+    RecoveryCandidate, ReorderRouteCredentialInput, RouteCredential,
     RouteCredentialFilterOption, RouteCredentialPage, RouteCredentialPageRequest,
     RouteCredentialPoolScope, RouteProxyAccountSummary, UpdateRouteCredentialInput,
     DEFAULT_ROUTE_CREDENTIAL_ERROR_STATUS_ENABLED, DEFAULT_ROUTE_CREDENTIAL_MAX_CONCURRENCY,
@@ -1826,6 +1826,13 @@ impl RouteCredentialRepository {
         response_body: Option<&[u8]>,
         scope: FailureScope<'_>,
     ) -> Result<RetryState, AppError> {
+        Self::record_transient_failure_with_status(pool,id,kind,None,message,response_body,scope).await
+    }
+
+    pub async fn record_transient_failure_with_status(
+        pool: &SqlitePool, id: &str, kind: &str, status: Option<u16>, message: &str,
+        response_body: Option<&[u8]>, scope: FailureScope<'_>,
+    ) -> Result<RetryState, AppError> {
         let mut tx = pool.begin().await.map_err(|err| AppError::Database {
             code: "database.route_credential_retry_tx",
             message: "Could not start route credential retry update".to_string(),
@@ -1852,7 +1859,10 @@ impl RouteCredentialRepository {
                 recoverable: true,
             });
         };
-        let policy = RouteCredentialFailurePolicy::from_config_json(&config_json);
+        let (policy,record)=crate::services::failure_rules::health_plan(&config_json,status,response_body,message);
+        if !record && crate::models::pipeline::has_explicit_pipeline(&config_json) {
+            return Ok(RetryState {failure_count:current,next_retry_at:None,cooldown_until:None});
+        }
         let cooldown_seconds = policy.cooldown_enabled.then_some(policy.cooldown_seconds);
 
         // A model-scoped failure charges the model row first, then asks whether
@@ -1870,7 +1880,7 @@ impl RouteCredentialRepository {
                     message,
                     response_body,
                     cooldown_seconds,
-                    None,
+                    status,
                     i64::from(policy.semantic_error_threshold),
                     policy.error_status_enabled,
                 )
@@ -2183,7 +2193,7 @@ impl RouteCredentialRepository {
         message: &str,
         response_body: Option<&[u8]>,
     ) -> Result<(), AppError> {
-        let error_status_enabled = Self::error_status_enabled(pool, id).await?;
+        let error_status_enabled = Self::error_status_enabled(pool, id, response_status, message, response_body).await?;
         Self::record_semantic_failure_internal(
             pool,
             id,
@@ -2204,6 +2214,10 @@ impl RouteCredentialRepository {
         message: &str,
         response_body: Option<&[u8]>,
     ) -> Result<(), AppError> {
+        let config: Option<String> = sqlx::query_scalar("SELECT config_json FROM route_credentials WHERE id = ?").bind(id).fetch_optional(pool).await
+            .map_err(|e|database_error("database.route_credential_failure_policy_read","Could not read failure policy",e))?;
+        let explicit_v2 = config.as_deref().and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok()).and_then(|c|c.get("pipeline").and_then(|p|p.get("version")).and_then(serde_json::Value::as_u64)).is_some_and(|v|v==2);
+        let enabled = !explicit_v2 || Self::error_status_enabled(pool,id,response_status,message,response_body).await?;
         Self::record_semantic_failure_internal(
             pool,
             id,
@@ -2211,7 +2225,7 @@ impl RouteCredentialRepository {
             1,
             message,
             response_body,
-            true,
+            enabled,
         )
         .await
     }
@@ -2289,7 +2303,7 @@ impl RouteCredentialRepository {
     /// Whether this account may be flipped to `error` by a failure streak.
     /// Missing rows return the default so callers keep their existing
     /// not-found handling instead of failing here.
-    async fn error_status_enabled(pool: &SqlitePool, id: &str) -> Result<bool, AppError> {
+    async fn error_status_enabled(pool: &SqlitePool, id: &str, status: Option<u16>, message: &str, body: Option<&[u8]>) -> Result<bool, AppError> {
         let config_json = sqlx::query_scalar::<_, String>(
             "SELECT config_json FROM route_credentials WHERE id = ?",
         )
@@ -2305,7 +2319,7 @@ impl RouteCredentialRepository {
         })?;
         Ok(config_json
             .map(|config| {
-                RouteCredentialFailurePolicy::from_config_json(&config).error_status_enabled
+                crate::services::failure_rules::health_policy(&config,status,body,message).error_status_enabled
             })
             .unwrap_or(DEFAULT_ROUTE_CREDENTIAL_ERROR_STATUS_ENABLED))
     }

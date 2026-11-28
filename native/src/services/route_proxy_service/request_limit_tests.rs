@@ -302,40 +302,19 @@ async fn proactive_trim_sends_only_the_newest_images_when_the_switch_is_on() {
     assert_eq!(config["image_limit_compat"], "trim_old_images");
 }
 
-/// 开关没开时撞上图片上限：自动打开开关，裁掉较旧图片，向同一个账号再问一次。
+/// 未添加图片兼容时不修改历史，也不偷偷启用插件。
 #[tokio::test]
-async fn image_limit_self_heal_enables_the_switch_and_retries_trimmed() {
-    let rec = recorder(vec![
-        (StatusCode::BAD_REQUEST, TOO_MANY_IMAGES.to_string()),
-        (StatusCode::OK, HEALTHY.to_string()),
-    ])
-    .await;
+async fn disabled_image_plugin_does_not_rewrite_or_enable_itself() {
+    let rec = recorder(vec![(StatusCode::BAD_REQUEST, TOO_MANY_IMAGES.to_string()), (StatusCode::OK, HEALTHY.to_string())]).await;
     let (pool, state, ids) = setup(&[rec.url.clone()], &[Value::Null]).await;
-
     let (status, body) = request_with_body(state, false, image_body(13, false)).await;
-
-    assert_eq!(status, StatusCode::OK, "裁剪后应当成功: {body}");
-    assert!(body.contains("healthy"), "{body}");
-    {
-        let sent = rec.bodies.lock().unwrap();
-        assert_eq!(sent.len(), 2, "第一次被拒，裁剪后重试一次");
-        assert_eq!(count_images(&sent[0]), 13, "第一次原样发出");
-        assert_eq!(count_images(&sent[1]), 10, "重试时只发最新的 10 张");
-    }
-    // 自愈写入是后台任务，等它落库。
-    let mut config = Value::Null;
-    for _ in 0..100 {
-        let account = RouteCredentialRepository::get(&pool, &ids[0])
-            .await
-            .unwrap();
-        config = serde_json::from_str(&account.config_json).unwrap();
-        if config["image_limit_compat"] == "trim_old_images" {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        config["image_limit_compat"], "trim_old_images",
-        "自愈后开关应当被持久化，后续请求不再撞上限"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("maximum number of images"));
+    let sent = rec.bodies.lock().unwrap().clone();
+    assert_eq!(sent.len(),1);
+    assert_eq!(count_images(&sent[0]),13);
+    let account = RouteCredentialRepository::get(&pool,&ids[0]).await.unwrap();
+    let config: Value = serde_json::from_str(&account.config_json).unwrap();
+    assert_ne!(config["image_limit_compat"], "trim_old_images");
+    assert_untouched(&pool,&ids[0]).await;
 }

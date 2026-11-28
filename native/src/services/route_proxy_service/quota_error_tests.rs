@@ -462,3 +462,19 @@ async fn insufficient_balance_during_continuation_skips_the_exhausted_account() 
         );
     }
 }
+
+#[tokio::test]
+async fn v2_removed_failover_does_not_switch_on_opening_quota_error() {
+    let quota=upstream(StatusCode::OK,vec![format!("data: {QUOTA_ERROR}\n\n")],true).await;
+    let good=upstream(StatusCode::OK,vec![format!("data: {HEALTHY}\n\n")],true).await;
+    let (pool,state,ids)=setup(&[&quota,&good],PoolModelMode::Aggregate).await;
+    for id in &ids {
+        let account=RouteCredentialRepository::get(&pool,id).await.unwrap();
+        let mut config:Value=serde_json::from_str(&account.config_json).unwrap();
+        config["pipeline"]=json!({"version":2,"request":{"mode":"process","chain":[]},"response":{"mode":"process","chain":[]},"recovery":{"mode":"process","chain":[]}});
+        sqlx::query("UPDATE route_credentials SET config_json = ? WHERE id = ?").bind(config.to_string()).bind(id).execute(&pool).await.unwrap();
+    }
+    let (_,body)=request(state,true,"gpt-6-astra").await;
+    assert_eq!(quota.calls.load(Ordering::SeqCst),1,"{body}");
+    assert_eq!(good.calls.load(Ordering::SeqCst),0,"{body}");
+}

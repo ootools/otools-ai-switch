@@ -288,6 +288,9 @@ impl RouteCredentialService {
         {
             config[RELAY_BALANCE_CONFIG_KEY] = serde_json::to_value(relay_balance)?;
         }
+        let mut pipeline = crate::models::pipeline::resolve_pipeline(&config.to_string());
+        pipeline.recovery.chain = crate::models::pipeline::recovery_plugins(RouteCredentialFailurePolicy::default(), false);
+        config["pipeline"] = serde_json::to_value(pipeline)?;
         let config_json = config.to_string();
         let preview_json = input.preview_json.unwrap_or_else(|| {
             RoutePreviewService::generate(&platform, "api", &secret_payload_json, &config_json)
@@ -1001,6 +1004,7 @@ fn copied_api_payload(
     for key in [
         "headers",
         "failure_policy",
+        "pipeline",
         "recovery",
         crate::services::account_proxy::PROXY_URL_CONFIG_KEY,
         RELAY_BALANCE_CONFIG_KEY,
@@ -1191,6 +1195,11 @@ fn validate_failure_policy_config(config_json: &str) -> Result<(), AppError> {
     let Ok(config) = serde_json::from_str::<Value>(config_json) else {
         return Ok(());
     };
+    if config.get("pipeline").and_then(|p| p.get("version")).and_then(Value::as_u64) == Some(2) {
+        let pipeline: crate::models::pipeline::PipelineConfig = serde_json::from_value(config["pipeline"].clone())
+            .map_err(|e| AppError::Validation {code:"validation.pipeline",message:"中间件配置无效".into(),details:Some(e.to_string()),recoverable:true})?;
+        crate::models::pipeline::validate_pipeline(&pipeline)?;
+    }
     if config.get("failure_policy").is_none() {
         return Ok(());
     }

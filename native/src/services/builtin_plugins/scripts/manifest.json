@@ -1,21 +1,495 @@
 [
-  { "id": "builtin.request.compression", "name": "请求压缩", "description": "按账号策略对出站请求体做 Brotli 压缩。", "lane": "request", "kind": "transform", "stage": "wire", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
-  { "id": "builtin.request.contentRejection", "name": "内容过滤兼容", "description": "裁剪旧工具输出以避开上游内容审核。", "lane": "request", "kind": "transform", "stage": "retryRecovery", "config_fields": [] },
-  { "id": "builtin.request.imageLimit", "name": "图片超限兼容", "description": "裁剪旧图片以避开上游图片数量限制。", "lane": "request", "kind": "transform", "stage": "imageLimit", "config_fields": [] },
-  { "id": "builtin.request.forceReasoning", "name": "强制回传推理", "description": "要求上游回传推理内容。", "lane": "request", "kind": "transform", "stage": "forceReasoning", "config_fields": [] },
-  { "id": "builtin.request.inlineRemoteImages", "name": "内联远程图片", "description": "把远程图片内联后发送。", "lane": "request", "kind": "transform", "stage": "inlineRemote", "config_fields": [] },
-  { "id": "builtin.request.turnReminder", "name": "每轮纠偏提醒", "description": "每轮请求追加一段自定义提醒。", "lane": "request", "kind": "transform", "stage": "postBridgeReminder", "config_fields": [{ "key": "text", "label": "提醒内容", "kind": "textarea" }] },
-  { "id": "builtin.request.customToolCompat", "name": "自定义工具兼容", "description": "为 Responses 客户端补齐自定义工具字段。", "lane": "request", "kind": "transform", "stage": "preBridge", "config_fields": [] },
-  { "id": "builtin.schedule.retry", "name": "重试策略", "description": "失败后的重试次数、间隔与按错误类型的上限。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "retry_count", "label": "重试次数", "kind": "number" }, { "key": "retry_interval_ms", "label": "重试间隔(ms)", "kind": "number" }, { "key": "max_retry_elapsed_seconds", "label": "总时长上限(秒)", "kind": "number" }] },
-  { "id": "builtin.schedule.semanticThreshold", "name": "语义失败阈值", "description": "判定语义失败的阈值。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "value", "label": "阈值", "kind": "number" }] },
-  { "id": "builtin.schedule.cooldown", "name": "失败冷却", "description": "失败后临时冷却该账号。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "seconds", "label": "冷却秒数", "kind": "number" }] },
-  { "id": "builtin.schedule.errorStatus", "name": "错误状态标记", "description": "把失败写回账号状态标签。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
-  { "id": "builtin.schedule.streamPrelude", "name": "建流等待", "description": "等待上游建流帧的时长。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "ms", "label": "等待(ms)", "kind": "number" }] },
-  { "id": "builtin.schedule.streamSalvage", "name": "流内失败挽救", "description": "流内失败时续写完成本轮。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
-  { "id": "builtin.schedule.streamContinue", "name": "断流续写", "description": "断流后继续请求补全答案。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [{ "key": "max", "label": "最多轮次", "kind": "number" }] },
-  { "id": "builtin.schedule.failover", "name": "故障转移", "description": "失败后切换到池内其它账号。", "lane": "request", "kind": "schedule", "stage": "policy", "config_fields": [] },
-  { "id": "builtin.response.plaintextReasoning", "name": "明文推理兼容", "description": "把上游推理字段规范化为明文。", "lane": "response", "kind": "transform", "stage": "postBridgePlaintext", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
-  { "id": "builtin.response.crossResourceStrip", "name": "跨资源状态剥离", "description": "剥离上游返回的跨资源状态字段。", "lane": "response", "kind": "transform", "stage": "postBridgeCross", "config_fields": [{ "key": "mode", "label": "模式", "kind": "select" }] },
-  { "id": "builtin.response.encryptedContentCleanup", "name": "推理内容清理", "description": "清理响应中的加密推理内容。", "lane": "response", "kind": "transform", "stage": "postBridgeEncrypted", "config_fields": [{ "key": "aggressive_strip", "label": "激进剥离", "kind": "bool" }] }
+  {
+    "id": "builtin.request.compression",
+    "name": "请求体压缩",
+    "description": "压缩整个 HTTP 请求体，减少上传流量；使用 Brotli，不压缩或降低图片画质。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "wire",
+    "config_fields": [
+      {
+        "key": "mode",
+        "label": "模式",
+        "kind": "select"
+      }
+    ],
+    "defaults": {
+      "mode": "auto"
+    },
+    "limitations": "适用场景：上游明确支持 Brotli，请求历史或工具结果较大。\n启用后：发送前压缩请求体；不会缩短模型上下文，也不能解决 context_length_exceeded。自动模式只对已验证服务生效。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log",
+      "codec.brotli"
+    ]
+  },
+  {
+    "id": "builtin.request.requestHeaders",
+    "name": "请求头设置",
+    "description": "上游要求特定 User-Agent 或自定义请求头时，统一设置、补充或移除请求头。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "perAttempt",
+    "api_version": 1,
+    "hooks": [
+      "onRequestHeaders"
+    ],
+    "capabilities": [
+      "request.transform"
+    ],
+    "defaults": {
+      "user_agent": "",
+      "headers": []
+    },
+    "config_fields": [
+      {
+        "key": "user_agent",
+        "label": "User-Agent",
+        "kind": "userAgent"
+      },
+      {
+        "key": "headers",
+        "label": "自定义请求头",
+        "kind": "headers"
+      }
+    ],
+    "limitations": "旧版高级设置中的 User-Agent 和导入请求头会迁移到这里。\n“补充”只在头不存在时写入，“覆盖”和“移除”在默认客户端身份构建后执行。Authorization、x-api-key 等认证头及连接/编码头由宿主管理，不能在最终阶段覆盖。只作用于经过 AI Switch 代理的请求。"
+  },
+  {
+    "id": "builtin.request.imageProcessing",
+    "name": "图片处理",
+    "description": "图片链接上游无法读取，或出现 Exceeded maximum number of images 时，在发送前处理远程图片和历史图片数量。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "inlineRemote",
+    "stages": [
+      "imageLimit"
+    ],
+    "api_version": 1,
+    "hooks": [
+      "onRequest",
+      "onFailure"
+    ],
+    "capabilities": [
+      "request.transform",
+      "network.image",
+      "diagnostics.log"
+    ],
+    "defaults": {
+      "inline_remote": true,
+      "trim_old_images": false,
+      "max_images": 10
+    },
+    "config_fields": [
+      {
+        "key": "inline_remote",
+        "label": "下载远程图片并内嵌",
+        "kind": "bool"
+      },
+      {
+        "key": "trim_old_images",
+        "label": "限制历史图片数量",
+        "kind": "bool"
+      },
+      {
+        "key": "max_images",
+        "label": "最多保留最近图片数",
+        "kind": "number",
+        "min": 1,
+        "max": 1000
+      }
+    ],
+    "limitations": "下载并内嵌：上游无法访问图片 URL 时，由 AI Switch 下载后以数据发送；链接失效或本机也无法访问时仍需处理原链接。\n限制数量：应对 Exceeded maximum number of images / too many images，保留最近的图片，较早图片不再发送，默认关闭。两个选项独立生效。\n此插件不改变图片分辨率或画质；“请求体压缩”是另一项 HTTP 传输优化。"
+  },
+  {
+    "id": "builtin.request.contentRejection",
+    "name": "历史工具输出裁剪",
+    "description": "遇到 sensitive_words_detected 或 content-blocked，且问题来自旧工具输出时，裁剪较早的工具结果后尝试重发。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "retryRecovery",
+    "config_fields": [],
+    "defaults": {},
+    "limitations": "常见报错：error.code 为 sensitive_words_detected 或 content-blocked。\n启用后：在符合兼容恢复条件时裁剪旧工具输出，再尝试请求。\n适用边界：只可能缓解旧工具输出引发的拒绝；不会消除上游内容限制，也不保证当前输入被接受。被裁剪的历史细节不再发给上游。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.forceReasoning",
+    "name": "推理字段补齐",
+    "description": "遇到 reasoning_content_missing、错误码 11155，或提示 reasoning_content must be passed back 时，补齐上游要求的推理字段。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "forceReasoning",
+    "config_fields": [],
+    "defaults": {},
+    "limitations": "常见报错：The `reasoning_content` in the thinking mode must be passed back to the API。部分网关仅返回 code: 11155。\n启用后：为相关 Chat 请求的历史助手消息补齐推理字段，缓解思考模式因字段缺失而拒绝请求的问题。\n适用边界：不能找回未保存的原始推理，也不处理 Azure 跨资源 ID 或加密内容校验失败；这些情况使用对应清理插件。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.turnReminder",
+    "name": "每轮纠偏提醒",
+    "description": "每轮请求追加一段自定义提醒。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "postBridgeReminder",
+    "config_fields": [
+      {
+        "key": "text",
+        "label": "提醒内容",
+        "kind": "textarea"
+      }
+    ],
+    "defaults": {
+      "text": ""
+    },
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.customToolCompat",
+    "name": "自定义工具兼容",
+    "description": "上游不支持 Responses 的 custom 工具类型、导致工具请求被拒绝时，将自定义工具转换成 function 工具再发送。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "preBridge",
+    "config_fields": [],
+    "defaults": {},
+    "limitations": "适用场景：报错指出 tools 中的 custom 类型不受支持，而该上游支持 function 工具。\n启用后：改写工具声明及相关调用格式，保留工具名称和原始输入。\n适用边界：只处理自定义工具格式差异，不会为不支持任何工具调用的模型增加工具能力。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.plaintextReasoning",
+    "name": "推理历史格式兼容",
+    "description": "上游拒绝历史 reasoning.content / reasoning_text 格式时，将明文推理整理为 summary_text 后重发历史。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "postBridgePlaintext",
+    "config_fields": [
+      {
+        "key": "mode",
+        "label": "模式",
+        "kind": "select"
+      }
+    ],
+    "defaults": {
+      "mode": "auto"
+    },
+    "limitations": "启用后：发送 Responses 请求前，把可识别的明文推理 content 转为 summary，保留已有摘要。\n适用边界：仅用于历史推理字段格式兼容；invalid_encrypted_content 使用“请求加密内容清理”，different Azure OpenAI resource 使用“跨服务历史状态清理”。自动模式只对已验证服务生效。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.crossResourceStrip",
+    "name": "跨服务历史状态清理",
+    "description": "解决 Azure 的 “The requested item was created under a different Azure OpenAI resource” 报错，避免换资源后继续携带旧资源的历史状态。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "postBridgeCross",
+    "config_fields": [
+      {
+        "key": "mode",
+        "label": "模式",
+        "kind": "select"
+      }
+    ],
+    "defaults": {
+      "mode": "auto"
+    },
+    "limitations": "常见报错：\nThe requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it.\n也可能写作 created by a different Azure OpenAI resource。\n启用后：发出下一轮请求前移除 previous_response_id、历史条目的服务端 id 和 encrypted* 状态，减少中转轮换 Azure 资源时因旧引用被拒绝的问题。\n如何开启：自动模式仅对已验证服务生效；其他遇到该报错的服务需将模式设为“开启”。\n适用边界：只有 ID 引用、没有完整历史正文时，无法找回原内容；清理也可能丢失跨轮推理状态。如果只报 encrypted_content 无效，优先使用“请求加密内容清理”。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.request.encryptedContentCleanup",
+    "name": "请求加密内容清理",
+    "description": "处理 invalid_encrypted_content，以及 encrypted content could not be verified / decrypted 报错；上游不接受历史加密推理时，可移除请求中的密文。",
+    "lane": "request",
+    "kind": "transform",
+    "stage": "postBridgeEncrypted",
+    "config_fields": [
+      {
+        "key": "aggressive_strip",
+        "label": "移除全部加密内容",
+        "kind": "bool"
+      }
+    ],
+    "defaults": {
+      "aggressive_strip": false
+    },
+    "limitations": "常见报错：\ninvalid_encrypted_content\nThe encrypted content could not be verified\nencrypted content could not be decrypted（也可能写作 cannot be verified / cannot be decrypted）\n启用后：发送下一轮 Responses 请求前清理历史 reasoning 项的 encrypted_content，避免重复提交无效密文。\n如何选择：默认只清理格式无效的密文。如果格式看起来合法但 Azure 或其他上游仍无法验证/解密，或明确提示 encrypted_content 不受支持，需开启“移除全部加密内容”。这会直接去掉该字段，不依赖报错文字匹配。\nAzure 另一类报错：若提示 The requested item was created under a different Azure OpenAI resource，应使用“跨服务历史状态清理”；仅去掉密文不足以清理旧资源的 ID 引用。\n适用边界：只修改出站请求，不解密，也不删除当前响应；全部移除可能丢失推理连续性，且无法补回仅由服务端 ID 引用的历史内容。",
+    "api_version": 1,
+    "hooks": [
+      "onRequest",
+      "onFailure"
+    ],
+    "capabilities": [
+      "request.transform",
+      "diagnostics.log"
+    ]
+  },
+  {
+    "id": "builtin.recovery.retry",
+    "name": "失败重试",
+    "description": "遇到 HTTP 408 / 429 / 5xx、no_capacity、rate_limit_exceeded 或 high demand 等临时错误时，在正文输出前自动重试，减少手动重发。",
+    "lane": "recovery",
+    "kind": "schedule",
+    "stage": "policy",
+    "defaults": {
+      "retry_count": 2,
+      "retry_interval_ms": 200,
+      "max_retry_elapsed_seconds": 0,
+      "capacity_retry_interval_ms": 0,
+      "failover_enabled": true,
+      "stream_prelude_wait_ms": 60000
+    },
+    "config_fields": [
+      {
+        "key": "retry_count",
+        "label": "额外重试次数",
+        "kind": "number",
+        "default": 2,
+        "min": 0,
+        "max": 10
+      },
+      {
+        "key": "retry_interval_ms",
+        "label": "重试间隔（毫秒）",
+        "kind": "number",
+        "default": 200,
+        "min": 0,
+        "max": 60000
+      },
+      {
+        "key": "max_retry_elapsed_seconds",
+        "label": "总时限（秒，0 为不限）",
+        "kind": "number",
+        "default": 0,
+        "min": 0,
+        "max": 86400
+      },
+      {
+        "key": "capacity_retry_interval_ms",
+        "label": "容量不足间隔（毫秒，0 沿用普通间隔）",
+        "kind": "number",
+        "default": 0,
+        "min": 0,
+        "max": 60000
+      },
+      {
+        "key": "failover_enabled",
+        "label": "失败后允许换账号",
+        "kind": "bool",
+        "default": true
+      },
+      {
+        "key": "stream_prelude_wait_ms",
+        "label": "首段正文前等待（毫秒，0 不等待）",
+        "kind": "number",
+        "default": 60000,
+        "min": 0,
+        "max": 600000
+      }
+    ],
+    "limitations": "常见报错：HTTP 408、429、500–599；no_capacity、overloaded、rate_limit_exceeded、too many requests、high demand；以及连接超时或读取失败。即使 HTTP 返回 200，响应体里的结构化错误也可匹配。\n启用后：按下面的规则、次数和间隔重试；允许换号时，耗尽本账号的重试次数后可尝试池内其他账号。\n适用边界：只处理正文尚未输出的失败。已经输出一部分才出现 stream disconnected before completion，应使用“流式恢复”。401/403、明确额度耗尽、权限不足和确定的请求错误不能靠原样重试修复。\n“首段正文前等待”暂存无正文的建流帧，为早期错误保留重试机会，不是网络连接超时。",
+    "api_version": 1,
+    "policy_domain": "retry",
+    "rule_editor": "retry",
+    "class_limits_editor": true,
+    "hooks": [
+      "policy",
+      "onFailure"
+    ],
+    "capabilities": [
+      "policy.configure",
+      "diagnostics.log",
+      "retry.request"
+    ]
+  },
+  {
+    "id": "builtin.recovery.stream",
+    "name": "流式恢复",
+    "description": "针对 stream disconnected before completion / stream closed before response.completed：回答输出到一半中断时，自动续写并接回已有回答，减少手动重试。",
+    "lane": "recovery",
+    "kind": "schedule",
+    "stage": "policy",
+    "defaults": {
+      "stream_continue_enabled": true,
+      "stream_continue_max": 2,
+      "stream_salvage_enabled": true,
+      "retry_count": 2,
+      "retry_interval_ms": 500,
+      "max_retry_elapsed_seconds": 60,
+      "failover_enabled": true
+    },
+    "config_fields": [
+      {
+        "key": "stream_continue_enabled",
+        "label": "连接提前断开时续接",
+        "kind": "bool",
+        "default": true
+      },
+      {
+        "key": "stream_salvage_enabled",
+        "label": "流内明确报错时续接",
+        "kind": "bool",
+        "default": true
+      },
+      {
+        "key": "stream_continue_max",
+        "label": "断流续接最多轮数",
+        "kind": "number",
+        "default": 2,
+        "min": 0,
+        "max": 10
+      },
+      {
+        "key": "retry_count",
+        "label": "流内错误续接最多轮数",
+        "kind": "number",
+        "default": 2,
+        "min": 0,
+        "max": 10
+      },
+      {
+        "key": "retry_interval_ms",
+        "label": "续接间隔（毫秒）",
+        "kind": "number",
+        "default": 500,
+        "min": 0,
+        "max": 60000
+      },
+      {
+        "key": "max_retry_elapsed_seconds",
+        "label": "恢复总时限（秒，0 为不限）",
+        "kind": "number",
+        "default": 60,
+        "min": 0,
+        "max": 86400
+      },
+      {
+        "key": "failover_enabled",
+        "label": "续接允许换账号",
+        "kind": "bool",
+        "default": true
+      }
+    ],
+    "limitations": "常见报错：\nstream disconnected before completion\nstream disconnected before completion: stream closed before response.completed\n也适用于已输出正文后，流中出现 response.failed / error，且原因是 no_capacity、rate_limit_exceeded 等临时失败。\n启用后：携带已经输出的内容重新请求上游续写，并接回同一条响应；恢复成功时，用户可继续收到后文，无需手动重发。\n如何开启：“连接提前断开时续接”处理没有正常结束标记的断流；“流内明确报错时续接”处理匹配下方规则的错误帧。尚未输出正文的失败使用“失败重试”。\n适用边界：只恢复 AI Switch 与上游之间的中断；客户端已经断开、上游持续不可用、历史无法重建或加密推理无法续接时不能保证恢复。每轮续写都是新的上游请求，可能单独计费，拼接内容也可能不完全连贯。",
+    "api_version": 1,
+    "policy_domain": "stream",
+    "rule_editor": "stream",
+    "class_limits_editor": true,
+    "hooks": [
+      "policy",
+      "onFailure",
+      "onStreamEvent"
+    ],
+    "capabilities": [
+      "policy.configure",
+      "diagnostics.log",
+      "stream.continue",
+      "retry.request"
+    ]
+  },
+  {
+    "id": "builtin.recovery.accountHealth",
+    "name": "账号故障处理",
+    "description": "同一账号反复返回错误、后续请求仍不断选中它时，记录故障并按设置冷却或标记异常，减少重复撞到故障账号。",
+    "lane": "recovery",
+    "kind": "schedule",
+    "stage": "policy",
+    "defaults": {
+      "cooldown_enabled": false,
+      "cooldown_seconds": 10,
+      "semantic_error_threshold": 10,
+      "error_status_enabled": true
+    },
+    "config_fields": [
+      {
+        "key": "cooldown_enabled",
+        "label": "启用短暂冷却",
+        "kind": "bool",
+        "default": false
+      },
+      {
+        "key": "cooldown_seconds",
+        "label": "冷却秒数",
+        "kind": "number",
+        "default": 10,
+        "min": 0,
+        "max": 86400
+      },
+      {
+        "key": "semantic_error_threshold",
+        "label": "连续失败阈值",
+        "kind": "number",
+        "default": 10,
+        "min": 0,
+        "max": 1000
+      },
+      {
+        "key": "error_status_enabled",
+        "label": "标记账号异常",
+        "kind": "bool",
+        "default": true
+      }
+    ],
+    "limitations": "常见场景：账号持续报错、短时间内反复失败，或上游明确报告额度耗尽、权限不足。\n启用后：按下方匹配规则及开关处理账号/模型状态；短暂冷却期间暂时避开故障对象，满足条件时标记异常。它不负责补全当前回答，重发和续接分别使用“失败重试”“流式恢复”。\n阈值含义：相同语义错误的连续计数，不是总请求失败数；容量不足属于上游繁忙，不惩罚账号。明确额度/权限错误可直接标记，凭据撤销由认证机制处理。",
+    "api_version": 1,
+    "policy_domain": "health",
+    "rule_editor": "health",
+    "class_limits_editor": false,
+    "hooks": [
+      "policy",
+      "onFailure"
+    ],
+    "capabilities": [
+      "policy.configure",
+      "diagnostics.log",
+      "account.read",
+      "account.write"
+    ]
+  }
 ]
-

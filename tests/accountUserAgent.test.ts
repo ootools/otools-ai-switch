@@ -49,3 +49,13 @@ describe("accountUserAgent", () => {
     expect(CLAUDE_CLI_USER_AGENT).toMatch(/^claude-cli\/\d+\.\d+\.\d+ \(external, cli\)$/);
   });
 });
+
+
+it("reads migrated User-Agent and respects removed/disabled header middleware",()=>{
+  const config={headers:{"User-Agent":"old"},pipeline:{version:2,catalog_revision:1,request:{mode:"process",chain:[{id:"builtin.request.requestHeaders",enabled:true,config:{user_agent:"NewBot/1"}}]}}};
+  expect(readUserAgentFromConfig(config)).toBe("NewBot/1");
+  config.pipeline.request.chain[0].enabled=false;
+  expect(readUserAgentFromConfig(config)).toBe("");
+  config.pipeline.request.chain=[];
+  expect(readUserAgentFromConfig(config)).toBe("");
+});

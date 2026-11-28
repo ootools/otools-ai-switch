@@ -274,7 +274,7 @@ const DEFAULT_MAX_CONCURRENCY = 5;
 type PlatformKey = PlatformId;
 type CreateMode = "api" | "official" | "external";
 type AccountView = "in_pool" | "out_of_pool" | "archived";
-type CreateTab = "basic" | "advanced";
+type CreateTab = "basic" | "advanced" | "requestProcessing";
 type EditTab = "basic" | "advanced" | "proxy" | "requestProcessing" | "other";
 type RowAction = {
   key: string;
@@ -445,6 +445,7 @@ const defaultRouteCredentialFailurePolicy: RouteCredentialFailurePolicy = {
 
 const createTabs: Array<FormTab<CreateTab>> = [
   { value: "basic", label: "基础" },
+  { value: "requestProcessing", label: "请求处理" },
   { value: "advanced", label: "高级" },
 ];
 
@@ -3564,7 +3565,7 @@ export function AccountsScreen({
     ...(builtinCatalogQuery.data ?? []),
     ...(packCatalogQuery.data ?? [])
       .filter((pack) => pack.enabled && pack.has_middleware)
-      .map((pack) => ({
+      .map((pack) => pack.middleware_descriptor ?? ({
         id: `pack:${pack.id}`,
         name: pack.name,
         description: pack.description,
@@ -9247,8 +9248,9 @@ export function AccountsScreen({
                     />
                   </>
                 ) : null}
-                {createTab === "advanced" ? (
+                {createTab === "requestProcessing" ? (
                   <>
+                    <p className="text-xs text-stone-500">请求头设置插件：填写 User-Agent 后会自动添加到新账号。更多请求头规则可在创建后编辑此插件。</p>
                     <UserAgentFields
                       fieldClass={fieldClass}
                       idPrefix="创建"
@@ -9256,6 +9258,10 @@ export function AccountsScreen({
                       onChange={setApiUserAgent}
                       value={apiUserAgent}
                     />
+                  </>
+                ) : null}
+                {createTab === "advanced" ? (
+                  <>
                     {!mediaView ? <>
                     <RequestCompressionOption mode={apiRequestCompressionMode} baseUrl={apiBaseUrl} onChange={setApiRequestCompressionMode} />
                     <ContentRejectionCompatOption
@@ -10082,15 +10088,7 @@ export function AccountsScreen({
                   />
                 </>
               ) : null}
-              {editTab === "advanced" ? (
-                <UserAgentFields
-                  fieldClass={fieldClass}
-                  idPrefix="编辑"
-                  labelClass={labelClass}
-                  onChange={handleEditUserAgentChange}
-                  value={editUserAgent}
-                />
-              ) : null}
+              {editTab === "advanced" ? <p className="text-xs text-stone-500">User-Agent 和自定义请求头已移至请求处理中的“请求头设置”插件。<button type="button" className="ml-2 underline" onClick={()=>setEditTab("requestProcessing")}>前往请求头设置</button></p> : null}
               {editTab === "advanced" && editingCredential.kind === "api" ? (
                 <>
                   <div className="grid gap-2 rounded-xl border border-stone-200 bg-white px-3 py-2">

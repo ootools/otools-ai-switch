@@ -1,3 +1,5 @@
+import builtinManifest from "../native/src/services/builtin_plugins/scripts/manifest.json";
+import type { BuiltinPluginDescriptor } from "../src/lib/api/types";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -458,7 +460,7 @@ async function selectAccountLayout(name: "列表模式" | "卡片模式") {
   await userEvent.click(within(screen.getByRole("menu", { name: "刷新操作" })).getByRole("menuitemradio", { name }));
 }
 
-async function openFormTab(name: "基础" | "高级" | "代理" | "故障处理" | "其他") {
+async function openFormTab(name: "基础" | "高级" | "代理" | "故障处理" | "其他" | "请求处理") {
   await userEvent.click(await screen.findByRole("tab", { name }));
 }
 
@@ -590,14 +592,17 @@ describe("AccountsScreen", () => {
     expect(screen.queryByLabelText("显示请求耗时")).not.toBeInTheDocument();
   });
 
-  it("opens the merged request-processing tab with two flow lanes", async () => {
+  it("opens compact request-processing settings with one visible direction", async () => {
     renderScreen();
     await screen.findByText("Team Account");
     await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
 
     await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
-    expect(screen.getAllByRole("button", { name: "原样透传" })).toHaveLength(2);
-    expect(screen.getAllByRole("button", { name: "AI Switch 处理" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "原样透传" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "AI Switch 处理" })).toHaveLength(1);
+    expect(screen.getByRole("tab", { name: "失败恢复" })).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(screen.getByRole("tab", { name: "响应方向" }));
+    expect(screen.getByRole("tab", { name: "响应方向" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getAllByText("智能体").length).toBeGreaterThan(0);
     expect(screen.getAllByText("供应商").length).toBeGreaterThan(0);
   });
@@ -617,6 +622,7 @@ describe("AccountsScreen", () => {
     await screen.findByText("Team Account");
     await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
     await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+    await userEvent.click(screen.getByRole("tab", { name: "请求方向" }));
 
     const passthrough = screen.getAllByRole("button", { name: "原样透传" })[0];
     await userEvent.click(passthrough);
@@ -644,9 +650,10 @@ describe("AccountsScreen", () => {
     await screen.findByText("Team Account");
     await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
     await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+    await userEvent.click(screen.getByRole("tab", { name: "请求方向" }));
 
-    const add = await screen.findByLabelText("添加插件 - 请求方向");
-    await userEvent.selectOptions(add, "builtin.request.compression");
+    await userEvent.click(await screen.findByRole("button", { name: "添加中间件" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加 请求压缩" }));
     expect(screen.getAllByText("请求压缩").length).toBeGreaterThan(0);
     await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
     await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
@@ -674,10 +681,10 @@ describe("AccountsScreen", () => {
     await screen.findByText("Team Account");
     await userEvent.click(screen.getByRole("button", { name: "编辑 Team Account" }));
     await userEvent.click(await screen.findByRole("tab", { name: "请求处理" }));
+    await userEvent.click(screen.getByRole("tab", { name: "请求方向" }));
 
-    const add = await screen.findByLabelText("添加插件 - 请求方向");
-    expect(within(add).getByRole("option", { name: "My Pack" })).toBeInTheDocument();
-    await userEvent.selectOptions(add, "pack:my-pack");
+    await userEvent.click(await screen.findByRole("button", { name: "添加中间件" }));
+    await userEvent.click(screen.getByRole("button", { name: "添加 My Pack" }));
     await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
     await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
     const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
@@ -705,10 +712,10 @@ describe("AccountsScreen", () => {
     const payload = vi.mocked(updateRouteCredential).mock.calls.at(-1)?.[1];
     const config = JSON.parse(payload?.config_json ?? "{}");
     const enabled = (id: string) =>
-      config.pipeline.response.chain.some((item: { id: string; enabled: boolean }) => item.id === id && item.enabled);
-    expect(enabled("builtin.response.crossResourceStrip")).toBe(true);
-    expect(enabled("builtin.response.plaintextReasoning")).toBe(false);
-    expect(enabled("builtin.response.encryptedContentCleanup")).toBe(false);
+      config.pipeline.request.chain.some((item: { id: string; enabled: boolean }) => item.id === id && item.enabled);
+    expect(enabled("builtin.request.crossResourceStrip")).toBe(true);
+    expect(enabled("builtin.request.plaintextReasoning")).toBe(false);
+    expect(enabled("builtin.request.encryptedContentCleanup")).toBe(false);
   });
 
 
@@ -843,7 +850,7 @@ describe("AccountsScreen", () => {
     vi.mocked(pluginPackListPresets).mockReset();
     vi.mocked(pluginPackListPresets).mockResolvedValue([]);
     vi.mocked(pluginPackList).mockResolvedValue([]);
-    vi.mocked(builtinPluginList).mockResolvedValue([]);
+    vi.mocked(builtinPluginList).mockResolvedValue(builtinManifest as BuiltinPluginDescriptor[]);
     // The panel only reads another app's config when its tab is open, so the
     // default is an empty preview rather than a rejection.
     vi.mocked(previewExternalClientImport).mockResolvedValue(externalPreviewFixture([]));
@@ -3115,6 +3122,8 @@ describe("AccountsScreen", () => {
     await userEvent.click(screen.getByRole("tab", { name: "高级" }));
     expect(screen.queryByLabelText(/Brotli|内容过滤兼容|强制回传推理内容|兼容 custom 工具|每轮追加纠偏提醒/)).not.toBeInTheDocument();
     expect(screen.queryByText(/压缩发往上游|明文推理兼容|密文清理/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("创建 User-Agent")).not.toBeInTheDocument();
+    await openFormTab("请求处理");
     expect(screen.getByLabelText("创建 User-Agent")).toBeInTheDocument();
   });
 
@@ -3399,7 +3408,7 @@ describe("AccountsScreen", () => {
     await userEvent.type(screen.getByLabelText("API Key"), "sk-ua");
     await userEvent.clear(screen.getByLabelText("Base URL"));
     await userEvent.type(screen.getByLabelText("Base URL"), "https://api.upstream.test/v1");
-    await openFormTab("高级");
+    await openFormTab("请求处理");
     await userEvent.selectOptions(screen.getByLabelText("创建 User-Agent 预设"), "grok-workspace");
     await userEvent.click(screen.getByRole("button", { name: "保存账号" }));
 
@@ -4782,17 +4791,20 @@ describe("AccountsScreen", () => {
 
     renderScreen();
     await userEvent.click(await screen.findByRole("button", { name: "编辑 API Account" }));
-    await openFormTab("高级");
+    await openFormTab("请求处理");
+    await userEvent.click(screen.getByRole("tab",{name:"请求方向"}));
+    await userEvent.click(screen.getByRole("button",{name:"配置 请求头设置"}));
 
-    expect(screen.getByLabelText("编辑 User-Agent")).toHaveValue("OldBot/1.0");
-    await userEvent.clear(screen.getByLabelText("编辑 User-Agent"));
-    await userEvent.type(screen.getByLabelText("编辑 User-Agent"), "NewBot/2.0");
+    expect(screen.getByLabelText("请求头设置 User-Agent")).toHaveValue("OldBot/1.0");
+    await userEvent.clear(screen.getByLabelText("请求头设置 User-Agent"));
+    await userEvent.type(screen.getByLabelText("请求头设置 User-Agent"), "NewBot/2.0");
     await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
     await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
     const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
     const config = JSON.parse(payload.config_json);
-    expect(config.headers["User-Agent"]).toBe("NewBot/2.0");
+    expect(config.pipeline.request.chain.find((p: {id:string})=>p.id==="builtin.request.requestHeaders").config.user_agent).toBe("NewBot/2.0");
+    expect(config.headers).toBeUndefined();
   });
 
   it("hydrates and saves a per-account proxy", async () => {
@@ -5845,19 +5857,23 @@ describe("AccountsScreen", () => {
     expect(within(row).queryByText("错误 2 次")).not.toBeInTheDocument();
   });
 
-  it("saves official account User-Agent into config headers", async () => {
+  it("saves official account User-Agent through request header middleware", async () => {
     vi.mocked(updateRouteCredential).mockResolvedValue(credentialsFixture[0]);
     renderScreen();
 
     await userEvent.click(await screen.findByRole("button", { name: "编辑 Team Account" }));
-    await openFormTab("高级");
-    await userEvent.selectOptions(screen.getByLabelText("编辑 User-Agent 预设"), "browser");
+    await openFormTab("请求处理");
+    await userEvent.click(screen.getByRole("tab",{name:"请求方向"}));
+    await userEvent.click(screen.getByRole("button",{name:"添加中间件"}));
+    await userEvent.click(screen.getByRole("button",{name:"添加 请求头设置"}));
+    await userEvent.selectOptions(screen.getByLabelText("请求头设置 User-Agent 预设"), "browser");
     await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
 
     await waitFor(() => expect(updateRouteCredential).toHaveBeenCalled());
     const payload = vi.mocked(updateRouteCredential).mock.calls[0][1];
     const config = JSON.parse(payload.config_json);
-    expect(config.headers["User-Agent"]).toContain("Mozilla/5.0");
+    expect(config.pipeline.request.chain.find((p: {id:string})=>p.id==="builtin.request.requestHeaders").config.user_agent).toContain("Mozilla/5.0");
+    expect(config.headers).toBeUndefined();
   });
 
 

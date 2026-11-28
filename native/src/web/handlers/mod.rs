@@ -635,6 +635,16 @@ pub async fn dispatch_command(
                     .map_err(to_error)?,
             )
         }
+        "builtin_plugin_test_rules" => {
+            let config = args.get("config").cloned().unwrap_or_else(|| json!({}));
+            let status = args.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok());
+            let body = args.get("body").and_then(Value::as_str).unwrap_or("");
+            if args.get("health").and_then(Value::as_bool) == Some(true) {
+                let failure = crate::services::response_failure_service::detect_response_failed(body.as_bytes());
+                to_value(crate::services::failure_rules::evaluate(&crate::services::failure_rules::rules_for(&config),status,failure.as_ref(),args.get("transport").and_then(Value::as_bool).unwrap_or(false)))
+            } else { to_value(crate::services::failure_rules::decide(&config,status,Some(body.as_bytes()),args.get("transport").and_then(Value::as_bool).unwrap_or(false))) }
+        }
+        "plugin_middleware_diagnostics" => to_value(crate::services::plugin_host::diagnostics()),
         "builtin_plugin_list" => to_value(crate::services::builtin_plugins::list()),
         "builtin_plugin_get" => {
             let id = required_string_arg(&args, "id")?;

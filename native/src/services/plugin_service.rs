@@ -114,36 +114,51 @@ async fn install_bytes(
     source: &str,
     middleware_js: Option<&[u8]>,
 ) -> Result<PluginSummary, AppError> {
-    let manifest = plugin::parse_manifest(bytes)?;
-    let dir = pack_dir(paths, &manifest.id)?;
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|error| filesystem("plugin.dir_create_failed", error.to_string()))?;
-    tokio::fs::write(dir.join(PLUGIN_FILE), bytes)
-        .await
-        .map_err(|error| filesystem("plugin.write_failed", error.to_string()))?;
-    if let Some(js) = middleware_js {
-        if js.len() > 256 * 1024 {
-            return Err(validation("plugin.script_too_large", "中间件脚本不能超过 256 KiB。".into()));
+    let manifest=plugin::parse_manifest(bytes)?;
+    if let Some(js)=middleware_js {crate::services::plugin_middleware::PluginMiddleware::validate_package(&manifest,js)?;}
+    let _effects=crate::services::plugin_actions::LIFECYCLE.write().await;
+    tokio::fs::create_dir_all(&paths.plugins_dir).await.map_err(|e|filesystem("plugin.dir_create_failed",e.to_string()))?;
+    let root=tokio::fs::canonicalize(&paths.plugins_dir).await.map_err(|e|filesystem("plugin.dir_resolve",e.to_string()))?;
+    let target=root.join(&manifest.id);
+    if target.parent()!=Some(root.as_path()){return Err(validation("plugin.path_invalid","插件路径越界".into()));}
+    // New version is prepared completely outside the live package directory.
+    let staging=tempfile::Builder::new().prefix("__install-").tempdir_in(&root).map_err(|e|filesystem("plugin.staging",e.to_string()))?;
+    let staged=staging.path().join("next");let backup=staging.path().join("previous");
+    tokio::fs::create_dir(&staged).await.map_err(|e|filesystem("plugin.staging",e.to_string()))?;
+    tokio::fs::write(staged.join(PLUGIN_FILE),bytes).await.map_err(|e|filesystem("plugin.write_failed",e.to_string()))?;
+    if let Some(js)=middleware_js {tokio::fs::write(staged.join("middleware.js"),js).await.map_err(|e|filesystem("plugin.write_failed",e.to_string()))?;}
+    let info=InstallInfo{source:source.into()};
+    tokio::fs::write(staged.join(INSTALL_FILE),serde_json::to_vec(&info).map_err(|e|validation("plugin.install_info_failed",e.to_string()))?).await.map_err(|e|filesystem("plugin.write_failed",e.to_string()))?;
+    // Settings are prepared before the live directory is touched; publication
+    // happens under the same lock used by loader snapshots, without an await.
+    let _settings=SETTINGS_LOCK.lock().await;
+    let mut settings=SettingsService::load(paths).await?;
+    let mut ids=enabled_ids(&settings);ids.insert(manifest.id.clone());
+    settings.plugins_enabled_json=Some(serde_json::to_string(&ids.into_iter().collect::<Vec<_>>()).map_err(|e|validation("plugin.settings_serialize_failed",e.to_string()))?);
+    let contents=serde_json::to_vec_pretty(&settings).map_err(|e|validation("plugin.settings_serialize_failed",e.to_string()))?;
+    let mut staged_settings=tempfile::NamedTempFile::new_in(paths.settings_file.parent().ok_or_else(||validation("plugin.settings_path","设置路径无效".into()))?).map_err(|e|filesystem("plugin.settings_stage",e.to_string()))?;
+    std::io::Write::write_all(&mut staged_settings,&contents).map_err(|e|filesystem("plugin.settings_stage",e.to_string()))?;
+    let publish=crate::services::plugin_middleware::with_package_lock(||->Result<(),AppError>{
+        let had_previous=target.exists();
+        if had_previous {std::fs::rename(&target,&backup).map_err(|e|filesystem("plugin.replace_failed",e.to_string()))?;}
+        if let Err(error)=std::fs::rename(&staged,&target){
+            if had_previous {std::fs::rename(&backup,&target).map_err(|restore|filesystem("plugin.rollback_failed",format!("{error}; {restore}")))?;}
+            return Err(filesystem("plugin.replace_failed",error.to_string()));
         }
-        tokio::fs::write(dir.join("middleware.js"), js)
-            .await
-            .map_err(|error| filesystem("plugin.write_failed", error.to_string()))?;
+        if let Err(error)=staged_settings.persist(&paths.settings_file){
+            std::fs::rename(&target,&staged).map_err(|restore|filesystem("plugin.rollback_failed",format!("{error}; {restore}")))?;
+            if had_previous {std::fs::rename(&backup,&target).map_err(|restore|filesystem("plugin.rollback_failed",format!("{error}; {restore}")))?;}
+            return Err(filesystem("plugin.settings_publish",error.to_string()));
+        }
+        Ok(())
+    });
+    if let Err(error)=publish {
+        // Never let TempDir cleanup erase the only surviving previous version.
+        if backup.exists(){let retained=staging.keep();crate::services::plugin_host::log(&manifest.id,"error",&format!("Rollback backup retained at {}",retained.display()));}
+        crate::services::plugin_middleware::mark_dirty();return Err(error);
     }
-    let info = InstallInfo {
-        source: source.to_string(),
-    };
-    let info_bytes = serde_json::to_vec(&info)
-        .map_err(|error| validation("plugin.install_info_failed", error.to_string()))?;
-    tokio::fs::write(dir.join(INSTALL_FILE), info_bytes)
-        .await
-        .map_err(|error| filesystem("plugin.write_failed", error.to_string()))?;
-    mutate_enabled(paths, |ids| {
-        ids.insert(manifest.id.clone());
-    })
-    .await?;
     crate::services::plugin_middleware::mark_dirty();
-    Ok(manifest.summary(true, source))
+    Ok(manifest.summary(true,source))
 }
 
 pub struct PluginService;
@@ -318,7 +333,7 @@ impl PluginService {
     }
 
     pub async fn uninstall(paths: &AppPaths, id: &str) -> Result<(), AppError> {
-        crate::services::plugin_middleware::mark_dirty();
+        let _effects=crate::services::plugin_actions::LIFECYCLE.write().await;
         let dir = pack_dir(paths, id)?;
         if !dir.is_dir() {
             return Err(filesystem(
@@ -329,14 +344,13 @@ impl PluginService {
         tokio::fs::remove_dir_all(&dir)
             .await
             .map_err(|error| filesystem("plugin.uninstall_failed", error.to_string()))?;
-        mutate_enabled(paths, |ids| {
-            ids.remove(id);
-        })
-        .await
+        let result=mutate_enabled(paths, |ids| {ids.remove(id);}).await;
+        crate::services::plugin_middleware::mark_dirty();
+        result
     }
 
     pub async fn set_enabled(paths: &AppPaths, id: &str, enabled: bool) -> Result<(), AppError> {
-        crate::services::plugin_middleware::mark_dirty();
+        let _effects=crate::services::plugin_actions::LIFECYCLE.write().await;
         // Validate the id and confirm the pack exists before touching settings.
         let _ = read_pack(paths, id).await?;
         mutate_enabled(paths, |ids| {
@@ -346,7 +360,9 @@ impl PluginService {
                 ids.remove(id);
             }
         })
-        .await
+        .await?;
+        crate::services::plugin_middleware::mark_dirty();
+        Ok(())
     }
 
     /// Presets from enabled packs only. Disabled or unreadable packs contribute
@@ -407,6 +423,36 @@ mod tests {
             .await
             .unwrap();
         (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn review_failed_update_preserves_installed_bytes_and_settings(){
+        let (_dir,paths)=pack_fixture("atomic-pack").await;
+        let source=paths.data_dir.join("source");
+        let original=manifest_json("atomic-pack").replace("\"contributes\": {","\"contributes\": {\"middleware\": {\"file\": \"middleware.js\"},");
+        tokio::fs::write(source.join(PLUGIN_FILE),&original).await.unwrap();
+        tokio::fs::write(source.join("middleware.js"),"function onRequest(b){return b;}").await.unwrap();
+        PluginService::install_folder(&paths,source.to_str().unwrap()).await.unwrap();
+        let settings=tokio::fs::read(&paths.settings_file).await.unwrap();
+        tokio::fs::write(source.join(PLUGIN_FILE),original.replace("1.0.0","2.0.0")).await.unwrap();
+        for broken in ["x".repeat(256*1024+1),"function onRequest( {".into()] {
+            tokio::fs::write(source.join("middleware.js"),broken).await.unwrap();
+            assert!(PluginService::install_folder(&paths,source.to_str().unwrap()).await.is_err());
+            assert_eq!(tokio::fs::read_to_string(paths.plugins_dir.join("atomic-pack/plugin.json")).await.unwrap(),original);
+            assert_eq!(tokio::fs::read(&paths.settings_file).await.unwrap(),settings);
+        }
+    }
+
+    #[tokio::test]
+    async fn review_uninstall_invalidates_runtime_even_when_settings_fail(){
+        let (_dir,paths)=pack_fixture("uninstall-watch").await;let source=paths.data_dir.join("source");
+        let manifest=manifest_json("uninstall-watch").replace("\"contributes\": {","\"contributes\": {\"middleware\": {\"file\": \"middleware.js\"},");
+        tokio::fs::write(source.join(PLUGIN_FILE),manifest).await.unwrap();tokio::fs::write(source.join("middleware.js"),"function onRequest(b){return b;}").await.unwrap();
+        PluginService::install_folder(&paths,source.to_str().unwrap()).await.unwrap();
+        crate::services::plugin_middleware::PluginMiddleware::configure(&paths).unwrap();assert!(crate::services::plugin_contract::descriptor("pack:uninstall-watch").is_some());
+        tokio::fs::write(&paths.settings_file,"not json").await.unwrap();
+        assert!(PluginService::uninstall(&paths,"uninstall-watch").await.is_err());
+        assert!(crate::services::plugin_contract::descriptor("pack:uninstall-watch").is_none());
     }
 
     #[tokio::test]

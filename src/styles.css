@@ -962,20 +962,135 @@ html.dark :is([class~="focus:border-stone-400"]:focus, [class~="focus:border-sto
   border-color: #a8a29e;
 }
 
-/* Account request pipeline flow connectors */
-.pipeline-flow-line {
-  fill: none;
-  stroke: #a8a29e;
-  stroke-width: 1.6;
-  stroke-dasharray: 6 5;
-  animation: pipeline-flow-dash 1.2s linear infinite;
+/* Compact account processing settings. Theme tokens are scoped to this editor. */
+.pipeline-settings {
+  --pipeline-bg: #fff;
+  --pipeline-soft: #fafaf9;
+  --pipeline-hover: #f5f5f4;
+  --pipeline-line: #e7e5e4;
+  --pipeline-text: #292524;
+  --pipeline-muted: #78716c;
+  --pipeline-accent: #44403c;
+  --pipeline-switch: #d6d3d1;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--pipeline-line);
+  border-radius: 12px;
+  background: var(--pipeline-bg);
+  color: var(--pipeline-text);
+  font-size: 12px;
+  line-height: 1.5;
 }
-.pipeline-flow-line[data-direction="response"] {
-  stroke: #64748b;
+html.dark .pipeline-settings {
+  --pipeline-bg: #221f1c;
+  --pipeline-soft: #292523;
+  --pipeline-hover: #34302c;
+  --pipeline-line: #49423c;
+  --pipeline-text: #e7e5e4;
+  --pipeline-muted: #b1aaa4;
+  --pipeline-accent: #d6d3d1;
+  --pipeline-switch: #62594f;
 }
-@keyframes pipeline-flow-dash {
-  to { stroke-dashoffset: -22; }
+.pipeline-tabs { display: flex; gap: 24px; padding: 0 16px; border-bottom: 1px solid var(--pipeline-line); }
+.pipeline-tabs button {
+  display: inline-flex; align-items: center; gap: 8px; min-height: 46px;
+  border-bottom: 2px solid transparent; padding: 0 2px; color: var(--pipeline-muted); font-weight: 600;
 }
-@media (prefers-reduced-motion: reduce) {
-  .pipeline-flow-line { animation: none; }
+.pipeline-tabs button[aria-selected="true"] { border-bottom-color: var(--pipeline-accent); color: var(--pipeline-text); }
+.pipeline-tabs button > span { min-width: 20px; padding: 0 5px; border-radius: 5px; background: var(--pipeline-hover); text-align: center; font-size: 10px; font-weight: 500; }
+.pipeline-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; }
+.pipeline-route { display: flex; align-items: center; gap: 8px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-modes { display: flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--pipeline-hover); }
+.pipeline-modes button { min-height: 28px; border-radius: 6px; padding: 3px 9px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-modes button[aria-pressed="true"] { background: var(--pipeline-bg); color: var(--pipeline-text); box-shadow: 0 1px 3px #00000012; font-weight: 600; }
+.pipeline-list-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; padding: 0 16px 10px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-list { list-style: none; }
+.pipeline-row { border-top: 1px solid var(--pipeline-line); }
+.pipeline-row-main { display: flex; align-items: center; padding-right: 16px; }
+.pipeline-row-trigger { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; min-height: 64px; padding: 11px 12px 11px 16px; text-align: left; }
+.pipeline-row-main:hover, .pipeline-row[data-expanded="true"] { background: var(--pipeline-soft); }
+.pipeline-index { flex-shrink: 0; width: 18px; color: var(--pipeline-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.pipeline-row-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; }
+.pipeline-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
+.pipeline-row-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-chevron { flex-shrink: 0; color: var(--pipeline-muted); }
+.pipeline-row[data-expanded="true"] .pipeline-chevron { transform: rotate(180deg); }
+.pipeline-toggle { display: inline-flex; align-items: center; flex-shrink: 0; gap: 7px; min-height: 36px; cursor: pointer; color: var(--pipeline-muted); font-size: 10px; }
+.pipeline-toggle input {
+  appearance: none; -webkit-appearance: none; position: relative; flex-shrink: 0;
+  width: 30px; height: 18px; margin: 0; border: 0; border-radius: 999px;
+  background: var(--pipeline-switch); cursor: pointer; transition: background-color 150ms ease;
 }
+.pipeline-toggle input::after { content: ""; position: absolute; left: 3px; top: 3px; width: 12px; height: 12px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px #0002; }
+.pipeline-toggle input:checked { background: #57534e; }
+.pipeline-toggle input:checked::after { left: 15px; }
+html.dark .pipeline-toggle input:checked { background: #d6d3d1; }
+html.dark .pipeline-toggle input:checked::after { background: #292524; }
+.pipeline-details { padding: 0 16px 14px 46px; }
+.pipeline-description { padding: 0 0 12px; color: var(--pipeline-muted); overflow-wrap: anywhere; font-size: 11px; line-height: 1.7; }
+.pipeline-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr)); gap: 12px; padding-bottom: 14px; }
+.pipeline-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-field-wide { grid-column: 1 / -1; }
+.pipeline-field-bool { flex-direction: row; align-items: center; cursor: pointer; }
+.pipeline-field-bool input { accent-color: #57534e; }
+.pipeline-settings .pipeline-field :is(input:not([type="checkbox"]), select, textarea),
+.pipeline-settings .pipeline-add select {
+  width: 100%; min-width: 0; min-height: 32px; padding: 5px 8px; border: 1px solid var(--pipeline-line);
+  border-radius: 6px; background: var(--pipeline-bg); color: var(--pipeline-text); box-shadow: none; font-size: 12px;
+}
+.pipeline-field textarea { resize: vertical; }
+.pipeline-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pipeline-actions button { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; border-radius: 5px; padding: 4px 8px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-actions button:hover:not(:disabled) { background: var(--pipeline-hover); color: var(--pipeline-text); }
+.pipeline-actions button:disabled { opacity: 0.4; }
+.pipeline-actions .pipeline-remove { margin-left: auto; }
+.pipeline-actions .pipeline-remove:hover { color: #dc2626; }
+html.dark .pipeline-actions .pipeline-remove:hover { color: #fca5a5; }
+.pipeline-add { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--pipeline-line); }
+.pipeline-add > span { display: flex; align-items: center; gap: 6px; color: var(--pipeline-muted); font-size: 11px; }
+.pipeline-settings .pipeline-add select { width: auto; max-width: 100%; flex: 0 1 215px; }
+.pipeline-add select:disabled { opacity: 0.6; cursor: not-allowed; }
+.pipeline-empty { padding: 20px 16px 24px; color: var(--pipeline-muted); font-size: 12px; line-height: 1.8; }
+.pipeline-empty > span { display: block; margin-top: 6px; font-size: 11px; }
+.pipeline-settings :is(button, input, select, textarea, [role="tabpanel"]):focus-visible { outline: 2px solid #60a5fa; outline-offset: -2px; }
+.pipeline-settings [role="switch"]:focus-visible { outline-offset: 3px; }
+.pipeline-settings button:not(:disabled):hover, .pipeline-settings button:not(:disabled):active { transform: none; }
+
+.pipeline-row-purpose { display:block; font-size:12px; line-height:1.5; color:var(--pipeline-muted); white-space:normal; }
+.pipeline-catalog { display:grid; gap:10px; padding:12px; border:1px solid var(--pipeline-line); border-radius:8px; }
+.pipeline-catalog > input { width:100%; min-width:0; }
+.pipeline-catalog-item { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid var(--pipeline-line); }
+.pipeline-catalog-item > div { flex:1; min-width:0; }
+.pipeline-catalog-item p { font-size:12px; margin:4px 0; line-height:1.5; }
+.failure-rules { display:grid; gap:10px; min-width:0; margin-top:12px; font-size:12px; }
+.failure-rules-heading { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.failure-rules p { margin:0; line-height:1.6; }
+.failure-rules details { border:1px solid var(--pipeline-line); border-radius:6px; padding:10px; min-width:0; }
+.failure-rules summary { cursor:pointer; overflow-wrap:anywhere; line-height:1.5; }
+.failure-rules label { display:block; margin:8px 0; }
+.failure-rules fieldset { border:1px solid var(--pipeline-line); margin:10px 0; min-width:0; padding:8px; }
+.failure-condition { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin:6px 0; }
+.failure-condition input { min-width:0; }
+.failure-condition button { justify-self:end; }
+.failure-rules select, .failure-rules textarea { max-width:100%; min-width:0; }
+.failure-rules textarea { width:100%; }
+.failure-rules pre { white-space:pre-wrap; overflow-wrap:anywhere; max-width:100%; }
+
+.pipeline-tabs { gap:16px; flex-wrap:wrap; }
+.pipeline-catalog { margin:0 16px 16px; }
+.pipeline-add { margin:12px 16px; }
+.pipeline-row-purpose { margin-top:3px; }
+.failure-rules :is(input:not([type="checkbox"]),select,textarea), .pipeline-catalog > input { border:1px solid var(--pipeline-line); border-radius:5px; background:var(--pipeline-bg); color:var(--pipeline-text); padding:6px 8px; }
+.failure-rules input:not([type="checkbox"]) { max-width:100%; }
+.failure-rules button, .pipeline-catalog-item button { border:1px solid var(--pipeline-line); border-radius:5px; padding:5px 8px; background:var(--pipeline-soft); }
+.failure-rules label > input:not([type="checkbox"]) { display:block; width:100%; margin-top:4px; }
+
+/* Error examples retain their original lines and wrap in narrow account panels. */
+.pipeline-description { white-space: pre-line; overflow-wrap: anywhere; }
+.pipeline-row-purpose, .pipeline-catalog-item p { overflow-wrap: anywhere; }
+.pipeline-header-rules { min-width:0; border:1px solid var(--pipeline-line); border-radius:6px; padding:10px; }
+.pipeline-header-rules p { color:var(--pipeline-muted); font-size:11px; margin:4px 0 8px; }
+.pipeline-header-rule { display:grid; grid-template-columns:minmax(0,1fr) 76px; gap:7px; margin-bottom:10px; }
+.pipeline-header-rule input,.pipeline-header-rule select { min-width:0; width:100%; border:1px solid var(--pipeline-line); border-radius:5px; background:var(--pipeline-bg); padding:6px; }
+.pipeline-header-rule button { justify-self:end; }
+.pipeline-field-wide > label { display:grid; gap:4px; margin-bottom:8px; }

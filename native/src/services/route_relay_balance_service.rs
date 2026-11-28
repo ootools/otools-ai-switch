@@ -8,7 +8,7 @@ use crate::models::route_relay_balance::{
 };
 use crate::services::deeplink_service::mask_api_key;
 use crate::services::http_client::build_outbound_http_client;
-use crate::services::route_proxy_service::credential_user_agent;
+use crate::services::route_proxy_service::effective_request_user_agent;
 use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -261,7 +261,7 @@ impl BalanceRequest {
             access_token: secret_string(&secret, RELAY_BALANCE_ACCESS_TOKEN_KEY),
             access_token_user_id: secret_string(&secret, RELAY_BALANCE_ACCESS_TOKEN_USER_ID_KEY),
             interface_format,
-            user_agent: credential_user_agent(config).map(str::to_string),
+            user_agent: effective_request_user_agent(config),
         })
     }
 }
